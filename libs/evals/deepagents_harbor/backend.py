@@ -6,9 +6,11 @@ import shlex
 import tempfile
 from pathlib import Path
 
+from deepagents.backends.filesystem import _map_exception_to_standard_error
 from deepagents.backends.protocol import (
     EditResult,
     ExecuteResponse,
+    FileData,
     FileDownloadResponse,
     FileInfo,
     FileUploadResponse,
@@ -19,9 +21,8 @@ from deepagents.backends.protocol import (
     ReadResult,
     SandboxBackendProtocol,
     WriteResult,
-    map_file_operation_error,
 )
-from deepagents.backends.utils import check_empty_content, create_file_data
+from deepagents.backends.utils import check_empty_content
 from harbor.environments.base import BaseEnvironment
 
 _SYNC_NOT_SUPPORTED = "This backend only supports async execution. Use the async variant instead."
@@ -39,16 +40,6 @@ _GREP_FIELD_COUNT = 3
 
 _COMMAND_PREVIEW_CHAR_LIMIT = 200
 """Maximum chars included in timeout error command previews."""
-
-
-def _format_transfer_error(exc: Exception) -> str:
-    """Convert transfer exceptions into standardized error codes.
-
-    Returns a `FileOperationError` literal for known exception types, or
-    `str(exc)` for unmapped exceptions so the caller can still surface
-    a meaningful message.
-    """
-    return map_file_operation_error(exc) or str(exc)
 
 
 class HarborSandbox(SandboxBackendProtocol):
@@ -189,9 +180,9 @@ awk -v offset={offset} -v limit={limit} '
 
         empty_msg = check_empty_content(content)
         if empty_msg:
-            return ReadResult(file_data=create_file_data(empty_msg))
+            return ReadResult(file_data=FileData(content=empty_msg, encoding="utf-8"))
 
-        return ReadResult(file_data=create_file_data(content))
+        return ReadResult(file_data=FileData(content=content, encoding="utf-8"))
 
     def read(
         self,
@@ -241,7 +232,7 @@ mkdir -p "$(dirname {safe_path})" 2>/dev/null
         try:
             await self.environment.upload_file(tmp_path, file_path)
         except Exception as exc:
-            error = map_file_operation_error(exc)
+            error = _map_exception_to_standard_error(exc)
             if error is None:
                 raise
             return WriteResult(error=f"Failed to write file '{file_path}': {error}")
@@ -251,7 +242,7 @@ mkdir -p "$(dirname {safe_path})" 2>/dev/null
             except OSError:
                 logger.warning("Failed to clean up temp file %s", tmp_path, exc_info=True)
 
-        return WriteResult(path=file_path, files_update=None)
+        return WriteResult(path=file_path)
 
     def write(
         self,
@@ -283,7 +274,7 @@ mkdir -p "$(dirname {safe_path})" 2>/dev/null
             try:
                 await self.environment.download_file(file_path, local)
             except Exception as exc:
-                error = map_file_operation_error(exc)
+                error = _map_exception_to_standard_error(exc)
                 if error is None:
                     raise
                 logger.warning("Failed to download %s for editing: %s", file_path, exc)
@@ -314,12 +305,12 @@ mkdir -p "$(dirname {safe_path})" 2>/dev/null
             try:
                 await self.environment.upload_file(local, file_path)
             except Exception as exc:
-                error = map_file_operation_error(exc)
+                error = _map_exception_to_standard_error(exc)
                 if error is None:
                     raise
                 return EditResult(error=f"Error editing file '{file_path}': {error}")
 
-        return EditResult(path=file_path, files_update=None, occurrences=count)
+        return EditResult(path=file_path, occurrences=count)
 
     def edit(
         self,
@@ -512,15 +503,21 @@ done
                     tmp.write(content)
                     tmp_path = Path(tmp.name)
             except OSError as exc:
+                error = _map_exception_to_standard_error(exc)
+                if error is None:
+                    raise
                 logger.warning("Failed to create temp file for upload %s: %s", path, exc)
-                results.append(FileUploadResponse(path=path, error=_format_transfer_error(exc)))
+                results.append(FileUploadResponse(path=path, error=error))
                 continue
             try:
                 await self.environment.upload_file(tmp_path, path)
                 results.append(FileUploadResponse(path=path, error=None))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to upload %s: %s", path, exc)
-                results.append(FileUploadResponse(path=path, error=_format_transfer_error(exc)))
+            except Exception as exc:
+                error = _map_exception_to_standard_error(exc)
+                if error is None:
+                    raise
+                logger.warning("Failed to upload %s: %s", path, error)
+                results.append(FileUploadResponse(path=path, error=error))
             finally:
                 try:
                     tmp_path.unlink()
@@ -542,13 +539,12 @@ done
                     await self.environment.download_file(path, local)
                     content = local.read_bytes()
                     results.append(FileDownloadResponse(path=path, content=content, error=None))
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to download %s: %s", path, exc)
-                    results.append(
-                        FileDownloadResponse(
-                            path=path, content=None, error=_format_transfer_error(exc)
-                        )
-                    )
+                except Exception as exc:
+                    error = _map_exception_to_standard_error(exc)
+                    if error is None:
+                        raise
+                    logger.warning("Failed to download %s: %s", path, error)
+                    results.append(FileDownloadResponse(path=path, content=None, error=error))
         return results
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
