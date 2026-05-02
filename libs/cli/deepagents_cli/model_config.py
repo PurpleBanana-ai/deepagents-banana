@@ -72,6 +72,34 @@ class ModelConfigError(Exception):
     """Raised when model configuration or creation fails."""
 
 
+class MissingCredentialsError(ModelConfigError):
+    """Raised when a provider is selected but its API key env var is unset.
+
+    Subclasses `ModelConfigError` so existing `except ModelConfigError` blocks
+    keep working. Carries the `provider` name and the canonical `env_var` so
+    callers can render targeted recovery hints (e.g., "set OPENAI_API_KEY" or
+    "run `/model <other_provider>:<model>`") without string-matching on the
+    formatted exception message and without re-deriving the env-var name.
+    """
+
+    def __init__(
+        self, message: str, *, provider: str, env_var: str | None = None
+    ) -> None:
+        """Initialize the error.
+
+        Args:
+            message: Human-readable message describing the missing credential.
+            provider: The provider whose credentials are missing
+                (e.g., `'openai'`).
+            env_var: The canonical env var name expected to hold the
+                credential (e.g., `'OPENAI_API_KEY'`). `None` when the
+                provider has no registered env-var mapping.
+        """
+        super().__init__(message)
+        self.provider = provider
+        self.env_var = env_var
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     """A model specification in `provider:model` format.
@@ -187,7 +215,12 @@ class ProviderConfig(TypedDict, total=False):
     """List of model identifiers available from this provider."""
 
     api_key_env: str
-    """Environment variable name containing the API key."""
+    """Name of the environment variable that holds the API key.
+
+    This is the env var *name* (e.g., `"OPENAI_API_KEY"`), not the secret
+    itself. The CLI resolves it at startup to verify credentials before model
+    creation.
+    """
 
     base_url: str
     """Custom base URL."""
@@ -208,6 +241,10 @@ class ProviderConfig(TypedDict, total=False):
     every model from this provider. Model-keyed sub-tables (e.g.,
     `[params."qwen3:4b"]`) override individual values for that model only;
     the merge is shallow (model wins on conflict).
+
+    Do not set `api_key` here — the early credential check runs before
+    `params` are read, so the CLI will reject the model before it sees the key.
+    Use `api_key_env` to point at an environment variable instead.
     """
 
     profile: dict[str, Any]
@@ -1103,14 +1140,18 @@ class ModelConfig:
         return result
 
 
-def _save_model_field(
-    field: str, model_spec: str, config_path: Path | None = None
+def _save_toml_field(
+    section: str,
+    field: str,
+    value: str,
+    config_path: Path | None = None,
 ) -> bool:
-    """Read-modify-write a `[models].<field>` key in the config file.
+    """Read-modify-write a `[section].<field>` key in the config file.
 
     Args:
-        field: Key name under the `[models]` table (e.g., `'default'` or `'recent'`).
-        model_spec: The model to save in `provider:model` format.
+        section: TOML table name (e.g., `'models'`, `'agents'`).
+        field: Key within the table (e.g., `'default'`, `'recent'`).
+        value: String value to persist.
         config_path: Path to config file.
 
             Defaults to `~/.deepagents/config.toml`.
@@ -1131,9 +1172,9 @@ def _save_model_field(
         else:
             data = {}
 
-        if "models" not in data:
-            data["models"] = {}
-        data["models"][field] = model_spec
+        if section not in data:
+            data[section] = {}
+        data[section][field] = value
 
         # Write to temp file then rename to prevent corruption if write is interrupted
         fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
@@ -1147,13 +1188,33 @@ def _save_model_field(
                 Path(tmp_path).unlink()
             raise
     except (OSError, tomllib.TOMLDecodeError):
-        logger.exception("Could not save %s model preference", field)
+        logger.exception("Could not save %s.%s preference", section, field)
         return False
     else:
         # Invalidate config cache so the next load() picks up the change.
         global _default_config_cache  # noqa: PLW0603  # Module-level cache requires global statement
         _default_config_cache = None
         return True
+
+
+def _save_model_field(
+    field: str, model_spec: str, config_path: Path | None = None
+) -> bool:
+    """Read-modify-write a `[models].<field>` key in the config file.
+
+    Thin wrapper around `_save_toml_field` for the `[models]` section.
+
+    Args:
+        field: Key name under the `[models]` table (e.g., `'default'` or `'recent'`).
+        model_spec: The model to save in `provider:model` format.
+        config_path: Path to config file.
+
+            Defaults to `~/.deepagents/config.toml`.
+
+    Returns:
+        True if save succeeded, False if it failed due to I/O errors.
+    """
+    return _save_toml_field("models", field, model_spec, config_path)
 
 
 def save_default_model(model_spec: str, config_path: Path | None = None) -> bool:
@@ -1701,3 +1762,51 @@ def save_recent_model(model_spec: str, config_path: Path | None = None) -> bool:
         This function does not preserve comments in the config file.
     """
     return _save_model_field("recent", model_spec, config_path)
+
+
+def save_recent_agent(agent_name: str, config_path: Path | None = None) -> bool:
+    """Update the recently used agent in config file.
+
+    Writes to `[agents].recent` so a later bare `deepagents` launch (no
+    `-a`) can bring the user back to their last agent instead of the
+    default.
+
+    Args:
+        agent_name: The agent directory name (e.g., `'coder'`).
+        config_path: Path to config file.
+
+            Defaults to `~/.deepagents/config.toml`.
+
+    Returns:
+        True if save succeeded, False if it failed due to I/O errors.
+    """
+    return _save_toml_field("agents", "recent", agent_name, config_path)
+
+
+def load_recent_agent(config_path: Path | None = None) -> str | None:
+    """Read `[agents].recent` from the config file.
+
+    Args:
+        config_path: Path to config file.
+
+            Defaults to `~/.deepagents/config.toml`.
+
+    Returns:
+        The saved agent name, or `None` if the file or key is missing or
+        the file is unreadable.
+    """
+    if config_path is None:
+        config_path = DEFAULT_CONFIG_PATH
+    if not config_path.exists():
+        return None
+    try:
+        with config_path.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        logger.warning("Could not read recent agent from config", exc_info=True)
+        return None
+    agents_section = data.get("agents", {})
+    recent = agents_section.get("recent")
+    if isinstance(recent, str) and recent.strip():
+        return recent.strip()
+    return None
