@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import sys
+import types
 from typing import TYPE_CHECKING
 
 import pytest
@@ -26,6 +30,7 @@ from deepagents_cli.deploy.config import (
     AgentConfig,
     AuthConfig,
     DeployConfig,
+    MemoriesConfig,
     SandboxConfig,
 )
 
@@ -155,8 +160,7 @@ class TestRenderPyproject:
 
     def test_deps_cover_all_validated_providers(self) -> None:
         """Every validated provider must have a bundler dep."""
-        no_partner_pkg = {"together"}
-        missing = set(_MODEL_PROVIDER_ENV) - set(_MODEL_PROVIDER_DEPS) - no_partner_pkg
+        missing = set(_MODEL_PROVIDER_ENV) - set(_MODEL_PROVIDER_DEPS)
         assert not missing, (
             f"Providers validated but missing from bundler deps: {missing}"
         )
@@ -206,6 +210,87 @@ class TestRenderDeployGraph:
         result = _render_deploy_graph(config, mcp_present=False)
         assert "_load_mcp_tools" not in result
         assert "pass  # no MCP servers configured" in result
+
+    def test_mcp_loader_expands_env_vars(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Emitted loader expands `${VAR}` in url + headers before MCP connect.
+
+        Mirrors the `${VAR}` substitution behavior of `deepagents-code`'s
+        `.mcp.json`. Without this, headers like
+        `Authorization: Bearer ${TOKEN}` reach MCP servers as the literal
+        string and auth fails silently.
+
+        Also verifies the documented contracts: unset references are left as
+        literal `${VAR}` so a recognizable token surfaces, non-string header
+        values pass through unchanged, and unresolved tokens emit a warning.
+        """
+        from deepagents_cli.deploy.templates import MCP_TOOLS_TEMPLATE
+
+        captured: dict[str, dict] = {}
+
+        class _FakeClient:
+            def __init__(self, connections: dict) -> None:
+                captured["connections"] = connections
+
+            async def get_tools(self) -> list:
+                return []
+
+        fake_root = types.ModuleType("langchain_mcp_adapters")
+        fake_client = types.ModuleType("langchain_mcp_adapters.client")
+        fake_client.MultiServerMCPClient = _FakeClient  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "langchain_mcp_adapters", fake_root)
+        monkeypatch.setitem(sys.modules, "langchain_mcp_adapters.client", fake_client)
+
+        (tmp_path / "_mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "primary": {
+                            "type": "http",
+                            "url": "https://api.example.com/${ENDPOINT}",
+                            "headers": {
+                                "Authorization": "Bearer ${TOKEN}",
+                                "X-Unset": "value-${MISSING_VAR}",
+                                "X-Numeric": 42,
+                            },
+                        },
+                    },
+                },
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("ENDPOINT", "v1/chat")
+        monkeypatch.setenv("TOKEN", "secret-abc")
+        monkeypatch.delenv("MISSING_VAR", raising=False)
+
+        loader_logger = logging.getLogger("test_mcp_loader")
+        namespace: dict = {
+            "__file__": str(tmp_path / "graph.py"),
+            "logger": loader_logger,
+        }
+        exec(
+            compile(MCP_TOOLS_TEMPLATE, "<MCP_TOOLS_TEMPLATE>", "exec"),
+            namespace,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="test_mcp_loader"):
+            asyncio.run(namespace["_load_mcp_tools"]())
+
+        conn = captured["connections"]["primary"]
+        assert conn["url"] == "https://api.example.com/v1/chat"
+        assert conn["headers"]["Authorization"] == "Bearer secret-abc"
+        assert conn["headers"]["X-Unset"] == "value-${MISSING_VAR}"
+        assert conn["headers"]["X-Numeric"] == 42
+        assert any(
+            "unresolved environment reference" in rec.getMessage()
+            and "${MISSING_VAR}" in rec.getMessage()
+            for rec in caplog.records
+        )
 
     def test_no_system_prompt_in_output(self) -> None:
         """AGENTS.md should not be baked into the deploy graph as a system prompt."""
@@ -307,6 +392,58 @@ class TestRenderDeployGraph:
         assert "AGENTS.md" in result
         assert 'mode="deny"' in result
 
+    def test_agent_writable_false_generates_deny_permissions(self) -> None:
+        config = DeployConfig(
+            agent=AgentConfig(name="x", model="anthropic:claude-sonnet-4-6"),
+            memories=MemoriesConfig(agent_writable=False),
+        )
+        result = _render_deploy_graph(config, mcp_present=False)
+        assert "AGENT_WRITABLE = False" in result
+        assert 'mode="deny"' in result
+        assert 'paths=[f"{MEMORIES_PREFIX}**"]' in result
+
+    def test_agent_writable_true_omits_deny_permissions(self) -> None:
+        config = DeployConfig(
+            agent=AgentConfig(name="x", model="anthropic:claude-sonnet-4-6"),
+            memories=MemoriesConfig(agent_writable=True),
+        )
+        result = _render_deploy_graph(config, mcp_present=False)
+        assert "AGENT_WRITABLE = True" in result
+        assert "permissions = []" in result
+
+    def test_default_memories_backend_is_hub(self) -> None:
+        """`_minimal_config()` relies on `MemoriesConfig()` — default must be hub."""
+        result = _render_deploy_graph(_minimal_config(), mcp_present=False)
+        assert "MEMORIES_BACKEND = 'hub'" in result
+
+    def test_store_backend_opt_in(self) -> None:
+        """Opt-in to the store backend still works for existing projects."""
+        config = DeployConfig(
+            agent=AgentConfig(name="x", model="anthropic:claude-sonnet-4-6"),
+            memories=MemoriesConfig(backend="store"),
+        )
+        result = _render_deploy_graph(config, mcp_present=False)
+        assert "MEMORIES_BACKEND = 'store'" in result
+
+    def test_hub_backend_wires_context_hub_route(self) -> None:
+        config = DeployConfig(
+            agent=AgentConfig(name="hubtest"),
+            memories=MemoriesConfig(backend="hub"),
+        )
+        result = _render_deploy_graph(config, mcp_present=False)
+        assert "MEMORIES_BACKEND = 'hub'" in result
+        assert "MEMORIES_HUB_IDENTIFIER = '-/hubtest'" in result
+        assert "from _context_hub import ContextHubBackend" in result
+        assert "_seed_hub_if_needed" in result
+
+    def test_hub_backend_honors_identifier_override(self) -> None:
+        config = DeployConfig(
+            agent=AgentConfig(name="hubtest"),
+            memories=MemoriesConfig(backend="hub", identifier="org-ns/custom"),
+        )
+        result = _render_deploy_graph(config, mcp_present=False)
+        assert "MEMORIES_HUB_IDENTIFIER = 'org-ns/custom'" in result
+
 
 class TestBundle:
     def test_produces_expected_files(self, tmp_path: Path) -> None:
@@ -355,6 +492,43 @@ class TestBundle:
         )
         with pytest.raises(ValueError, match="Unknown sandbox provider"):
             bundle(config, project, build)
+
+    def test_hub_bundle_vendors_context_hub(self, tmp_path: Path) -> None:
+        project = _minimal_project(tmp_path / "project")
+        build = tmp_path / "build"
+        config = DeployConfig(
+            agent=AgentConfig(name="hubtest"),
+            memories=MemoriesConfig(backend="hub"),
+        )
+        bundle(config, project, build)
+        vendored = build / "_context_hub.py"
+        assert vendored.exists()
+        # The vendored file must contain the class the graph imports.
+        assert "class ContextHubBackend" in vendored.read_text(encoding="utf-8")
+        # Generated graph should syntactically compile.
+        graph_py = (build / "deploy_graph.py").read_text(encoding="utf-8")
+        compile(graph_py, "<hub_deploy_graph>", "exec")
+
+    def test_store_bundle_does_not_vendor_context_hub(self, tmp_path: Path) -> None:
+        project = _minimal_project(tmp_path / "project")
+        build = tmp_path / "build"
+        config = DeployConfig(
+            agent=AgentConfig(name="test-agent", model="anthropic:claude-sonnet-4-6"),
+            memories=MemoriesConfig(backend="store"),
+        )
+        bundle(config, project, build)
+        assert not (build / "_context_hub.py").exists()
+
+    def test_hub_bundle_adds_langsmith_dep(self, tmp_path: Path) -> None:
+        project = _minimal_project(tmp_path / "project")
+        build = tmp_path / "build"
+        config = DeployConfig(
+            agent=AgentConfig(name="hubtest"),
+            memories=MemoriesConfig(backend="hub"),
+        )
+        bundle(config, project, build)
+        pyproject = (build / "pyproject.toml").read_text(encoding="utf-8")
+        assert "langsmith>=0.7.35" in pyproject
 
     def test_bundle_with_subagents(self, tmp_path: Path) -> None:
         """Full bundle with sync subagents produces valid artifacts."""

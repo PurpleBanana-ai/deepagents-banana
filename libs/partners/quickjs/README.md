@@ -6,11 +6,11 @@ Instead of issuing N serial tool calls, the model can write one block of JavaScr
 
 ```python
 from deepagents import create_deep_agent
-from langchain_quickjs import REPLMiddleware
+from langchain_quickjs import CodeInterpreterMiddleware
 
 agent = create_deep_agent(
     model="claude-sonnet-4-6",
-    middleware=[REPLMiddleware()],
+    middleware=[CodeInterpreterMiddleware()],
 )
 ```
 
@@ -52,11 +52,11 @@ uv add langchain-quickjs
 
 ```python
 from deepagents import create_deep_agent
-from langchain_quickjs import REPLMiddleware
+from langchain_quickjs import CodeInterpreterMiddleware
 
 agent = create_deep_agent(
     model="claude-sonnet-4-6",
-    middleware=[REPLMiddleware()],
+    middleware=[CodeInterpreterMiddleware()],
 )
 
 # Use `ainvoke` — PTC bridges register as async QuickJS host functions,
@@ -74,7 +74,10 @@ The middleware:
 
 ### Persistence
 
-The REPL is module-flavoured: top-level `let`/`const`/`function` persist across `eval` calls within the same run. Assign to `globalThis.X` to keep a value around under an explicit name.
+The REPL is module-flavoured: top-level `let`/`const`/`function` persist across `eval` calls in the same thread. By default (`snapshot_between_turns=True`), state also persists across turns in the same LangGraph `thread_id` by snapshotting after each run and restoring before the next.
+
+Set `snapshot_between_turns=False` to reset REPL state after each turn.
+Snapshot payloads are capped by `max_snapshot_bytes` (defaults to `memory_limit`); oversized snapshots are dropped instead of persisted.
 
 ```js
 // call 1
@@ -175,9 +178,9 @@ await tools.summarize({ text: results.join("\n\n") })
 ### Enabling it
 
 ```python
-REPLMiddleware()                              # disabled (default)
-REPLMiddleware(ptc=["search_web"])            # explicit allowlist
-REPLMiddleware(ptc=[search_tool])             # explicit tool object allowlist
+CodeInterpreterMiddleware()                              # disabled (default)
+CodeInterpreterMiddleware(ptc=["search_web"])            # explicit allowlist
+CodeInterpreterMiddleware(ptc=[search_tool])             # explicit tool object allowlist
 ```
 
 The REPL's own tool is always excluded from PTC; `tools.eval("tools.eval(...)")` would be pointless recursion, and if the model wants nested code it can just write nested code in one call.
@@ -225,7 +228,7 @@ Under the hood:
 Enable it by passing the same `BackendProtocol` your `SkillsMiddleware` uses:
 
 ```python
-REPLMiddleware(skills_backend=my_backend)
+CodeInterpreterMiddleware(skills_backend=my_backend)
 ```
 
 There's a hard cap of 1 MiB per skill bundle. If you hit it, split the skill or prune generated code.
@@ -233,13 +236,15 @@ There's a hard cap of 1 MiB per skill bundle. If you hit it, split the skill or 
 ## Configuration reference
 
 ```python
-REPLMiddleware(
+CodeInterpreterMiddleware(
     memory_limit=64 * 1024 * 1024,  # bytes, shared across contexts
     timeout=5.0,                     # per-call seconds
     max_ptc_calls=256,     # per-eval `tools.*` bridge calls, None disables (DoS risk)
     tool_name="eval",                # what the model calls it
     max_result_chars=4000,           # result/stdout truncation, each
     capture_console=True,            # install console.log/warn/error bridge
+    snapshot_between_turns=True,     # snapshot in after_agent, restore in before_agent
+    max_snapshot_bytes=None,         # defaults to `memory_limit`; larger snapshots are dropped
     ptc=None,                        # None | list[str] | list[BaseTool]
     skills_backend=None,             # BackendProtocol for @/skills/<name> imports
 )
@@ -253,7 +258,6 @@ REPLMiddleware(
 | `Timeout` | Call exceeded `timeout=`. |
 | `OutOfMemory` | Runtime hit `memory_limit=`. |
 | `PTCCallBudgetExceeded` | Uncaught `tools.*` call-budget overflow in one eval (`max_ptc_calls=`). |
-| `HostError` | A registered host function (console bridge, tool bridge) threw on the Python side. |
 | `Deadlock` | Top-level promise never resolved with no async host work in flight. |
 | `ConcurrentEval` | Shouldn't happen under locks; defensive mapping for QuickJS `ConcurrentEvalError`. |
 | `SkillNotAvailable` | Source referenced `@/skills/<name>` we couldn't resolve or install. |

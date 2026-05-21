@@ -26,11 +26,12 @@ from langchain.agents.middleware.types import (
 )
 from langchain.tools import ToolRuntime
 from langchain.tools.tool_node import ToolCallRequest
-from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AnyMessage, HumanMessage, ToolMessage
 from langchain_core.messages.content import ContentBlock
 from langchain_core.tools import BaseTool, StructuredTool
+from langgraph.channels.delta import DeltaChannel
 from langgraph.runtime import Runtime
-from langgraph.types import Command
+from langgraph.types import Command, Overwrite
 from pydantic import BaseModel, Field
 
 from deepagents._api.deprecation import warn_deprecated
@@ -52,9 +53,16 @@ from deepagents.backends.utils import (
     check_empty_content,
     format_content_with_line_numbers,
     format_grep_matches,
-    sanitize_tool_call_id,
+    sanitize_tool_call_id as sanitize_tool_call_id,
     truncate_if_too_long,
     validate_path,
+)
+from deepagents.middleware._message_eviction import (
+    TOO_LARGE_TOOL_MSG as TOO_LARGE_TOOL_MSG,
+    _aoffload_tool_message_content,
+    _create_content_preview,
+    _extract_text_from_message,
+    _offload_tool_message_content,
 )
 from deepagents.middleware._utils import append_to_system_message
 
@@ -231,11 +239,30 @@ def _file_data_reducer(left: dict[str, FileData] | None, right: dict[str, FileDa
     return result
 
 
+def _file_data_delta_reducer(
+    left: dict[str, FileData] | None,
+    values: list[dict[str, FileData | None]],
+) -> dict[str, FileData]:
+    """Batch reducer for use with DeltaChannel.
+
+    DeltaChannel calls reducer(base, list(values)) where values is a list of
+    all writes in the current step. Single dict copy + one pass over all writes.
+    """
+    result: dict[str, FileData] = dict(left) if left else {}
+    for writes in values:
+        for key, value in writes.items():
+            if value is None:
+                result.pop(key, None)
+            else:
+                result[key] = value
+    return result
+
+
 class FilesystemState(AgentState):
     """State for the filesystem middleware."""
 
-    files: Annotated[NotRequired[dict[str, FileData]], _file_data_reducer]
-    """Files in the filesystem."""
+    files: Annotated[NotRequired[dict[str, FileData]], DeltaChannel(_file_data_delta_reducer, snapshot_frequency=50)]  # ty: ignore[invalid-argument-type]
+    """Files in the filesystem. Uses DeltaChannel with snapshots every ~50 pregel steps to bound read depth."""
 
 
 class LsSchema(BaseModel):
@@ -453,8 +480,10 @@ Use this tool to run commands, scripts, tests, builds, and other shell operation
 def supports_execution(backend: BackendProtocol) -> bool:
     """Check if a backend supports command execution.
 
-    For CompositeBackend, checks if the default backend supports execution.
-    For other backends, checks if they implement SandboxBackendProtocol.
+    For [`CompositeBackend`][deepagents.backends.composite.CompositeBackend],
+    checks if the default backend supports execution.
+    For other backends, checks if they implement
+    [`SandboxBackendProtocol`][deepagents.backends.protocol.SandboxBackendProtocol].
 
     Args:
         backend: The backend to check.
@@ -500,17 +529,6 @@ TOOLS_EXCLUDED_FROM_EVICTION = (
     "write_file",
 )
 
-
-TOO_LARGE_TOOL_MSG = """Tool result too large, the result of this tool call {tool_call_id} was saved in the filesystem at this path: {file_path}
-
-You can read the result from the filesystem by using the read_file tool, but make sure to only read part of the result at a time.
-
-You can do this by specifying an offset and limit in the read_file tool call. For example, to read the first 100 lines, you can use the read_file tool with offset=0 and limit=100.
-
-Here is a preview showing the head and tail of the result (lines of the form `... [N lines truncated] ...` indicate omitted lines in the middle of the content):
-
-{content_sample}
-"""
 
 TOO_LARGE_HUMAN_MSG = """Message content too large and was saved to the filesystem at: {file_path}
 
@@ -571,84 +589,18 @@ def _build_truncated_human_message(message: HumanMessage, file_path: str) -> Hum
     return message.model_copy(update={"content": evicted})
 
 
-def _create_content_preview(content_str: str, *, head_lines: int = 5, tail_lines: int = 5) -> str:
-    """Create a preview of content showing head and tail with truncation marker.
-
-    Args:
-        content_str: The full content string to preview.
-        head_lines: Number of lines to show from the start.
-        tail_lines: Number of lines to show from the end.
-
-    Returns:
-        Formatted preview string with line numbers.
-    """
-    lines = content_str.splitlines()
-
-    if len(lines) <= head_lines + tail_lines:
-        # If file is small enough, show all lines
-        preview_lines = [line[:1000] for line in lines]
-        return format_content_with_line_numbers(preview_lines, start_line=1)
-
-    # Show head and tail with truncation marker
-    head = [line[:1000] for line in lines[:head_lines]]
-    tail = [line[:1000] for line in lines[-tail_lines:]]
-
-    head_sample = format_content_with_line_numbers(head, start_line=1)
-    truncation_notice = f"\n... [{len(lines) - head_lines - tail_lines} lines truncated] ...\n"
-    tail_sample = format_content_with_line_numbers(tail, start_line=len(lines) - tail_lines + 1)
-
-    return head_sample + truncation_notice + tail_sample
-
-
-def _extract_text_from_message(message: BaseMessage) -> str:
-    """Extract text from a message using its `content_blocks` property.
-
-    Joins all text content blocks and ignores non-text blocks (images, audio, etc.)
-    so that binary payloads don't inflate the size measurement.
-
-    Args:
-        message: The BaseMessage to extract text from.
-
-    Returns:
-        Joined text from all text content blocks, or stringified content as fallback.
-    """
-    texts = [block["text"] for block in message.content_blocks if block["type"] == "text"]
-    return "\n".join(texts)
-
-
-def _build_evicted_content(message: ToolMessage, replacement_text: str) -> str | list[ContentBlock]:
-    """Build replacement content for an evicted message, preserving non-text blocks.
-
-    For plain string content, returns the replacement text directly. For list content
-    with mixed block types (e.g., text + image), replaces all text blocks with a single
-    text block containing the replacement text while keeping non-text blocks intact.
-
-    Args:
-        message: The original ToolMessage being evicted.
-        replacement_text: The truncation notice and preview text.
-
-    Returns:
-        Replacement content: a string or list of content blocks.
-    """
-    if isinstance(message.content, str):
-        return replacement_text
-    media_blocks = [block for block in message.content_blocks if block["type"] != "text"]
-    if not media_blocks:
-        # All content is text, so a plain string replacement is sufficient.
-        return replacement_text
-    return [cast("ContentBlock", {"type": "text", "text": replacement_text}), *media_blocks]
-
-
 class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]):
     """Middleware for providing filesystem and optional execution tools to an agent.
 
     This middleware adds filesystem tools to the agent: `ls`, `read_file`, `write_file`,
     `edit_file`, `glob`, and `grep`.
 
-    Files can be stored using any backend that implements the `BackendProtocol`.
+    Files can be stored using any backend that implements the
+    [`BackendProtocol`][deepagents.backends.protocol.BackendProtocol].
 
-    If the backend implements `SandboxBackendProtocol`, an `execute` tool is also added
-    for running shell commands.
+    If the backend implements
+    [`SandboxBackendProtocol`][deepagents.backends.protocol.SandboxBackendProtocol],
+    an `execute` tool is also added for running shell commands.
 
     This middleware also automatically evicts large tool results to the file system when
     they exceed a token threshold, preventing context window saturation.
@@ -656,11 +608,16 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
     Args:
         backend: Backend for file storage and optional execution.
 
-            If not provided, defaults to `StateBackend` (ephemeral storage in agent state).
+            If not provided, defaults to
+            [`StateBackend`][deepagents.backends.state.StateBackend]
+            (ephemeral storage in agent state).
 
-            For persistent storage or hybrid setups, use `CompositeBackend` with custom routes.
+            For persistent storage or hybrid setups, use
+            [`CompositeBackend`][deepagents.backends.composite.CompositeBackend]
+            with custom routes.
 
-            For execution support, use a backend that implements `SandboxBackendProtocol`.
+            For execution support, use a backend that implements
+            [`SandboxBackendProtocol`][deepagents.backends.protocol.SandboxBackendProtocol].
         system_prompt: Optional custom system prompt override.
         custom_tool_descriptions: Optional custom tool descriptions override.
         tool_token_limit_before_evict: Token limit before evicting a tool result to the
@@ -1806,32 +1763,14 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         if len(content_str) <= NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict:
             return message, False
 
-        # Write content to filesystem
-        sanitized_id = sanitize_tool_call_id(message.tool_call_id)
-        file_path = f"{self._large_tool_results_prefix}/{sanitized_id}"
-        result = resolved_backend.write(file_path, content_str)
-        if result.error:
+        processed_message = _offload_tool_message_content(
+            message,
+            content_str,
+            resolved_backend,
+            self._large_tool_results_prefix,
+        )
+        if processed_message is None:
             return message, False
-
-        # Create preview showing head and tail of the result
-        content_sample = _create_content_preview(content_str)
-        replacement_text = TOO_LARGE_TOOL_MSG.format(
-            tool_call_id=message.tool_call_id,
-            file_path=file_path,
-            content_sample=content_sample,
-        )
-
-        evicted = _build_evicted_content(message, replacement_text)
-        processed_message = ToolMessage(
-            content=cast("str | list[str | dict]", evicted),
-            tool_call_id=message.tool_call_id,
-            name=message.name,
-            id=message.id,
-            artifact=message.artifact,
-            status=message.status,
-            additional_kwargs=dict(message.additional_kwargs),
-            response_metadata=dict(message.response_metadata),
-        )
         return processed_message, True
 
     async def _aprocess_large_message(
@@ -1853,32 +1792,14 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         if len(content_str) <= NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict:
             return message, False
 
-        # Write content to filesystem using async method
-        sanitized_id = sanitize_tool_call_id(message.tool_call_id)
-        file_path = f"{self._large_tool_results_prefix}/{sanitized_id}"
-        result = await resolved_backend.awrite(file_path, content_str)
-        if result.error:
+        processed_message = await _aoffload_tool_message_content(
+            message,
+            content_str,
+            resolved_backend,
+            self._large_tool_results_prefix,
+        )
+        if processed_message is None:
             return message, False
-
-        # Create preview showing head and tail of the result
-        content_sample = _create_content_preview(content_str)
-        replacement_text = TOO_LARGE_TOOL_MSG.format(
-            tool_call_id=message.tool_call_id,
-            file_path=file_path,
-            content_sample=content_sample,
-        )
-
-        evicted = _build_evicted_content(message, replacement_text)
-        processed_message = ToolMessage(
-            content=cast("str | list[str | dict]", evicted),
-            tool_call_id=message.tool_call_id,
-            name=message.name,
-            id=message.id,
-            artifact=message.artifact,
-            status=message.status,
-            additional_kwargs=dict(message.additional_kwargs),
-            response_metadata=dict(message.response_metadata),
-        )
         return processed_message, True
 
     def _get_backend_from_runtime(
@@ -1944,6 +1865,12 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
     ) -> tuple[list[AnyMessage], Command | None]:
         """Tag a newly evicted message and truncate all tagged messages.
 
+        When a new eviction fires, uses `Overwrite` to atomically replace
+        the messages channel with a fully-identified list. A plain append of
+        the tagged message would not survive DeltaChannel replay: the original
+        `HumanMessage(id=None)` write gets a fresh UUID on replay that
+        doesn't match the eviction Command's ID, producing a duplicate.
+
         Args:
             messages: The message list (may be modified if write succeeded).
             write_result: Result of the backend write, or `None` if no new
@@ -1959,13 +1886,14 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             last = messages[-1]
             tagged = last.model_copy(
                 update={
+                    "id": last.id if last.id is not None else str(uuid.uuid4()),
                     "additional_kwargs": {
                         **last.additional_kwargs,
                         "lc_evicted_to": file_path,
-                    }
+                    },
                 }
             )
-            state_command = Command(update={"messages": [tagged]})
+            state_command = Command(update={"messages": Overwrite([*messages[:-1], tagged])})
             messages = [*messages[:-1], tagged]
 
         processed: list[AnyMessage] = []

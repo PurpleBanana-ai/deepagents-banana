@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.6.3](https://github.com/langchain-ai/deepagents/compare/deepagents==0.6.2...deepagents==0.6.3) (2026-05-20)
+
+### Bug Fixes
+
+* Anchor ripgrep glob to search root ([#3454](https://github.com/langchain-ai/deepagents/issues/3454)) ([e50fa3f](https://github.com/langchain-ai/deepagents/commit/e50fa3f00ab1b1a84bbaed74bf7e89118b7c2d82))
+* Assign UUIDs to ID-less messages in _messages_delta_reducer ([#3513](https://github.com/langchain-ai/deepagents/issues/3513)) ([6d959ad](https://github.com/langchain-ai/deepagents/commit/6d959ade30655eae3967c9809994434e0bbd1148))
+* Clarify skill source labels in system prompt ([#3464](https://github.com/langchain-ai/deepagents/issues/3464)) ([fc6a24f](https://github.com/langchain-ai/deepagents/commit/fc6a24f18829cf3f36089945226edfa50d52ab9e))
+* Strip HTML comments from memory content before system prompt injection ([#3462](https://github.com/langchain-ai/deepagents/issues/3462)) ([bfbb8bc](https://github.com/langchain-ai/deepagents/commit/bfbb8bc5575ebd1ba9aa29430f6d2f86c24b7d3c))
+
+## [0.6.2](https://github.com/langchain-ai/deepagents/compare/deepagents==0.6.1...deepagents==0.6.2) (2026-05-18)
+
+### Features
+
+* Add `system_prompt` override slot to memory, skills, and summarization ([#3451](https://github.com/langchain-ai/deepagents/issues/3451)) ([7583f4a](https://github.com/langchain-ai/deepagents/commit/7583f4aff6a6044bc987ee7980d322bb5c791428))
+
+### Bug Fixes
+
+* Patch invalid tool calls ([#3386](https://github.com/langchain-ai/deepagents/issues/3386)) ([c916d1b](https://github.com/langchain-ai/deepagents/commit/c916d1b2e3a81dcd4fb2e595d6b971923c18fa31))
+* Align `MemoryMiddleware` prompt with investigate-first agent behavior ([#2461](https://github.com/langchain-ai/deepagents/issues/2461)) ([d53c8f4](https://github.com/langchain-ai/deepagents/commit/d53c8f4f481288a3aa04a5e62362beba6ed7e57a))
+* Subagents: update prompt and make fetching of last message more robust ([#3406](https://github.com/langchain-ai/deepagents/issues/3406)) ([4421bec](https://github.com/langchain-ai/deepagents/commit/4421bec94ffbe1f3a3bf44088ebcf8ab8c24a736))
+* Summarization: truncate trailing ToolMessages to keep context within `keep` limit ([#3405](https://github.com/langchain-ai/deepagents/issues/3405)) ([bee514f](https://github.com/langchain-ai/deepagents/commit/bee514fd24862b6b22a5993eb8b6cfc69e42dd80))
+* Surface OS errors in sandbox ls/read/edit/glob ([#3359](https://github.com/langchain-ai/deepagents/issues/3359)) ([7598bd9](https://github.com/langchain-ai/deepagents/commit/7598bd93f72b609a46da64f7c458c42ac07a0f3a))
+
+## [0.6.1](https://github.com/langchain-ai/deepagents/compare/deepagents==0.6.0...deepagents==0.6.1) (2026-05-12)
+
+### Bug Fixes
+
+* Import profile re-exports from leaf modules ([#3377](https://github.com/langchain-ai/deepagents/issues/3377)) ([ca99391](https://github.com/langchain-ai/deepagents/commit/ca99391668ea1510932f8e9097e8ed3c0caadf73))
+
+## [0.6.0](https://github.com/langchain-ai/deepagents/compare/deepagents==0.5.9...deepagents==0.6.0) (2026-05-12)
+
+### Features
+
+* **[`CodeInterpreterMiddleware`](https://pypi.org/project/langchain-quickjs)**: (experimental) `deepagents` now supports code execution and programmatic tool calling through a scoped QuickJS runtime. Install via the optional dependency: `deepagents[quickjs]`.
+* Support for `version="v3"` in `stream_events` / `astream_events`. Refer to the [event streaming](https://docs.langchain.com/oss/python/deepagents/event-streaming) guide for details.
+
+## [0.5.9](https://github.com/langchain-ai/deepagents/compare/deepagents==0.5.8...deepagents==0.5.9) (2026-05-10)
+
+### Bug Fixes
+
+* Import profile symbols directly from `harness_profiles` ([#3291](https://github.com/langchain-ai/deepagents/issues/3291)) ([503453c](https://github.com/langchain-ai/deepagents/commit/503453c06f7e0545914789a07ddba6ca6b0c8ec5))
+
+## [0.5.8](https://github.com/langchain-ai/deepagents/compare/deepagents==0.5.7...deepagents==0.5.8) (2026-05-08)
+
+### Bug Fixes
+
+* Avoid deprecated-use warnings in `CompositeBackend` path mutation ([#3244](https://github.com/langchain-ai/deepagents/issues/3244)) ([64d45f6](https://github.com/langchain-ai/deepagents/commit/64d45f67c86edb4df2ced0e7b82f1a8fd158ec8c))
+
+## [0.5.7](https://github.com/langchain-ai/deepagents/compare/deepagents==0.5.6...deepagents==0.5.7) (2026-05-05)
+
+### Bug Fixes
+
+* Auto-added GP subagent inherits parent permissions ([#3131](https://github.com/langchain-ai/deepagents/issues/3131)) ([0d55b3b](https://github.com/langchain-ai/deepagents/commit/0d55b3ba8b974d06b1e0f52893f33e44496bff8b))
+* Default OpenRouter routing to ignore Azure upstream ([#3157](https://github.com/langchain-ai/deepagents/issues/3157)) ([01a9113](https://github.com/langchain-ai/deepagents/commit/01a911379d368fab8280cd827c38776800abe7b8))
+
 ## [0.5.6](https://github.com/langchain-ai/deepagents/compare/deepagents==0.5.5...deepagents==0.5.6) (2026-05-01)
 
 ### Bug Fixes
