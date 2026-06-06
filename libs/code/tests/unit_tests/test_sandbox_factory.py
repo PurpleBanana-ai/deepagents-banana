@@ -10,6 +10,7 @@ import pytest
 
 from deepagents_code.integrations.sandbox_factory import (
     _get_provider,
+    create_sandbox,
     get_default_working_dir,
     verify_sandbox_deps,
 )
@@ -40,6 +41,201 @@ def test_get_provider_raises_helpful_error_for_missing_optional_dependency(
         pytest.raises(ImportError, match=error),
     ):
         _get_provider(provider)
+
+
+def test_create_sandbox_passes_langsmith_snapshot_name() -> None:
+    """LangSmith snapshot names are forwarded to the provider."""
+    backend = MagicMock(id="sandbox-1")
+    provider = MagicMock()
+    provider.get_or_create.return_value = backend
+
+    with (
+        patch(
+            "deepagents_code.integrations.sandbox_factory._get_provider",
+            return_value=provider,
+        ),
+        create_sandbox("langsmith", snapshot_name="custom-snap") as result,
+    ):
+        assert result is backend
+
+    provider.get_or_create.assert_called_once_with(
+        sandbox_id=None,
+        snapshot="custom-snap",
+    )
+    provider.delete.assert_called_once_with(sandbox_id="sandbox-1")
+
+
+def test_create_sandbox_passes_runloop_snapshot_name() -> None:
+    """Runloop blueprint names are forwarded to the provider."""
+    backend = MagicMock(id="sandbox-1")
+    provider = MagicMock()
+    provider.get_or_create.return_value = backend
+
+    with (
+        patch(
+            "deepagents_code.integrations.sandbox_factory._get_provider",
+            return_value=provider,
+        ),
+        create_sandbox("runloop", snapshot_name="custom-blueprint") as result,
+    ):
+        assert result is backend
+
+    provider.get_or_create.assert_called_once_with(
+        sandbox_id=None,
+        snapshot="custom-blueprint",
+    )
+    provider.delete.assert_called_once_with(sandbox_id="sandbox-1")
+
+
+def test_runloop_provider_delegates_to_langchain_runloop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_RunloopProvider` forwards snapshot kwargs to `RunloopProvider`."""
+    from deepagents_code.integrations.sandbox_factory import _RunloopProvider
+
+    fake_provider = MagicMock()
+    fake_provider.get_or_create.return_value = MagicMock(id="dev-1")
+    fake_module = MagicMock()
+    fake_module.RunloopProvider.return_value = fake_provider
+
+    monkeypatch.setenv("RUNLOOP_API_KEY", "test-key")
+    with patch(
+        "deepagents_code.integrations.sandbox_factory._import_provider_module",
+        return_value=fake_module,
+    ):
+        provider = _RunloopProvider()
+        provider.get_or_create(sandbox_id=None, snapshot="my-bp")
+        provider.delete(sandbox_id="dev-1")
+
+    fake_module.RunloopProvider.assert_called_once()
+    fake_provider.get_or_create.assert_called_once_with(
+        sandbox_id=None,
+        timeout=180,
+        snapshot="my-bp",
+    )
+    fake_provider.delete.assert_called_once_with(sandbox_id="dev-1")
+
+
+def test_runloop_provider_forwards_blueprint_dockerfile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`blueprint_dockerfile` passes through `**kwargs` to `RunloopProvider`."""
+    from deepagents_code.integrations.sandbox_factory import _RunloopProvider
+
+    fake_provider = MagicMock()
+    fake_provider.get_or_create.return_value = MagicMock(id="dev-1")
+    fake_module = MagicMock()
+    fake_module.RunloopProvider.return_value = fake_provider
+
+    monkeypatch.setenv("RUNLOOP_API_KEY", "test-key")
+    with patch(
+        "deepagents_code.integrations.sandbox_factory._import_provider_module",
+        return_value=fake_module,
+    ):
+        provider = _RunloopProvider()
+        provider.get_or_create(
+            sandbox_id=None,
+            snapshot="my-bp",
+            blueprint_dockerfile="FROM ubuntu:24.04\n",
+        )
+
+    fake_provider.get_or_create.assert_called_once_with(
+        sandbox_id=None,
+        timeout=180,
+        snapshot="my-bp",
+        blueprint_dockerfile="FROM ubuntu:24.04\n",
+    )
+
+
+def test_create_sandbox_rejects_snapshot_name_for_other_providers() -> None:
+    """Snapshot names only apply to LangSmith and Runloop."""
+    provider = MagicMock()
+
+    with (
+        patch(
+            "deepagents_code.integrations.sandbox_factory._get_provider",
+            return_value=provider,
+        ),
+        pytest.raises(
+            ValueError,
+            match="only supported for provider='langsmith' or 'runloop'",
+        ),
+        create_sandbox("modal", snapshot_name="custom-snap"),
+    ):
+        pass
+
+    provider.get_or_create.assert_not_called()
+
+
+@pytest.mark.parametrize("provider_name", ["langsmith", "runloop"])
+def test_create_sandbox_rejects_snapshot_name_with_sandbox_id(
+    provider_name: str,
+) -> None:
+    """Snapshots are only meaningful for fresh sandboxes, not re-attach."""
+    provider = MagicMock()
+
+    with (
+        patch(
+            "deepagents_code.integrations.sandbox_factory._get_provider",
+            return_value=provider,
+        ),
+        pytest.raises(ValueError, match="cannot be combined with sandbox_id"),
+        create_sandbox(
+            provider_name,
+            sandbox_id="sb-existing",
+            snapshot_name="custom-snap",
+        ),
+    ):
+        pass
+
+    provider.get_or_create.assert_not_called()
+
+
+def test_runloop_provider_raises_sandbox_not_found_for_missing_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing devbox ID (surfaced as `KeyError`) maps to `SandboxNotFoundError`.
+
+    `RunloopProvider` translates the SDK's `NotFoundError` to a `KeyError`, so the
+    factory only ever sees the builtin and stays free of an SDK import.
+    """
+    from deepagents_code.integrations.sandbox_factory import _RunloopProvider
+    from deepagents_code.integrations.sandbox_provider import SandboxNotFoundError
+
+    fake_provider = MagicMock()
+    fake_provider.get_or_create.side_effect = KeyError("missing-dev")
+    fake_module = MagicMock()
+    fake_module.RunloopProvider.return_value = fake_provider
+
+    monkeypatch.setenv("RUNLOOP_API_KEY", "test-key")
+    with patch(
+        "deepagents_code.integrations.sandbox_factory._import_provider_module",
+        return_value=fake_module,
+    ):
+        provider = _RunloopProvider()
+        with pytest.raises(SandboxNotFoundError, match="missing-dev"):
+            provider.get_or_create(sandbox_id="missing-dev")
+
+
+def test_runloop_provider_reraises_keyerror_without_sandbox_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `KeyError` with no `sandbox_id` is not mislabeled as `SandboxNotFoundError`."""
+    from deepagents_code.integrations.sandbox_factory import _RunloopProvider
+
+    fake_provider = MagicMock()
+    fake_provider.get_or_create.side_effect = KeyError("unexpected")
+    fake_module = MagicMock()
+    fake_module.RunloopProvider.return_value = fake_provider
+
+    monkeypatch.setenv("RUNLOOP_API_KEY", "test-key")
+    with patch(
+        "deepagents_code.integrations.sandbox_factory._import_provider_module",
+        return_value=fake_module,
+    ):
+        provider = _RunloopProvider()
+        with pytest.raises(KeyError):
+            provider.get_or_create(sandbox_id=None)
 
 
 def test_agentcore_get_or_create_raises_for_missing_dep() -> None:
@@ -276,7 +472,7 @@ class TestVerifySandboxDeps:
             pytest.raises(
                 ImportError,
                 match=rf"Missing dependencies for '{provider}' sandbox.*"
-                rf"pip install 'deepagents-code\[{provider}\]'",
+                rf"/install {provider}.*dcode --install {provider}",
             ),
         ):
             verify_sandbox_deps(provider)
@@ -366,6 +562,25 @@ class TestLangSmithSnapshotResolution:
         mock_client.create_sandbox.assert_called_once()
         kwargs = mock_client.create_sandbox.call_args.kwargs
         assert kwargs["snapshot_id"] == "snap-abc123"
+
+    def test_snapshot_kwarg_overrides_env_var(
+        self,
+        provider,
+        mock_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Explicit snapshot kwarg wins over `LANGSMITH_SANDBOX_SNAPSHOT_NAME`."""
+        monkeypatch.delenv("LANGSMITH_SANDBOX_SNAPSHOT_ID", raising=False)
+        monkeypatch.setenv("LANGSMITH_SANDBOX_SNAPSHOT_NAME", "env-snap")
+
+        existing = MagicMock(id="snap-flag", status="ready")
+        existing.name = "flag-snap"
+        mock_client.list_snapshots.return_value = [existing]
+
+        provider.get_or_create(snapshot="flag-snap")
+
+        mock_client.create_snapshot.assert_not_called()
+        assert mock_client.create_sandbox.call_args.kwargs["snapshot_id"] == "snap-flag"
 
     def test_snapshot_name_env_var_overrides_default(
         self,

@@ -20,9 +20,11 @@ import sys
 import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
+    from rich.console import Console
+
     from deepagents_code.app import AppResult
     from deepagents_code.mcp_tools import MCPServerInfo
     from deepagents_code.notifications import PendingNotification
@@ -33,6 +35,127 @@ warnings.filterwarnings("ignore", message=".*Pydantic V1.*", category=UserWarnin
 from deepagents_code._version import __version__
 
 logger = logging.getLogger(__name__)
+
+
+def _restart_current_process() -> NoReturn:
+    """Replace the current process with a fresh `deepagents_code` invocation.
+
+    Raises:
+        RuntimeError: If process replacement unexpectedly returns.
+    """
+    argv = [sys.executable, "-m", "deepagents_code", *sys.argv[1:]]
+    # Re-exec the trusted interpreter with the user's own argv verbatim; the
+    # only "input" is the command the user already ran, so S606's concern
+    # (untrusted/unsanitized args to a spawned executable) does not apply.
+    os.execv(sys.executable, argv)  # noqa: S606
+    msg = "os.execv returned unexpectedly"
+    raise RuntimeError(msg)
+
+
+def _run_startup_auto_update(console: "Console") -> None:
+    """Apply enabled auto-updates before the TUI and server start.
+
+    On a successful upgrade the process is re-exec'd so the new version is
+    loaded. Any failure is fail-soft: the installed version is launched and
+    the error is surfaced, never blocking startup.
+
+    Raises:
+        SystemExit: Re-raised rather than suppressed by the fail-soft handler,
+            so a process-exit request is never swallowed (the `os.execv`
+            re-exec is simulated this way under test).
+    """
+    from rich.markup import escape
+
+    from deepagents_code._env_vars import DEBUG_UPDATE, RESTARTED_AFTER_UPDATE
+    from deepagents_code._version import __version__ as cli_version
+    from deepagents_code.config import _is_editable_install
+    from deepagents_code.update_check import (
+        create_update_log_path,
+        format_release_age_parenthetical,
+        get_cached_update_available,
+        is_auto_update_enabled,
+        perform_upgrade,
+        upgrade_command,
+    )
+
+    try:
+        if _is_editable_install() or not is_auto_update_enabled():
+            return
+        # Consume the re-exec sentinel recorded before the previous restart.
+        restarted_for = os.environ.pop(RESTARTED_AFTER_UPDATE, None)
+        available, latest = get_cached_update_available()
+        if not available or latest is None:
+            return
+        if restarted_for == latest:
+            # Already restarted after upgrading to this version, yet it still
+            # reports as available: the install did not change the running
+            # version. Bail out instead of upgrading and restarting forever
+            # (this runs before the TUI, so there is no in-app way to stop it).
+            cmd = upgrade_command()
+            console.print(
+                f"[bold yellow]Warning:[/bold yellow] v{latest} still reports as "
+                "available after an automatic update; skipping auto-update to "
+                f"avoid a restart loop. Update manually: [cyan]{cmd}[/cyan]\n"
+                f"Continuing with v{cli_version}.",
+                highlight=False,
+            )
+            return
+        release_age = format_release_age_parenthetical(latest)
+        console.print(
+            f"Auto-updating deepagents-code from v{cli_version} to "
+            f"v{latest}{release_age} before startup..."
+        )
+        if os.environ.get(DEBUG_UPDATE):
+            console.print("Skipped update install (debug mode).", style="dim")
+            return
+        log_path = create_update_log_path()
+        console.print(
+            f"Update log: {log_path}\nTail progress: tail -f {log_path}",
+            style="dim",
+            highlight=False,
+            markup=False,
+        )
+        success, output = asyncio.run(perform_upgrade(log_path=log_path))
+        if success:
+            console.print(f"[green]Updated to v{latest}. Restarting...[/green]")
+            # Record the target version so the re-exec'd process can detect a
+            # no-op upgrade and break the loop (see the `restarted_for` guard).
+            os.environ[RESTARTED_AFTER_UPDATE] = latest
+            try:
+                _restart_current_process()
+            except (OSError, RuntimeError):
+                # Upgrade succeeded but the re-exec did not happen (`os.execv`
+                # raised, or returned unexpectedly). Drop the sentinel and
+                # continue on the old in-memory code; the user must restart
+                # manually to load the new version.
+                os.environ.pop(RESTARTED_AFTER_UPDATE, None)
+                logger.warning("Restart after update failed", exc_info=True)
+                console.print(
+                    f"[bold yellow]Warning:[/bold yellow] Updated to v{latest} but "
+                    "the automatic restart failed. Restart dcode manually to use "
+                    "the new version.",
+                    highlight=False,
+                )
+            return
+        cmd = upgrade_command()
+        detail = f": {escape(output[:200])}" if output else ""
+        console.print(
+            f"[bold red]Auto-update failed{detail}[/bold red]\n"
+            f"Run manually: [cyan]{cmd}[/cyan]\n"
+            f"Continuing with v{cli_version}.",
+            markup=True,
+            highlight=False,
+        )
+    except SystemExit:
+        # Process replacement (and test doubles that simulate it) must not be
+        # swallowed by the fail-soft handler below.
+        raise
+    except Exception:
+        logger.warning("Startup auto-update failed", exc_info=True)
+        console.print(
+            "[bold yellow]Warning:[/bold yellow] Auto-update failed before startup; "
+            "continuing with the installed version."
+        )
 
 
 def _resolve_agent_arg(args: argparse.Namespace) -> str:
@@ -201,10 +324,10 @@ def check_cli_dependencies() -> None:
         print("\nThe following packages are required to use Deep Agents Code:")  # noqa: T201  # App output for missing dependencies
         for pkg in missing:
             print(f"  - {pkg}")  # noqa: T201  # CLI output for missing dependencies
-        print("\nPlease install them with:")  # noqa: T201  # CLI output for missing dependencies
-        print("  pip install deepagents[cli]")  # noqa: T201  # CLI output for missing dependencies
-        print("\nOr install all dependencies:")  # noqa: T201  # CLI output for missing dependencies
-        print("  pip install 'deepagents[cli]'")  # noqa: T201  # CLI output for missing dependencies
+        print("\nReinstall dcode with the recommended installer:")  # noqa: T201  # CLI output for missing dependencies
+        print("  curl -LsSf https://langch.in/dcode | bash")  # noqa: T201  # CLI output for missing dependencies
+        print("\nOr install the tool directly via uv:")  # noqa: T201  # CLI output for missing dependencies
+        print("  uv tool install -U deepagents-code")  # noqa: T201  # CLI output for missing dependencies
         sys.exit(1)
 
 
@@ -917,6 +1040,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--sandbox-snapshot-name",
+        metavar="NAME",
+        help="Snapshot (langsmith) or blueprint (runloop) name to use or create",
+    )
+
+    parser.add_argument(
         "--sandbox-setup",
         metavar="PATH",
         help="Path to setup script to run in sandbox after creation",
@@ -932,7 +1061,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mcp-config",
         help="Path to MCP servers JSON configuration file (Claude Desktop format). "
-        "Merged on top of auto-discovered configs (highest precedence).",
+        "Merged on top of auto-discovered configs (highest precedence). "
+        "Run `dcode mcp config` to see discovery paths.",
     )
     parser.add_argument(
         "--no-mcp",
@@ -983,6 +1113,24 @@ def parse_args() -> argparse.Namespace:
         help="Toggle automatic updates on or off, then exit",
     )
     parser.add_argument(
+        "--install",
+        metavar="NAME",
+        help="Install an optional extra (e.g. quickjs, daytona, fireworks), then exit",
+    )
+    parser.add_argument(
+        "--package",
+        action="store_true",
+        help=(
+            "With --install, treat NAME as a package added via `uv --with` "
+            "(for a custom provider package), not a deepagents-code extra"
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip interactive confirmation prompts (e.g., for --install)",
+    )
+    parser.add_argument(
         "--acp",
         action="store_true",
         help="Run as an ACP server over stdio instead of launching the Textual UI",
@@ -1016,7 +1164,13 @@ def parse_args() -> argparse.Namespace:
         action=_make_help_action(_lazy_help("show_help")),
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.sandbox_snapshot_name is not None and args.sandbox not in {
+        "langsmith",
+        "runloop",
+    }:
+        parser.error("--sandbox-snapshot-name requires --sandbox langsmith or runloop")
+    return args
 
 
 async def run_textual_cli_async(
@@ -1025,6 +1179,7 @@ async def run_textual_cli_async(
     auto_approve: bool = False,
     sandbox_type: str = "none",  # str (not None) to match argparse choices
     sandbox_id: str | None = None,
+    sandbox_snapshot_name: str | None = None,
     sandbox_setup: str | None = None,
     model_name: str | None = None,
     model_params: dict[str, Any] | None = None,
@@ -1052,6 +1207,7 @@ async def run_textual_cli_async(
         sandbox_type: Type of sandbox
             ("none", "agentcore", "modal", "runloop", "daytona", "langsmith")
         sandbox_id: Optional existing sandbox ID to reuse.
+        sandbox_snapshot_name: Snapshot (langsmith) or blueprint (runloop) name.
         sandbox_setup: Optional path to setup script to run in the sandbox
             after creation.
         model_name: Optional model name to use
@@ -1158,6 +1314,7 @@ async def run_textual_cli_async(
         "model_params": model_params,
         "sandbox_type": sandbox_type,
         "sandbox_id": sandbox_id,
+        "sandbox_snapshot_name": sandbox_snapshot_name,
         "sandbox_setup": sandbox_setup,
         "enable_ask_user": True,
         "enable_interpreter": enable_interpreter,
@@ -1193,6 +1350,7 @@ async def run_textual_cli_async(
             server_kwargs=server_kwargs,
             mcp_preload_kwargs=mcp_preload_kwargs,
             model_kwargs=model_kwargs,
+            model_explicitly_set=model_name is not None,
             defer_server_start=defer_server_start,
         )
     except Exception as e:
@@ -1624,8 +1782,12 @@ def _check_mcp_project_trust(*, trust_flag: bool = False) -> bool | None:
         answer = ""
 
     if answer == "y":
-        if not debug_prompt:
-            trust_project_mcp(project_root, fingerprint)
+        if not debug_prompt and not trust_project_mcp(project_root, fingerprint):
+            prompt_console.print(
+                "[yellow]Approved for this session, but the decision could not be "
+                "saved — you'll be asked again next time.[/yellow]",
+                highlight=False,
+            )
         return True
     return False
 
@@ -1766,7 +1928,8 @@ def cli_main() -> None:
             except ImportError as exc:
                 msg = (
                     f"ACP dependencies not available: {exc}\n"
-                    "Install with: pip install deepagents-acp\n"
+                    "Install with: uv tool install -U deepagents-code "
+                    "--with deepagents-acp\n"
                 )
                 sys.stderr.write(msg)
                 sys.stderr.flush()
@@ -1955,6 +2118,224 @@ def cli_main() -> None:
                 )
                 sys.exit(1)
 
+        if args.package and not args.install:
+            console.print(
+                "[bold red]Error:[/bold red] --package requires --install <package>.",
+            )
+            sys.exit(2)
+
+        # Handle --install <package> --package flag (headless, no session).
+        # Installs an arbitrary package via `uv --with` for a custom provider,
+        # rather than a deepagents-code extra. Always exits.
+        if args.install and args.package:
+            from rich.markup import escape
+
+            from deepagents_code.config import _is_editable_install
+            from deepagents_code.update_check import (
+                create_update_log_path,
+                editable_package_hint,
+                is_valid_package_name,
+                perform_install_package,
+            )
+
+            package: str = args.install
+            pkg_log_path: Path | None = None
+            try:
+                if not is_valid_package_name(package):
+                    # Defense in depth — the package is interpolated into a
+                    # shell command. Reject malformed names before any prompt
+                    # or uv call, even with --yes.
+                    console.print(
+                        f"[bold red]Error:[/bold red] "
+                        f"Invalid package name '{escape(package)}'. "
+                        "Package names must be alphanumeric with `-`, `_`, "
+                        "or `.` (PEP 508).",
+                        highlight=False,
+                    )
+                    sys.exit(2)
+                if _is_editable_install():
+                    console.print(
+                        "[bold yellow]Warning:[/bold yellow] "
+                        "--install --package is not supported on editable "
+                        "installs.\n" + escape(editable_package_hint(package)),
+                        highlight=False,
+                    )
+                    sys.exit(1)
+
+                # Arbitrary packages have no curated allowlist to vet against,
+                # so confirm before pulling third-party code into the tool env.
+                console.print(
+                    f"This will install the package '{escape(package)}' into "
+                    "the Deep Agents Code environment (this runs third-party "
+                    "code).",
+                    highlight=False,
+                )
+                if not args.yes:
+                    if not sys.stdin.isatty():
+                        console.print(
+                            "[bold red]Error:[/bold red] "
+                            "Refusing package install in non-interactive mode. "
+                            "Pass --yes to proceed."
+                        )
+                        sys.exit(2)
+                    try:
+                        reply = input(f"Install package '{package}'? [y/N] ")
+                    except EOFError:
+                        console.print("\nAborted.", style="dim")
+                        sys.exit(130)
+                    if reply.strip().lower() not in {"y", "yes"}:
+                        console.print("Aborted.", style="dim")
+                        sys.exit(1)
+
+                console.print(f"Installing package '{package}'...")
+                pkg_log_path = create_update_log_path()
+                console.print(
+                    f"Install log: {pkg_log_path}\n"
+                    f"Tail progress: tail -f {pkg_log_path}",
+                    style="dim",
+                    highlight=False,
+                    markup=False,
+                )
+                success, output = asyncio.run(
+                    perform_install_package(package, log_path=pkg_log_path)
+                )
+                if success:
+                    console.print(f"[green]Installed package '{package}'.[/green]")
+                    sys.exit(0)
+                # Tail the last 200 chars — uv prints the resolved error at the
+                # end. The full output is in the log.
+                detail = f": {output[-200:]}" if output else ""
+                console.print(
+                    f"[bold red]Install failed[/bold red]{escape(detail)}\n"
+                    f"Log: {pkg_log_path}",
+                    markup=True,
+                    highlight=False,
+                )
+                sys.exit(1)
+            except KeyboardInterrupt:
+                console.print("\nAborted.", style="dim")
+                sys.exit(130)
+            except Exception as exc:
+                logger.warning("--install --package failed", exc_info=True)
+                log_line = f"\nLog: {pkg_log_path}" if pkg_log_path else ""
+                console.print(
+                    f"[bold red]Error:[/bold red] "
+                    f"{type(exc).__name__}: {escape(str(exc))}"
+                    f"{escape(log_line)}",
+                    markup=True,
+                    highlight=False,
+                )
+                sys.exit(1)
+
+        # Handle --install <extra> flag (headless, no session)
+        if args.install:
+            from rich.markup import escape
+
+            from deepagents_code.config import _is_editable_install
+            from deepagents_code.extras_info import KNOWN_EXTRAS
+            from deepagents_code.update_check import (
+                create_update_log_path,
+                editable_extra_hint,
+                install_extra_command,
+                is_valid_extra_name,
+                perform_install_extra,
+            )
+
+            extra: str = args.install
+            log_path: Path | None = None
+            manual_cmd: str | None = None
+            try:
+                if not is_valid_extra_name(extra):
+                    # Defense in depth — the extra is interpolated into a
+                    # shell command. Reject malformed names before any
+                    # confirmation prompt, even with --yes.
+                    console.print(
+                        f"[bold red]Error:[/bold red] "
+                        f"Invalid extra name '{escape(extra)}'. "
+                        "Extra names must be alphanumeric with `-`, `_`, "
+                        "or `.` (PEP 508).",
+                        highlight=False,
+                    )
+                    sys.exit(2)
+                if _is_editable_install():
+                    console.print(
+                        "[bold yellow]Warning:[/bold yellow] "
+                        "--install is not supported on editable installs.\n"
+                        + escape(editable_extra_hint(extra)),
+                        highlight=False,
+                    )
+                    sys.exit(1)
+
+                manual_cmd = install_extra_command(extra)
+                # KNOWN_EXTRAS is a curated "did you mean" list, not the
+                # authoritative set (that's pyproject, resolved by uv): warn and
+                # confirm rather than refuse, since valid-but-unlisted names
+                # exist (e.g. all-providers). Malformed names blocked above.
+                if extra not in KNOWN_EXTRAS:
+                    known = ", ".join(sorted(KNOWN_EXTRAS))
+                    console.print(
+                        f"[bold yellow]Warning:[/bold yellow] "
+                        f"'{extra}' is not a known extra.\n"
+                        f"Known extras: {known}",
+                        highlight=False,
+                    )
+                    if not args.yes:
+                        if not sys.stdin.isatty():
+                            console.print(
+                                "[bold red]Error:[/bold red] "
+                                "Refusing unknown extra in non-interactive "
+                                "mode. Pass --yes to override."
+                            )
+                            sys.exit(2)
+                        reply = input("Continue anyway? [y/N] ").strip().lower()
+                        if reply not in {"y", "yes"}:
+                            console.print("Aborted.", style="dim")
+                            sys.exit(1)
+
+                console.print(f"Installing extra '{extra}'...")
+                log_path = create_update_log_path()
+                console.print(
+                    f"Install log: {log_path}\nTail progress: tail -f {log_path}",
+                    style="dim",
+                    highlight=False,
+                    markup=False,
+                )
+                success, output = asyncio.run(
+                    perform_install_extra(extra, log_path=log_path)
+                )
+                if success:
+                    console.print(f"[green]Installed extra '{extra}'.[/green]")
+                    sys.exit(0)
+                # Tail the last 200 chars — uv resolver prints the resolved
+                # error at the end, not the beginning.
+                detail = f": {output[-200:]}" if output else ""
+                console.print(
+                    f"[bold red]Install failed[/bold red]{escape(detail)}\n"
+                    f"Log: {log_path}\n"
+                    f"Run manually: [cyan]{manual_cmd}[/cyan]",
+                    markup=True,
+                    highlight=False,
+                )
+                sys.exit(1)
+            except KeyboardInterrupt:
+                console.print("\nAborted.", style="dim")
+                sys.exit(130)
+            except Exception as exc:
+                logger.warning("--install failed", exc_info=True)
+                log_line = f"\nLog: {log_path}" if log_path else ""
+                fallback_cmd = (
+                    manual_cmd or f"uv tool install -U 'deepagents-code[{extra}]'"
+                )
+                console.print(
+                    f"[bold red]Error:[/bold red] "
+                    f"{type(exc).__name__}: {escape(str(exc))}"
+                    f"{escape(log_line)}\n"
+                    f"Run manually: [cyan]{escape(fallback_cmd)}[/cyan]",
+                    markup=True,
+                    highlight=False,
+                )
+                sys.exit(1)
+
         # Handle --auto-update flag (headless toggle: reads current state
         # and inverts it, no session)
         if args.auto_update:
@@ -2068,25 +2449,26 @@ def cli_main() -> None:
 
             execute_skills_command(args)
         elif args.command == "mcp":
-            from deepagents_code.mcp_commands import run_mcp_login
+            from deepagents_code.mcp_commands import run_mcp_config, run_mcp_login
             from deepagents_code.ui import show_mcp_help
 
             if args.mcp_command == "login":
-                if getattr(args, "mcp_config", None) and not args.config_path:
+                config_path = args.config_path or args.mcp_config
+                if config_path and not args.config_path:
                     print(  # noqa: T201
-                        "--mcp-config is not supported for 'mcp login'. "
-                        "Use: dcode mcp login <server> --config <path>",
+                        f"Using --mcp-config from top-level: {config_path}",
                         file=sys.stderr,
                     )
-                    sys.exit(2)
                 sys.exit(
                     asyncio.run(
                         run_mcp_login(
                             server=args.server,
-                            config_path=args.config_path,
+                            config_path=config_path,
                         )
                     )
                 )
+            if args.mcp_command == "config":
+                sys.exit(run_mcp_config())
             show_mcp_help()
         elif args.command == "threads":
             from deepagents_code.sessions import (
@@ -2196,6 +2578,7 @@ def cli_main() -> None:
                             profile_override=profile_override,
                             sandbox_type=args.sandbox,
                             sandbox_id=args.sandbox_id,
+                            sandbox_snapshot_name=args.sandbox_snapshot_name,
                             sandbox_setup=getattr(args, "sandbox_setup", None),
                             initial_skill=getattr(args, "initial_skill", None),
                             startup_cmd=getattr(args, "startup_cmd", None),
@@ -2231,6 +2614,7 @@ def cli_main() -> None:
                 sys.exit(130)
             sys.exit(exit_code)
         else:
+            _run_startup_auto_update(console)
             # Resolve recent-agent fallback only for actual session launches.
             assistant_id = _resolve_agent_arg(args)
             # Interactive mode - handle thread resume
@@ -2288,6 +2672,7 @@ def cli_main() -> None:
                         auto_approve=args.auto_approve,
                         sandbox_type=args.sandbox,
                         sandbox_id=args.sandbox_id,
+                        sandbox_snapshot_name=args.sandbox_snapshot_name,
                         sandbox_setup=getattr(args, "sandbox_setup", None),
                         model_name=getattr(args, "model", None),
                         model_params=model_params,
@@ -2361,11 +2746,12 @@ def cli_main() -> None:
                         console.print()
                         release_age = format_release_age_parenthetical(latest)
                         installed_age = format_installed_age_suffix(cli_version)
-                        update_msg = Text("Update available: ", style="yellow bold")
-                        update_msg.append(f"v{latest}", style="yellow")
-                        update_msg.append(release_age, style="dim")
+                        update_msg = Text(
+                            f"Update available: v{latest}", style="yellow bold"
+                        )
                         update_msg.append(
-                            f". Currently installed: {cli_version}{installed_age}.",
+                            f"{release_age}. "
+                            f"Currently installed: {cli_version}{installed_age}.",
                             style="dim",
                         )
                         console.print(update_msg)

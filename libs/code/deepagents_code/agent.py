@@ -62,6 +62,7 @@ from deepagents_code.config import (
     settings,
 )
 from deepagents_code.configurable_model import ConfigurableModelMiddleware
+from deepagents_code.filesystem_empty_result import _FilesystemEmptyResultMiddleware
 from deepagents_code.integrations.sandbox_factory import get_default_working_dir
 from deepagents_code.local_context import (
     LocalContextMiddleware,
@@ -1204,51 +1205,67 @@ def create_cli_agent(
         else settings.get_project_agents_dir()
     )
 
+    def _subagent_cli_middleware(*, has_explicit_model: bool) -> list[AgentMiddleware]:
+        middleware: list[AgentMiddleware] = []
+        if not has_explicit_model:
+            middleware.append(ConfigurableModelMiddleware())
+        if restrictive_shell_allow_list is not None:
+            middleware.append(ShellAllowListMiddleware(restrictive_shell_allow_list))
+        return middleware
+
     for subagent_meta in list_subagents(
         user_agents_dir=user_agents_dir,
         project_agents_dir=project_agents_dir,
     ):
+        # Treat a falsy spec (`None` or `""`) as "no explicit model" so an empty
+        # `model:` in subagent frontmatter inherits the runtime model rather than
+        # being forwarded verbatim to `resolve_model("")`.
+        model_spec = subagent_meta["model"]
+        has_explicit_model = bool(model_spec)
         subagent: SubAgent = {
             "name": subagent_meta["name"],
             "description": subagent_meta["description"],
             "system_prompt": subagent_meta["system_prompt"],
         }
-        if subagent_meta["model"]:
-            subagent["model"] = subagent_meta["model"]
-        if restrictive_shell_allow_list is not None:
-            subagent["middleware"] = [
-                ShellAllowListMiddleware(restrictive_shell_allow_list)
-            ]
+        if model_spec:
+            subagent["model"] = model_spec
+        subagent_middleware = _subagent_cli_middleware(
+            has_explicit_model=has_explicit_model
+        )
+        if subagent_middleware:
+            subagent["middleware"] = subagent_middleware
         custom_subagents.append(subagent)
 
-    if restrictive_shell_allow_list is not None:
-        from deepagents.middleware.subagents import (
-            GENERAL_PURPOSE_SUBAGENT,
-            SubAgent as RuntimeSubAgent,
-        )
+    from deepagents.middleware.subagents import (
+        GENERAL_PURPOSE_SUBAGENT,
+        SubAgent as RuntimeSubAgent,
+    )
 
-        if not any(
-            subagent["name"] == GENERAL_PURPOSE_SUBAGENT["name"]
-            for subagent in custom_subagents
-        ):
-            general_purpose_subagent: RuntimeSubAgent = {
-                "name": GENERAL_PURPOSE_SUBAGENT["name"],
-                "description": GENERAL_PURPOSE_SUBAGENT["description"],
-                "system_prompt": GENERAL_PURPOSE_SUBAGENT["system_prompt"],
-                "middleware": [ShellAllowListMiddleware(restrictive_shell_allow_list)],
-            }
-            custom_subagents.append(general_purpose_subagent)
+    if not any(
+        subagent["name"] == GENERAL_PURPOSE_SUBAGENT["name"]
+        for subagent in custom_subagents
+    ):
+        general_purpose_subagent: RuntimeSubAgent = {
+            "name": GENERAL_PURPOSE_SUBAGENT["name"],
+            "description": GENERAL_PURPOSE_SUBAGENT["description"],
+            "system_prompt": GENERAL_PURPOSE_SUBAGENT["system_prompt"],
+            "middleware": _subagent_cli_middleware(has_explicit_model=False),
+        }
+        custom_subagents.append(general_purpose_subagent)
 
     # Build middleware stack based on enabled features
-    agent_middleware = []
-    agent_middleware.append(ConfigurableModelMiddleware())
+    agent_middleware = [
+        ConfigurableModelMiddleware(),
+        _FilesystemEmptyResultMiddleware(),
+    ]
 
-    # Token state: declares the `_context_tokens` channel and writes it from
-    # `after_model` based on the latest `AIMessage.usage_metadata`. The CLI
-    # reads it back from `state_values` on thread resume.
-    from deepagents_code.token_state import TokenStateMiddleware
+    # Resume state: declares the `_context_tokens` and `_model_spec` channels
+    # and writes them from `after_model` (token count from the latest
+    # `AIMessage.usage_metadata`, model spec from `context["effective_model"]`).
+    # The CLI reads them back from `state_values` on thread resume.
+    from deepagents_code.resume_state import ResumeStateMiddleware
 
-    agent_middleware.append(TokenStateMiddleware())
+    agent_middleware.append(ResumeStateMiddleware())
 
     # Add ask_user middleware (must be early so its tool is available)
     if enable_ask_user:
@@ -1268,7 +1285,7 @@ def create_cli_agent(
 
         agent_middleware.append(
             MemoryMiddleware(
-                backend=FilesystemBackend(),
+                backend=FilesystemBackend(virtual_mode=False),
                 sources=memory_sources,
             )
         )
@@ -1311,7 +1328,7 @@ def create_cli_agent(
 
         agent_middleware.append(
             SkillsMiddleware(
-                backend=FilesystemBackend(),
+                backend=FilesystemBackend(virtual_mode=False),
                 sources=middleware_sources,
             )
         )
@@ -1337,7 +1354,7 @@ def create_cli_agent(
             )
         else:
             # No shell access - use plain FilesystemBackend
-            backend = FilesystemBackend(root_dir=root_dir)
+            backend = FilesystemBackend(root_dir=root_dir, virtual_mode=False)
     else:
         # ========== REMOTE SANDBOX MODE ==========
         backend = sandbox  # Remote sandbox (ModalSandbox, etc.)
