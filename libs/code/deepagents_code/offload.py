@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Any, cast
 from langchain_core.messages import get_buffer_string
 from langchain_core.messages.utils import count_tokens_approximately
 
+from deepagents_code._session_stats import format_token_count
 from deepagents_code.config import create_model
-from deepagents_code.textual_adapter import format_token_count
 
 if TYPE_CHECKING:
     from deepagents.backends.protocol import BackendProtocol
@@ -293,7 +293,7 @@ async def perform_offload(
                 else {"max_input_tokens": context_limit}
             )
             try:
-                model.profile = merged  # type: ignore[union-attr]
+                model.profile = merged  # ty: ignore[invalid-assignment]
             except (AttributeError, TypeError, ValueError):
                 logger.warning(
                     "Could not patch context limit (%d) into model profile; "

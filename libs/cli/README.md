@@ -56,10 +56,24 @@ MCP server that is already registered in the workspace
 (`deepagents mcp-servers add`) — so a freshly scaffolded project deploys
 without first registering a server.
 
-New agents default to the `default` backend — switch `agent.json`'s
-`backend.type` to `thread_scoped_sandbox` (or `agent_scoped_sandbox`) to opt
-into a managed sandbox. The CLI does not create or run sandboxes locally;
-sandbox lifecycle is handled by the Managed Deep Agents platform.
+New agents default to the `state` backend. To opt into a managed sandbox, set
+`agent.json`'s `backend.type` to `sandbox` and configure
+`backend.sandbox_config.scope` as `thread` or `agent`; `sandbox_config` can also
+include sandbox policy IDs and TTL fields. The CLI does not create or run
+sandboxes locally; sandbox lifecycle is handled by the Managed Deep Agents
+platform.
+
+```json
+{
+  "backend": {
+    "type": "sandbox",
+    "sandbox_config": {
+      "scope": "thread",
+      "policy_ids": ["policy-id"]
+    }
+  }
+}
+```
 
 ### Project layout
 
@@ -99,6 +113,8 @@ ignoring case and trailing slash).
 - **[Source code](https://github.com/langchain-ai/deepagents/tree/main/libs/cli)**
 - **[Deep Agents SDK](https://github.com/langchain-ai/deepagents)** — underlying agent harness
 - **[Deep Agents Code](https://pypi.org/project/deepagents-code/)** — coding agent
+- [LangChain Academy](https://academy.langchain.com/) — Comprehensive, free courses on LangChain libraries and products, made by the LangChain team.
+- [Code of Conduct](https://github.com/langchain-ai/langchain/?tab=coc-ov-file) — community guidelines and standards
 
 ## 📕 Releases & Versioning
 

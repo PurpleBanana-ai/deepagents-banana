@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import fnmatch
+import functools
 import json
 import logging
 import re
@@ -18,18 +19,26 @@ import shutil
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from langchain_core.tools import BaseTool
     from langchain_mcp_adapters.client import Connection
     from mcp import ClientSession
 
+    from deepagents_code.model_config import McpServerTrustLists
     from deepagents_code.project_utils import ProjectContext
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+# Maintainer note: `deepagents-talon` imports `MCPConfigError`,
+# `MCPServerInfo`, and `get_mcp_tools` from this module, and its tests construct
+# `MCPToolInfo`. Keep those symbols' names, signatures, and return/dataclass
+# shapes stable unless `deepagents-talon` is migrated in the same change.
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,10 +140,6 @@ class MCPServerInfo:
                     "cannot carry tools"
                 )
                 raise ValueError(msg)
-
-    def is_loaded(self) -> bool:
-        """Return whether this server has successfully loaded tools."""
-        return self.status == "ok"
 
     def needs_attention(self) -> bool:
         """Return whether this server is blocked on user login."""
@@ -603,6 +608,199 @@ def _validate_tool_filter_fields(
             raise ValueError(error_msg)
 
 
+def _looks_like_comment(doc: str, lineno: int) -> bool:
+    """Return `True` if the offending line *begins* with `//` or `/*`.
+
+    Only the failing line is checked, and only its leading characters (after
+    stripping indentation). A `url` value such as `"url": "https://..."`
+    begins with a quote, not `//`, so a URL scheme inside a quoted string
+    never triggers a false comment hint.
+
+    Args:
+        doc: Full source text that failed to parse.
+        lineno: 1-based line number of the error; out-of-range values
+            return `False`.
+
+    Returns:
+        `True` when the stripped failing line starts with `//` or `/*`.
+    """
+    lines = doc.splitlines()
+    if lineno < 1 or lineno > len(lines):
+        return False
+    stripped = lines[lineno - 1].lstrip()
+    return stripped.startswith(("//", "/*"))
+
+
+def _json_error_hint(exc: json.JSONDecodeError) -> str | None:
+    """Return an actionable hint for a common JSON mistake, or `None`.
+
+    Checks are ordered most-specific-first (trailing comma, then comment,
+    then generic decoder-message keywords) so a more precise hint wins when
+    several could apply.
+
+    Args:
+        exc: The decode error to classify.
+
+    Returns:
+        A hint string for a recognized mistake, or `None` when no specific
+            guidance applies.
+    """
+    msg = exc.msg.lower()
+    if "trailing comma" in msg:
+        return (
+            "Hint: JSON does not allow trailing commas. Remove the comma "
+            "before the closing '}' or ']'."
+        )
+    if _looks_like_comment(exc.doc, exc.lineno):
+        return "Hint: JSON does not allow comments (// or /* */). Remove them."
+    if "expecting property name" in msg:
+        return (
+            "Hint: check for trailing commas, a missing key, or an unquoted "
+            "property name near this position."
+        )
+    if "expecting value" in msg:
+        return (
+            "Hint: check for a missing value, an extra comma, or unquoted text "
+            "near this position."
+        )
+    if "delimiter" in msg:
+        return (
+            "Hint: check for a missing comma, ':', or closing bracket near "
+            "this position."
+        )
+    return None
+
+
+def _trailing_comma_pos(doc: str, pos: int) -> int | None:
+    """Return the comma position for decoder errors at a trailing comma."""
+    if pos < 0 or pos >= len(doc) or doc[pos] not in "}]":
+        return None
+    idx = pos - 1
+    while idx >= 0 and doc[idx].isspace():
+        idx -= 1
+    if idx >= 0 and doc[idx] == ",":
+        return idx
+    return None
+
+
+def _json_error_snippet(
+    doc: str, lineno: int, colno: int, *, pos: int | None = None
+) -> str | None:
+    """Build a caret snippet pointing at a JSON error location.
+
+    Args:
+        doc: Full source text that failed to parse.
+        lineno: 1-based line number of the error.
+        colno: 1-based column number of the error.
+        pos: 0-based absolute error offset, if available.
+
+    Returns:
+        A two-line `<source line>` + caret string, or `None` when the line
+        is out of range or blank.
+    """
+    if pos is not None:
+        trailing_pos = _trailing_comma_pos(doc, pos)
+        if trailing_pos is not None:
+            lineno = doc.count("\n", 0, trailing_pos) + 1
+            line_start = doc.rfind("\n", 0, trailing_pos) + 1
+            colno = trailing_pos - line_start + 1
+    lines = doc.splitlines()
+    if lineno < 1 or lineno > len(lines):
+        return None
+    source = lines[lineno - 1].rstrip()
+    if not source:
+        return None
+    caret_col = max(0, min(colno - 1, len(source)))
+    return f"    {source}\n    {' ' * caret_col}^"
+
+
+def _load_mcp_config_json(config_path: str) -> dict[str, Any]:
+    """Load MCP configuration JSON with parser diagnostics.
+
+    Args:
+        config_path: Path to the MCP JSON configuration file.
+
+    Returns:
+        Parsed configuration dictionary.
+
+    Raises:
+        FileNotFoundError: If config file doesn't exist.
+        json.JSONDecodeError: If config file contains invalid JSON.
+    """
+    path = Path(config_path)
+
+    if not path.exists():
+        error_msg = f"MCP config file not found: {config_path}"
+        raise FileNotFoundError(error_msg)
+
+    try:
+        with path.open(encoding="utf-8") as file_obj:
+            return json.load(file_obj)
+    except json.JSONDecodeError as exc:
+        # Build a layered message: core reason, an actionable hint for common
+        # mistakes, then a caret snippet last so the auto-appended
+        # "line X column Y" suffix reads as the location of the caret.
+        parts = [f"Invalid JSON in MCP config file: {exc.msg}"]
+        hint = _json_error_hint(exc)
+        if hint is not None:
+            parts.append(hint)
+        snippet = _json_error_snippet(exc.doc, exc.lineno, exc.colno, pos=exc.pos)
+        if snippet is not None:
+            parts.append(snippet)
+        error_msg = "\n".join(parts)
+        raise json.JSONDecodeError(error_msg, exc.doc, exc.pos) from exc
+
+
+def _validate_mcp_config_top_level(config: dict[str, Any]) -> None:
+    """Validate top-level MCP configuration fields.
+
+    Args:
+        config: Parsed MCP config dictionary.
+
+    Raises:
+        TypeError: If top-level fields have wrong types.
+        ValueError: If required top-level fields are missing.
+    """
+    if "mcpServers" not in config:
+        error_msg = (
+            "MCP config must contain 'mcpServers' field. "
+            'Expected format: {"mcpServers": {"server-name": {...}}}'
+        )
+        raise ValueError(error_msg)
+
+    if not isinstance(config["mcpServers"], dict):
+        error_msg = "'mcpServers' field must be a dictionary"
+        raise TypeError(error_msg)
+
+    if not config["mcpServers"]:
+        error_msg = "'mcpServers' field is empty - no servers configured"
+        raise ValueError(error_msg)
+
+
+def _validate_mcp_config_servers(config: dict[str, Any]) -> None:
+    """Validate every server in an MCP configuration.
+
+    Args:
+        config: Parsed MCP config dictionary.
+    """
+    for server_name, server_config in config["mcpServers"].items():
+        _validate_server_config(server_name, server_config)
+
+
+def _load_mcp_config_top_level(config_path: Path) -> dict[str, Any]:
+    """Load an MCP config file and validate only its top-level shape.
+
+    Args:
+        config_path: Config path to load.
+
+    Returns:
+        Parsed configuration dictionary with a valid `mcpServers` mapping.
+    """
+    config = _load_mcp_config_json(str(config_path))
+    _validate_mcp_config_top_level(config)
+    return config
+
+
 def load_mcp_config(config_path: str) -> dict[str, Any]:
     """Load and validate MCP configuration from a JSON file.
 
@@ -634,38 +832,9 @@ def load_mcp_config(config_path: str) -> dict[str, Any]:
         json.JSONDecodeError: If config file contains invalid JSON.
         TypeError: If config fields have wrong types.
         ValueError: If config is missing required fields.
-        RuntimeError: If header env-var interpolation references an unset var.
-    """  # noqa: DOC502 - `_validate_server_config()` raises `RuntimeError` indirectly
-    path = Path(config_path)
-
-    if not path.exists():
-        error_msg = f"MCP config file not found: {config_path}"
-        raise FileNotFoundError(error_msg)
-
-    try:
-        with path.open(encoding="utf-8") as file_obj:
-            config = json.load(file_obj)
-    except json.JSONDecodeError as exc:
-        error_msg = f"Invalid JSON in MCP config file: {exc.msg}"
-        raise json.JSONDecodeError(error_msg, exc.doc, exc.pos) from exc
-
-    if "mcpServers" not in config:
-        error_msg = (
-            "MCP config must contain 'mcpServers' field. "
-            'Expected format: {"mcpServers": {"server-name": {...}}}'
-        )
-        raise ValueError(error_msg)
-
-    if not isinstance(config["mcpServers"], dict):
-        error_msg = "'mcpServers' field must be a dictionary"
-        raise TypeError(error_msg)
-
-    if not config["mcpServers"]:
-        error_msg = "'mcpServers' field is empty - no servers configured"
-        raise ValueError(error_msg)
-
-    for server_name, server_config in config["mcpServers"].items():
-        _validate_server_config(server_name, server_config)
+    """  # noqa: DOC502 - raised indirectly by `_load_mcp_config_json` / `_validate_server_config` (which does shape-only checks; `${VAR}` header interpolation is deferred to activation time, so no RuntimeError here)
+    config = _load_mcp_config_top_level(Path(config_path))
+    _validate_mcp_config_servers(config)
 
     return config
 
@@ -807,6 +976,11 @@ def extract_project_server_summaries(
         return results
     for name, server in servers.items():
         if not isinstance(server, dict):
+            logger.debug(
+                "Skipping malformed MCP server entry %r: expected a table, got %s",
+                name,
+                type(server).__name__,
+            )
             continue
         kind = _resolve_server_type(server)
         if kind == "stdio":
@@ -873,6 +1047,31 @@ def load_mcp_config_with_error(
         logger.warning("Skipping unreadable MCP config %s: %s", config_path, exc)
         return None, f"Unreadable: {exc}"
     except (json.JSONDecodeError, ValueError, TypeError, RuntimeError) as exc:
+        logger.warning("Skipping invalid MCP config %s: %s", config_path, exc)
+        return None, str(exc)
+
+
+def _load_mcp_config_top_level_with_error(
+    config_path: Path,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Load an MCP config file, validating only its top-level structure.
+
+    Args:
+        config_path: Config path to load.
+
+    Returns:
+        `(parsed_config, None)` on success, `(None, None)` when the file
+        doesn't exist, or `(None, error_message)` on load/top-level validate
+        failure.
+    """
+    try:
+        return _load_mcp_config_top_level(config_path), None
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        logger.warning("Skipping unreadable MCP config %s: %s", config_path, exc)
+        return None, f"Unreadable: {exc}"
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
         logger.warning("Skipping invalid MCP config %s: %s", config_path, exc)
         return None, str(exc)
 
@@ -1045,6 +1244,7 @@ def _build_cached_mcp_tool(
     from langchain_core.tools import StructuredTool, ToolException
     from langchain_mcp_adapters.tools import (
         _convert_call_tool_result,  # noqa: PLC2701
+        _handle_mcp_tool_error,  # noqa: PLC2701
     )
 
     original_tool_name = mcp_tool.name
@@ -1060,6 +1260,18 @@ def _build_cached_mcp_tool(
     )
     wrapped_meta = {"_meta": meta} if meta is not None else {}
     metadata = {**base_meta, **wrapped_meta} or None
+
+    def _handle_cached_mcp_tool_error(error: ToolException) -> Any:  # noqa: ANN401
+        try:
+            return _handle_mcp_tool_error(error)
+        except ToolException:
+            logger.warning(
+                "MCP tool %r failed with recoverable ToolException: %s",
+                lc_tool_name,
+                error,
+                exc_info=True,
+            )
+            return str(error) or f"{lc_tool_name} failed with no error detail"
 
     async def coroutine(
         # `runtime` is injected by LangChain's tool-calling plumbing.
@@ -1077,9 +1289,9 @@ def _build_cached_mcp_tool(
         # Re-raise control-flow/shutdown signals (CancelledError,
         # KeyboardInterrupt, SystemExit) and ToolException unchanged. Wrapping a
         # ToolException here would bury its actionable message (e.g. an MCP
-        # `isError` instruction like "use the X tool instead") under a
-        # generic retry wrapper; re-raising preserves it for the tool-error
-        # handling layer and the model.
+        # `isError` instruction like "use the X tool instead") under a generic
+        # retry wrapper; re-raising preserves it for the tool-local error
+        # handler and the model.
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, ToolException):
             raise
         except Exception as exc:
@@ -1145,11 +1357,11 @@ def _build_cached_mcp_tool(
                             exc_info=True,
                         )
 
-        # `_convert_call_tool_result` raises ToolException when the MCP server
-        # returns a result flagged isError=True. That ToolException propagates
-        # up through ToolNode, whose default handler re-raises everything except
-        # ToolInvocationError — so it aborts the turn unless a wrap_tool_call
-        # middleware converts it to a recoverable ToolMessage.
+        # On an MCP `isError=True` result the adapter's `_convert_call_tool_result`
+        # raises, and the `handle_tool_error` callback registered below converts
+        # the MCP content blocks into a `ToolMessage(status="error")`. Other
+        # expected `ToolException`s raised by this wrapper are formatted by that
+        # same tool-local handler.
         return _convert_call_tool_result(result)
 
     return StructuredTool(
@@ -1159,6 +1371,7 @@ def _build_cached_mcp_tool(
         coroutine=coroutine,
         response_format="content_and_artifact",
         metadata=metadata,
+        handle_tool_error=cast("Any", _handle_cached_mcp_tool_error),
     )
 
 
@@ -1193,11 +1406,27 @@ def _entry_matches_tool(entry: str, tool_name: str, prefix: str) -> bool:
     return tool_name.startswith(prefix) and tool_name[len(prefix) :] == entry
 
 
+@overload
 def _apply_tool_filter(
     tools: list[BaseTool],
     server_name: str,
     server_config: dict[str, Any],
-) -> list[BaseTool]:
+) -> list[BaseTool]: ...
+
+
+@overload
+def _apply_tool_filter(
+    tools: Sequence[BaseTool],
+    server_name: str,
+    server_config: dict[str, Any],
+) -> Sequence[BaseTool]: ...
+
+
+def _apply_tool_filter(
+    tools: Sequence[BaseTool],
+    server_name: str,
+    server_config: dict[str, Any],
+) -> Sequence[BaseTool]:
     """Filter a server's loaded tools by its `allowedTools` / `disabledTools`.
 
     Entries may be literal tool names or `fnmatch`-style glob patterns
@@ -1248,6 +1477,84 @@ def _apply_tool_filter(
     return [t for t in tools if not _any_entry_matches(t.name, entries)]
 
 
+_MCP_LOAD_CONCURRENCY = 8
+"""Upper bound on MCP servers preflighted/discovered concurrently.
+
+Independent servers are probed in parallel so graph load no longer scales
+linearly with server count, but the fan-out is capped so a large config cannot
+spawn an unbounded number of simultaneous socket/subprocess handshakes (or
+`asyncio.to_thread` `shutil.which` workers).
+"""
+
+
+def _warm_mcp_adapter_imports() -> None:
+    """Eagerly import MCP adapter modules whose first import may block.
+
+    Run via `asyncio.to_thread` before adapter symbols are used, so the initial
+    (potentially blocking) package-resource scan stays off the server event
+    loop. Because this runs inside `_load_tools_from_config`, it happens only
+    when at least one active MCP server exists — a config with no MCP servers
+    never imports the adapters.
+    """
+    from langchain_mcp_adapters import (
+        sessions as _sessions,  # noqa: F401
+        tools as _tools,  # noqa: F401
+    )
+
+
+async def _gather_bounded(
+    factories: Sequence[Callable[[], Awaitable[_T]]],
+    *,
+    limit: int,
+) -> list[_T]:
+    """Await coroutine factories with bounded concurrency, preserving order.
+
+    Results are returned in submission order (not completion order), so callers
+    can zip them back against their inputs to keep deterministic ordering. If a
+    factory raises (including a cancellation/shutdown signal), the remaining
+    tasks are cancelled and awaited before the exception propagates, so no
+    background work is left running.
+
+    `asyncio.gather` propagates only the *first* task to finish with an
+    exception; when several tasks fail concurrently the rest are cancelled
+    during teardown and their exceptions would otherwise be discarded silently.
+    To keep concurrent failures debuggable, each dropped (non-cancellation)
+    sibling exception is logged at debug level before the first one propagates.
+
+    Args:
+        factories: Zero-arg callables each returning an awaitable to run.
+        limit: Maximum number of awaitables in flight at once. Values below 1
+            are clamped to 1.
+
+    Returns:
+        The awaited results in the same order as `factories`.
+    """
+    semaphore = asyncio.Semaphore(max(1, limit))
+
+    async def _run(factory: Callable[[], Awaitable[_T]]) -> _T:
+        async with semaphore:
+            return await factory()
+
+    tasks = [asyncio.create_task(_run(factory)) for factory in factories]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                logger.debug(
+                    "MCP concurrent load: a sibling task failed while another "
+                    "failure was already propagating; logging the dropped "
+                    "exception for debugging",
+                    exc_info=result,
+                )
+        raise
+
+
 async def _load_tools_from_config(
     config: dict[str, Any],
     *,
@@ -1278,7 +1585,11 @@ async def _load_tools_from_config(
     Raises:
         RuntimeError: If `session_manager` is reconfigured incompatibly with
             sessions already active on it.
-    """  # noqa: DOC501, DOC502 - `RuntimeError` surfaces via `MCPSessionManager.configure`; `KeyboardInterrupt` / `SystemExit` / `CancelledError` are re-raised pass-throughs
+    """  # noqa: DOC502 - `RuntimeError` surfaces via `MCPSessionManager.configure`
+    # Warm the adapter imports off the event loop *here* (rather than in the
+    # caller) so a config with no active MCP servers — which returns before
+    # ever reaching this function — never pays the adapter-import cost.
+    await asyncio.to_thread(_warm_mcp_adapter_imports)
     from langchain_mcp_adapters.sessions import (
         SSEConnection,
         StdioConnection,
@@ -1287,28 +1598,41 @@ async def _load_tools_from_config(
     )
     from langchain_mcp_adapters.tools import convert_mcp_tool_to_langchain_tool
 
-    skipped: dict[str, tuple[MCPServerStatus, str]] = {}
+    server_items = list(config["mcpServers"].items())
+    # Resolve each server's transport once, up front. `_resolve_server_type` is
+    # pure, so this is a readability/DRY win over recomputing it in preflight,
+    # discovery, and the final fold-in loop below.
+    transports = {name: _resolve_server_type(cfg) for name, cfg in server_items}
 
-    for server_name, server_config in config["mcpServers"].items():
-        server_type = _resolve_server_type(server_config)
+    async def _preflight_and_connect(
+        server_name: str,
+        server_config: dict[str, Any],
+    ) -> tuple[MCPServerStatus, str] | Connection:
+        """Preflight one server and build its connection config.
+
+        Per-server preflight/config failures are captured here so one bad
+        server never aborts loading the others.
+
+        Returns:
+            A `(status, error)` tuple when the server must be skipped, or a
+            ready `Connection` otherwise.
+        """
+        server_type = transports[server_name]
         try:
             if server_type in _SUPPORTED_REMOTE_TYPES:
                 await _check_remote_server(server_name, server_config)
             elif server_type == "stdio":
-                _check_stdio_server(server_name, server_config)
+                # `shutil.which` makes blocking `os.access` calls; run it
+                # off the event loop so blockbuster doesn't reject it.
+                await asyncio.to_thread(_check_stdio_server, server_name, server_config)
         except RuntimeError as exc:
             logger.warning(
                 "MCP server '%s' skipped: pre-flight failed: %s",
                 server_name,
                 exc,
             )
-            skipped[server_name] = ("error", str(exc))
+            return ("error", str(exc))
 
-    connections: dict[str, Connection] = {}
-    for server_name, server_config in config["mcpServers"].items():
-        if server_name in skipped:
-            continue
-        server_type = _resolve_server_type(server_config)
         try:
             if server_type in _SUPPORTED_REMOTE_TYPES:
                 if server_type == "http":
@@ -1330,26 +1654,39 @@ async def _load_tools_from_config(
                         server_name=server_name,
                     )
 
-                if server_config.get("auth") == "oauth":
-                    from deepagents_code.mcp_auth import (
-                        FileTokenStorage,
-                        build_oauth_provider,
-                    )
+                from deepagents_code.mcp_auth import (
+                    FileTokenStorage,
+                    build_oauth_provider,
+                )
 
-                    storage = FileTokenStorage(
+                explicit_oauth = server_config.get("auth") == "oauth"
+                header_names = {
+                    name.lower() for name in (server_config.get("headers") or {})
+                }
+                has_authorization_header = "authorization" in header_names
+                storage = FileTokenStorage(
+                    server_name,
+                    server_url=server_config["url"],
+                )
+                stored_tokens = await storage.get_tokens()
+
+                if explicit_oauth and stored_tokens is None:
+                    # Config opted into OAuth but no tokens are stored yet —
+                    # require an upfront login before connecting.
+                    auth_msg = f"MCP server {server_name!r} needs re-authentication."
+                    logger.warning(
+                        "MCP server '%s' skipped: not authenticated.",
                         server_name,
-                        server_url=server_config["url"],
                     )
-                    if await storage.get_tokens() is None:
-                        auth_msg = (
-                            f"MCP server {server_name!r} needs re-authentication."
-                        )
-                        logger.warning(
-                            "MCP server '%s' skipped: not authenticated.",
-                            server_name,
-                        )
-                        skipped[server_name] = ("unauthenticated", auth_msg)
-                        continue
+                    return ("unauthenticated", auth_msg)
+
+                if explicit_oauth or (
+                    stored_tokens is not None and not has_authorization_header
+                ):
+                    # Attach the provider when the user opted in, or when a
+                    # prior login (possibly triggered by 401 auto-detection)
+                    # already stored tokens for this server. Static
+                    # Authorization headers take precedence over stored OAuth.
                     conn["auth"] = build_oauth_provider(
                         server_name=server_name,
                         server_url=server_config["url"],
@@ -1357,21 +1694,42 @@ async def _load_tools_from_config(
                         interactive=False,
                     )
 
-                connections[server_name] = conn
-            else:
-                connections[server_name] = StdioConnection(
-                    command=server_config["command"],
-                    args=server_config.get("args", []),
-                    env=server_config.get("env") or None,
-                    transport="stdio",
-                )
+                return conn
+            return StdioConnection(
+                command=server_config["command"],
+                args=server_config.get("args", []),
+                env=server_config.get("env") or None,
+                transport="stdio",
+            )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             logger.warning(
                 "MCP server '%s' skipped: config/setup failed: %s",
                 server_name,
                 exc,
             )
-            skipped[server_name] = ("error", str(exc))
+            return ("error", str(exc))
+
+    # Preflight + connection build runs concurrently across servers (bounded).
+    # Results come back in submission order, so `skipped`/`connections` are
+    # assembled in config order and stay deterministic regardless of which
+    # server's probe finished first.
+    preflight_results = await _gather_bounded(
+        [
+            functools.partial(_preflight_and_connect, name, cfg)
+            for name, cfg in server_items
+        ],
+        limit=_MCP_LOAD_CONCURRENCY,
+    )
+
+    skipped: dict[str, tuple[MCPServerStatus, str]] = {}
+    connections: dict[str, Connection] = {}
+    for (server_name, _server_config), result in zip(
+        server_items, preflight_results, strict=True
+    ):
+        if isinstance(result, tuple):
+            skipped[server_name] = result
+        else:
+            connections[server_name] = result
 
     runtime_manager: MCPSessionManager | None = session_manager
     if runtime_manager is not None:
@@ -1379,23 +1737,22 @@ async def _load_tools_from_config(
     elif not stateless:
         runtime_manager = MCPSessionManager(connections=connections)
 
-    all_tools: list[BaseTool] = []
-    server_infos: list[MCPServerInfo] = []
+    async def _discover_server(
+        server_name: str,
+        server_config: dict[str, Any],
+        transport: str,
+    ) -> tuple[list[BaseTool], MCPServerInfo]:
+        """Discover one server's tools and build its `MCPServerInfo`.
 
-    for server_name, server_config in config["mcpServers"].items():
-        transport = _resolve_server_type(server_config)
-        if server_name in skipped:
-            status, error = skipped[server_name]
-            server_infos.append(
-                MCPServerInfo(
-                    name=server_name,
-                    transport=transport,
-                    status=status,
-                    error=error,
-                ),
-            )
-            continue
+        Both discovery failures (classified as auth vs. generic error) and
+        post-discovery tool-construction failures are captured as a non-`ok`
+        `MCPServerInfo` with no tools, so a single failing server never aborts
+        the load for the others. Cancellation/shutdown signals are re-raised so
+        the bounded runner can tear the whole load down.
 
+        Returns:
+            The server's LangChain tools plus its `MCPServerInfo` entry.
+        """  # noqa: DOC501 - CancelledError/KeyboardInterrupt/SystemExit are re-raised pass-throughs
         try:
             async with create_session(connections[server_name]) as discover_session:
                 await discover_session.initialize()
@@ -1403,116 +1760,228 @@ async def _load_tools_from_config(
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
-            from deepagents_code.mcp_auth import find_reauth_required
+            from deepagents_code.mcp_auth import (
+                find_oauth_challenge,
+                find_reauth_required,
+            )
 
-            reauth = find_reauth_required(exc)
             status: MCPServerStatus
+            try:
+                reauth = find_reauth_required(exc)
+                challenge_url = (
+                    find_oauth_challenge(exc)
+                    if transport in _SUPPORTED_REMOTE_TYPES
+                    else None
+                )
+            except Exception:
+                # Classifying the failure is best-effort. If a classifier
+                # itself raises, degrade this one server to a plain error
+                # rather than letting the exception abort tool loading for
+                # every remaining server.
+                reauth = None
+                challenge_url = None
+                logger.debug(
+                    "MCP server '%s': failed to classify discovery error",
+                    server_name,
+                    exc_info=True,
+                )
+
             if reauth is not None:
                 # Tokens existed (we checked above) but the OAuth provider
                 # fell back to interactive reauth — the refresh attempt
                 # failed. Flag unauthenticated so the user is prompted to
-                # re-login, and keep the original exception in the log so
-                # debugging a real provider outage is possible.
+                # re-login, and keep the original exception only in debug logs
+                # so expected re-auth skips don't flood non-interactive output.
                 status = "unauthenticated"
                 error = (
                     f"{reauth} "
                     "(token refresh failed; the original error is in debug logs)"
                 )
+                logger.warning(
+                    "MCP server '%s' skipped: %s",
+                    server_name,
+                    error,
+                )
+                logger.debug(
+                    "MCP server '%s' skipped: tool discovery failed",
+                    server_name,
+                    exc_info=True,
+                )
+            elif challenge_url is not None:
+                # A remote server answered with a 401 OAuth challenge
+                # (RFC 9728) that wasn't already handled as a token refresh —
+                # typically a server not opted into OAuth in config. Surface it
+                # as unauthenticated so the user can log in, rather than as an
+                # opaque connection error.
+                status = "unauthenticated"
+                error = (
+                    f"MCP server {server_name!r} requires authentication; "
+                    f"run `dcode mcp login {server_name}`."
+                )
+                logger.warning(
+                    "MCP server '%s' skipped: %s",
+                    server_name,
+                    error,
+                )
+                logger.debug(
+                    "MCP server '%s' skipped: 401 OAuth challenge detected",
+                    server_name,
+                    exc_info=True,
+                )
             else:
                 status = "error"
                 error = str(exc)
+                logger.warning(
+                    "MCP server '%s' skipped: tool discovery failed",
+                    server_name,
+                    exc_info=True,
+                )
+            return [], MCPServerInfo(
+                name=server_name,
+                transport=transport,
+                status=status,
+                error=error,
+            )
+
+        # Tool construction and filtering run after the discovery session has
+        # closed and can still fail (schema conversion, custom tool filters).
+        # Isolate them too so a construction error degrades this one server to
+        # an error entry instead of aborting the whole concurrent load — the
+        # same guarantee the discovery `try` above provides. Cancellation and
+        # shutdown signals still propagate so the bounded runner can tear down.
+        try:
+            if runtime_manager is None:
+                server_tools: list[BaseTool] = [
+                    convert_mcp_tool_to_langchain_tool(
+                        None,
+                        mcp_tool,
+                        connection=connections[server_name],
+                        server_name=server_name,
+                        tool_name_prefix=True,
+                    )
+                    for mcp_tool in mcp_tools
+                ]
+            else:
+                server_tools = [
+                    _build_cached_mcp_tool(
+                        mcp_tool=mcp_tool,
+                        server_name=server_name,
+                        session_manager=runtime_manager,
+                        tool_name_prefix=True,
+                    )
+                    for mcp_tool in mcp_tools
+                ]
+
+            server_tools = _apply_tool_filter(server_tools, server_name, server_config)
+
+            # Pair each tool's input_schema by its LangChain (server-prefixed)
+            # name — the same form `server_tools` carries — so the lookup needs
+            # no string surgery and stays correct if `tool_name_prefix` ever
+            # changes. Deep-copy the raw dict because `MCPToolInfo` is `frozen`
+            # but Python's `frozen=True` does not freeze nested mutables; a
+            # shared reference would let one holder mutate every other's view.
+            schemas: dict[str, dict[str, Any] | None] = {}
+            for mcp_tool in mcp_tools:
+                tool_name = getattr(mcp_tool, "name", "")
+                try:
+                    raw_schema = getattr(mcp_tool, "inputSchema", None)
+                    schema_copy = (
+                        copy.deepcopy(raw_schema) if raw_schema is not None else None
+                    )
+                except (AttributeError, TypeError, RecursionError) as exc:
+                    logger.warning(
+                        "MCP tool %r on server %r: inputSchema access raised "
+                        "%s: %s; rendering with no parameters",
+                        tool_name,
+                        server_name,
+                        exc.__class__.__name__,
+                        exc,
+                    )
+                    schema_copy = None
+                lc_name = f"{server_name}_{tool_name}"
+                schemas[lc_name] = schema_copy
+
+            tool_infos: list[MCPToolInfo] = []
+            for tool in server_tools:
+                schema = schemas.get(tool.name)
+                if schema is None and schemas:
+                    logger.debug(
+                        "MCP tool %r on server %r: no schema matched in lookup "
+                        "(available keys: %s); rendering with no parameters",
+                        tool.name,
+                        server_name,
+                        list(schemas.keys())[:5],
+                    )
+                tool_infos.append(
+                    MCPToolInfo(
+                        name=tool.name,
+                        description=tool.description or "",
+                        input_schema=schema,
+                    ),
+                )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
             logger.warning(
-                "MCP server '%s' skipped: tool discovery failed",
+                "MCP server '%s' skipped: tool construction failed",
                 server_name,
                 exc_info=True,
             )
+            return [], MCPServerInfo(
+                name=server_name,
+                transport=transport,
+                status="error",
+                error=str(exc),
+            )
+
+        return server_tools, MCPServerInfo(
+            name=server_name,
+            transport=transport,
+            tools=tuple(tool_infos),
+        )
+
+    # Discovery also runs concurrently (bounded) across the servers that
+    # survived preflight. Because `_gather_bounded` returns results in
+    # submission order and skipped servers are folded back in below by
+    # iterating `server_items` in config order, `server_infos` stays in config
+    # order and the returned tools stay sorted by tool name — regardless of
+    # which server's probe finished first.
+    discover_items = [
+        (server_name, server_config, transports[server_name])
+        for server_name, server_config in server_items
+        if server_name not in skipped
+    ]
+    discovery_results = await _gather_bounded(
+        [
+            functools.partial(_discover_server, name, cfg, transport)
+            for name, cfg, transport in discover_items
+        ],
+        limit=_MCP_LOAD_CONCURRENCY,
+    )
+    discovered: dict[str, tuple[list[BaseTool], MCPServerInfo]] = {
+        server_name: result
+        for (server_name, _cfg, _transport), result in zip(
+            discover_items, discovery_results, strict=True
+        )
+    }
+
+    all_tools: list[BaseTool] = []
+    server_infos: list[MCPServerInfo] = []
+    for server_name, _server_config in server_items:
+        if server_name in skipped:
+            status, error = skipped[server_name]
             server_infos.append(
                 MCPServerInfo(
                     name=server_name,
-                    transport=transport,
+                    transport=transports[server_name],
                     status=status,
                     error=error,
                 ),
             )
             continue
-
-        if runtime_manager is None:
-            server_tools = [
-                convert_mcp_tool_to_langchain_tool(
-                    None,
-                    mcp_tool,
-                    connection=connections[server_name],
-                    server_name=server_name,
-                    tool_name_prefix=True,
-                )
-                for mcp_tool in mcp_tools
-            ]
-        else:
-            server_tools = [
-                _build_cached_mcp_tool(
-                    mcp_tool=mcp_tool,
-                    server_name=server_name,
-                    session_manager=runtime_manager,
-                    tool_name_prefix=True,
-                )
-                for mcp_tool in mcp_tools
-            ]
-
-        server_tools = _apply_tool_filter(server_tools, server_name, server_config)
+        server_tools, server_info = discovered[server_name]
         all_tools.extend(server_tools)
-
-        # Pair each tool's input_schema by its LangChain (server-prefixed)
-        # name — the same form `server_tools` carries — so the lookup needs
-        # no string surgery and stays correct if `tool_name_prefix` ever
-        # changes. Deep-copy the raw dict because `MCPToolInfo` is `frozen`
-        # but Python's `frozen=True` does not freeze nested mutables; a
-        # shared reference would let one holder mutate every other's view.
-        schemas: dict[str, dict[str, Any] | None] = {}
-        for mcp_tool in mcp_tools:
-            tool_name = getattr(mcp_tool, "name", "")
-            try:
-                raw_schema = getattr(mcp_tool, "inputSchema", None)
-                schema_copy = (
-                    copy.deepcopy(raw_schema) if raw_schema is not None else None
-                )
-            except (AttributeError, TypeError, RecursionError) as exc:
-                logger.warning(
-                    "MCP tool %r on server %r: inputSchema access raised %s: %s; "
-                    "rendering with no parameters",
-                    tool_name,
-                    server_name,
-                    exc.__class__.__name__,
-                    exc,
-                )
-                schema_copy = None
-            lc_name = f"{server_name}_{tool_name}"
-            schemas[lc_name] = schema_copy
-
-        tool_infos: list[MCPToolInfo] = []
-        for tool in server_tools:
-            schema = schemas.get(tool.name)
-            if schema is None and schemas:
-                logger.debug(
-                    "MCP tool %r on server %r: no schema matched in lookup "
-                    "(available keys: %s); rendering with no parameters",
-                    tool.name,
-                    server_name,
-                    list(schemas.keys())[:5],
-                )
-            tool_infos.append(
-                MCPToolInfo(
-                    name=tool.name,
-                    description=tool.description or "",
-                    input_schema=schema,
-                ),
-            )
-        server_infos.append(
-            MCPServerInfo(
-                name=server_name,
-                transport=transport,
-                tools=tuple(tool_infos),
-            ),
-        )
+        server_infos.append(server_info)
 
     all_tools.sort(key=lambda tool: tool.name)
     return all_tools, None if stateless else runtime_manager, server_infos
@@ -1539,6 +2008,47 @@ async def get_mcp_tools(
     return await _load_tools_from_config(config)
 
 
+def _log_skipped_project_servers(
+    dropped: list[tuple[str, str, str]],
+    *,
+    trust_project_mcp: bool | None,
+    config_trusted: bool,
+) -> None:
+    """Log project MCP servers that were dropped, explaining why.
+
+    Split out so the trust/drop loop stays readable. The message distinguishes an
+    explicit reject on an otherwise-trusted config from the untrusted-drop cases,
+    which themselves differ by whether trust was declined outright
+    (`--trust-project-mcp` off) or merely not yet granted.
+
+    Args:
+        dropped: `(name, kind, summary)` tuples for each skipped server.
+        trust_project_mcp: The caller's tri-state trust flag.
+        config_trusted: Whether the project config was otherwise trusted (so the
+            only reason to drop is an explicit user-level deny entry).
+    """
+    skipped_list = "\n".join(
+        f"- {name} [{kind}]: {summary}" for name, kind, summary in dropped
+    )
+    if config_trusted:
+        logger.warning(
+            "Skipped project MCP servers rejected by user config "
+            "(disabled_project_servers):\n%s",
+            skipped_list,
+        )
+    elif trust_project_mcp is False:
+        logger.warning(
+            "Skipped untrusted project MCP servers:\n%s",
+            skipped_list,
+        )
+    else:
+        logger.warning(
+            "Skipped untrusted project MCP servers "
+            "(config changed or not yet approved):\n%s",
+            skipped_list,
+        )
+
+
 async def resolve_and_load_mcp_tools(
     *,
     explicit_config_path: str | None = None,
@@ -1558,12 +2068,23 @@ async def resolve_and_load_mcp_tools(
         explicit_config_path: Extra config file to layer on top of
             auto-discovered configs.
         no_mcp: If `True`, disable all MCP loading.
-        trust_project_mcp: Controls project-level stdio server trust.
+        trust_project_mcp: Controls project-level server trust.
 
-            - `True`: always trust project configs, including stdio servers.
-            - `False`: drop stdio entries from project configs.
+            Applies to stdio and remote (http/sse) servers alike — remote entries
+            are gated too because an attacker-controlled `.mcp.json` can SSRF or
+            exfiltrate `${VAR}` headers during the discovery preflight.
+
+            - `True`: always trust project configs (all servers).
+            - `False`: drop all project servers (stdio and remote).
             - `None`: consult the persistent trust store — trusted configs
-              load fully, untrusted project stdio servers are dropped.
+                load fully; all servers from untrusted project configs are
+                dropped.
+
+            Regardless of this flag, the user-level allow/deny lists
+            (`[mcp].enabled_project_servers` /`disabled_project_servers` and
+            their env equivalents, via `load_mcp_server_trust_lists`) are
+            applied: named servers load from an otherwise-untrusted config,
+            and explicitly denied servers are dropped even from a trusted one.
         project_context: Explicit project path context for config discovery
             and trust resolution.
         stateless: When `True`, do not return an owned runtime session manager.
@@ -1581,9 +2102,10 @@ async def resolve_and_load_mcp_tools(
             types.
         ValueError: If `explicit_config_path` is missing required fields
             or declares an unsupported transport.
-        RuntimeError: If the merged MCP config is malformed, or header
-            env-var interpolation in `explicit_config_path` references an
-            unset variable.
+        RuntimeError: If the merged MCP config is malformed. (Header `${VAR}`
+            interpolation is deferred to activation inside
+            `_load_tools_from_config`, which captures such failures into the
+            returned `server_infos` rather than raising here.)
     """  # noqa: DOC502 - FileNotFoundError / JSONDecodeError / TypeError / ValueError surface via `load_mcp_config`
     if no_mcp:
         return [], None, []
@@ -1608,8 +2130,9 @@ async def resolve_and_load_mcp_tools(
             configs.append(config)
 
     project_trusted: bool | None = None
+    trust_lists: McpServerTrustLists | None = None
     for path in project_configs:
-        config, error = load_mcp_config_with_error(path)
+        config, error = _load_mcp_config_top_level_with_error(path)
         if error is not None:
             config_load_errors.append((path, error))
         if config is None:
@@ -1617,45 +2140,110 @@ async def resolve_and_load_mcp_tools(
 
         project_servers = extract_project_server_summaries(config)
         if not project_servers:
-            configs.append(config)
+            # No dict servers yielded a summary, so every entry is malformed.
+            # Re-validate the already-loaded config (no second file read) to
+            # surface a precise per-server error; this always fails today, but
+            # the append path is kept so a future validator that accepts such a
+            # shape would still load it.
+            try:
+                _validate_mcp_config_servers(config)
+            except (ValueError, TypeError, RuntimeError) as exc:
+                config_load_errors.append((path, str(exc)))
+            else:
+                configs.append(config)
             continue
 
+        # Whether the config as a whole is trusted (flag/env/fingerprint). This
+        # governs the default for un-listed servers; the user-level allow/deny
+        # lists below refine it per server.
         if trust_project_mcp is True:
-            configs.append(config)
-            continue
-
-        if trust_project_mcp is None and project_trusted is None:
-            from deepagents_code.mcp_trust import (
-                compute_config_fingerprint,
-                is_project_mcp_trusted,
-            )
-
-            project_root = str(_resolve_project_config_base(project_context).resolve())
-            fingerprint = compute_config_fingerprint(project_configs)
-            project_trusted = is_project_mcp_trusted(project_root, fingerprint)
-
-        if project_trusted is True:
-            configs.append(config)
-            continue
-
-        # Untrusted project config: drop ALL servers (stdio + remote). Remote
-        # entries from an attacker-controlled .mcp.json can SSRF localhost or
-        # cloud metadata endpoints during the preflight HEAD probe, and any
-        # `${VAR}` references in their `headers` would exfiltrate the value
-        # to the attacker URL during the discovery handshake.
-        skipped = [
-            f"{name} [{kind}]: {summary}" for name, kind, summary in project_servers
-        ]
-        if trust_project_mcp is False:
-            logger.warning(
-                "Skipped untrusted project MCP servers: %s",
-                "; ".join(skipped),
-            )
+            config_trusted = True
+        elif trust_project_mcp is False:
+            config_trusted = False
         else:
-            logger.warning(
-                "Skipped untrusted project MCP servers "
-                "(config changed or not yet approved): %s",
-                "; ".join(skipped),
+            if project_trusted is None:
+                from deepagents_code.mcp_trust import (
+                    compute_config_fingerprint,
+                    is_project_mcp_trusted,
+                )
+
+                project_root = str(
+                    _resolve_project_config_base(project_context).resolve()
+                )
+                fingerprint = compute_config_fingerprint(project_configs)
+                project_trusted = is_project_mcp_trusted(project_root, fingerprint)
+            config_trusted = project_trusted
+
+        # The allow/deny lists are sourced only from the user's own config (home
+        # config.toml + env) — never from the repo — so a committed .mcp.json
+        # cannot self-approve. Loaded lazily and reused across project configs.
+        if trust_lists is None:
+            from deepagents_code.model_config import (
+                DEFAULT_CONFIG_PATH,
+                load_mcp_server_trust_lists,
+            )
+
+            trust_lists = load_mcp_server_trust_lists()
+            if trust_lists.read_error is not None:
+                # Surface the read failure as a visible config error (a bare
+                # logger.warning has no handler outside debug mode).
+                config_load_errors.append((DEFAULT_CONFIG_PATH, trust_lists.read_error))
+
+        if trust_lists.load_failed:
+            # Fail closed: the user's allow/deny policy could not be read, so do
+            # not honor whole-config trust — otherwise a server the user meant to
+            # deny would load. Names explicitly enabled via a readable source
+            # (shell env) still survive the filter below.
+            config_trusted = False
+
+        # Keep only servers that survive the trust decision. Dropping the rest
+        # here (rather than loading all or none) preserves the SSRF/header-
+        # exfiltration gate: a non-allowlisted remote entry from an attacker-
+        # controlled .mcp.json never reaches the preflight HEAD probe or the
+        # `${VAR}` header interpolation during the discovery handshake.
+        servers = config["mcpServers"]
+        kept: dict[str, Any] = {}
+        for name, server in servers.items():
+            if name in trust_lists.disabled:
+                # Explicit reject always wins, even for a trusted config.
+                continue
+            if config_trusted or name in trust_lists.enabled:
+                kept[name] = server
+        if kept:
+            filtered = {**config, "mcpServers": kept}
+            try:
+                _validate_mcp_config_servers(filtered)
+            except (ValueError, TypeError, RuntimeError) as exc:
+                # The whole filtered config is dropped, so name the kept
+                # (trusted/allowlisted) servers that will NOT load — otherwise
+                # they vanish silently (the skip-log below only covers servers
+                # dropped by the trust decision, not by this validation failure).
+                logger.warning(
+                    "Skipping invalid MCP config %s after project trust "
+                    "filtering; these trusted/allowlisted servers will not "
+                    "load: %s (%s)",
+                    path,
+                    ", ".join(kept),
+                    exc,
+                )
+                config_load_errors.append((path, str(exc)))
+            else:
+                configs.append(filtered)
+
+        # Servers dropped by the trust *decision* (disabled, or not allowlisted
+        # in an untrusted config). A validation failure above is reported
+        # separately, so those kept-but-unloaded names are intentionally not
+        # re-listed here with a trust-based reason.
+        dropped = [
+            (name, kind, summary)
+            for name, kind, summary in project_servers
+            if name not in kept
+        ]
+        if dropped:
+            _log_skipped_project_servers(
+                dropped,
+                trust_project_mcp=trust_project_mcp,
+                config_trusted=config_trusted,
             )
 
     if explicit_config_path:
@@ -1699,7 +2287,7 @@ async def resolve_and_load_mcp_tools(
                         if isinstance(server_config, dict)
                         else "unknown",
                         status="disabled",
-                        error="Disabled by user (`/mcp` F2 to re-enable).",
+                        error="Disabled by user (F2 to re-enable).",
                     ),
                 )
             else:
