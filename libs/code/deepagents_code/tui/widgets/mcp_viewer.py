@@ -902,6 +902,7 @@ class MCPViewerScreen(ModalScreen[str | None]):
         connecting: bool = False,
         pending_reconnect: bool = False,
         on_toggle_disable: Callable[[str], Awaitable[None]] | None = None,
+        on_close: Callable[[], bool] | None = None,
     ) -> None:
         """Initialize the MCP viewer screen.
 
@@ -921,12 +922,17 @@ class MCPViewerScreen(ModalScreen[str | None]):
                 expected to call `refresh_server_info` on this screen so
                 the user sees the updated status without a screen swap.
                 When `None`, `F2` is a no-op.
+            on_close: Callback invoked before Escape dismisses the viewer.
+                Return `True` when the callback replaced the viewer with a
+                follow-up screen and dismissal should be skipped. `None`
+                keeps the normal close behavior.
         """
         super().__init__()
         self._server_info = server_info
         self._connecting = connecting
         self._pending_reconnect = pending_reconnect
         self._on_toggle_disable = on_toggle_disable
+        self._on_close = on_close
         # All cursor-navigable rows in render order: server headers + tool
         # items intermixed. `_selected_index` indexes into this list.
         self._row_widgets: list[MCPToolItem | MCPServerHeaderItem] = []
@@ -1345,10 +1351,10 @@ class MCPViewerScreen(ModalScreen[str | None]):
             # bottom for up).
 
     def _move_selection(self, delta: int) -> None:
-        """Move selection by delta row positions, clamped at the list ends.
+        """Move selection by delta row positions within the list bounds.
 
-        No wrap-around — pressing `Down` past the last row stays put rather
-        than jumping to the first. Walks every row (headers + tools).
+        Walks every row (headers + tools). Navigation actions handle wrapping
+        before calling this helper at a list boundary.
 
         Args:
             delta: Number of row positions to move.
@@ -1359,22 +1365,22 @@ class MCPViewerScreen(ModalScreen[str | None]):
         if 0 <= target < len(self._row_widgets):
             self._move_to(target)
 
-    def _next_tool_row(self, start: int, step: int) -> int | None:
-        """Return the index of the next `MCPToolItem` row in `step` direction.
-
-        Used by `Tab` / `Shift+Tab` to skip server-header rows during
-        cross-tool navigation. Returns `None` when there is no tool row in
-        the requested direction.
+    def _next_server_header(self, start: int, step: int) -> int | None:
+        """Return the next server-header index in the requested direction.
 
         Args:
             start: Index to start searching from (exclusive).
             step: `+1` (forward) or `-1` (backward).
+
+        Returns:
+            The index of the nearest `MCPServerHeaderItem` in that direction,
+            or `None` when no server header exists there.
         """
-        idx = start + step
-        while 0 <= idx < len(self._row_widgets):
-            if isinstance(self._row_widgets[idx], MCPToolItem):
-                return idx
-            idx += step
+        index = start + step
+        while 0 <= index < len(self._row_widgets):
+            if isinstance(self._row_widgets[index], MCPServerHeaderItem):
+                return index
+            index += step
         return None
 
     def _scroll_widget_bottom_to_view(
@@ -1426,11 +1432,11 @@ class MCPViewerScreen(ModalScreen[str | None]):
         """Smart up: scroll one row inside a tall expanded row, else jump.
 
         If the selected row's top edge is already inside the viewport, jump
-        to the previous row (header or tool). For rows taller than the
-        viewport, pin the new selection's **bottom** to the viewport so the
-        next `Up` resumes line-stepping through that row; otherwise just
-        ensure the row is visible. `Tab` / `Shift+Tab` skip the smart check
-        AND skip header rows (see `action_jump_up`).
+        to the previous row (header or tool), wrapping to the final row from
+        the first. For rows taller than the viewport, pin the new selection's
+        **bottom** to the viewport so the next `Up` resumes line-stepping
+        through that row; otherwise just ensure the row is visible. `Tab` /
+        `Shift+Tab` jump between server headers (see `action_jump_up`).
         """
         if not self._row_widgets:
             return
@@ -1438,7 +1444,10 @@ class MCPViewerScreen(ModalScreen[str | None]):
         selected = self._row_widgets[self._selected_index]
         if selected.region.y >= scroll.region.y:
             old = self._selected_index
-            self._move_selection(-1)
+            if old == 0:
+                self._move_to(len(self._row_widgets) - 1)
+            else:
+                self._move_selection(-1)
             if self._selected_index != old:
                 self._reveal_selection(
                     self._row_widgets[self._selected_index], direction=-1
@@ -1450,10 +1459,11 @@ class MCPViewerScreen(ModalScreen[str | None]):
         """Smart down: scroll one row inside a tall expanded row, else jump.
 
         If the selected row's bottom edge is already inside the viewport,
-        jump to the next row (header or tool). For rows taller than the
-        viewport, pin the new selection's top to the viewport; otherwise
-        just ensure the row is visible. `Tab` / `Shift+Tab` skip the smart
-        check AND skip header rows (see `action_jump_down`).
+        jump to the next row (header or tool), wrapping to the first row from
+        the final one. For rows taller than the viewport, pin the new
+        selection's top to the viewport; otherwise just ensure the row is
+        visible. `Tab` / `Shift+Tab` jump between server headers (see
+        `action_jump_down`).
         """
         if not self._row_widgets:
             return
@@ -1463,7 +1473,10 @@ class MCPViewerScreen(ModalScreen[str | None]):
         viewport_bottom = scroll.region.y + scroll.region.height
         if selected_bottom <= viewport_bottom:
             old = self._selected_index
-            self._move_selection(1)
+            if old == len(self._row_widgets) - 1:
+                self._move_to(0)
+            else:
+                self._move_selection(1)
             if self._selected_index != old:
                 self._reveal_selection(
                     self._row_widgets[self._selected_index], direction=1
@@ -1472,17 +1485,26 @@ class MCPViewerScreen(ModalScreen[str | None]):
             scroll.scroll_relative(y=1, animate=False)
 
     def action_jump_up(self) -> None:
-        """Jump to the previous tool (Shift+Tab); skips headers."""
-        target = self._next_tool_row(self._selected_index, -1)
+        """Jump backward to the nearest server header (Shift+Tab), wrapping.
+
+        From a tool row this lands on the current server's own header; from a
+        header it moves to the previous server. Wraps to the final header from
+        the top.
+        """
+        target = self._next_server_header(self._selected_index, -1)
         if target is None:
+            target = self._next_server_header(len(self._row_widgets), -1)
+        if target is None or target == self._selected_index:
             return
         self._move_to(target)
         self._reveal_selection(self._row_widgets[target], direction=-1)
 
     def action_jump_down(self) -> None:
-        """Jump to the next tool (Tab); skips headers."""
-        target = self._next_tool_row(self._selected_index, +1)
+        """Jump to the next server (Tab), wrapping at the end."""
+        target = self._next_server_header(self._selected_index, +1)
         if target is None:
+            target = self._next_server_header(-1, +1)
+        if target is None or target == self._selected_index:
             return
         self._move_to(target)
         self._reveal_selection(self._row_widgets[target], direction=1)
@@ -1587,6 +1609,8 @@ class MCPViewerScreen(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         """Close the viewer without selecting a server to log into."""
+        if self._on_close is not None and self._on_close():
+            return
         self.dismiss(None)
 
     def action_reconnect(self) -> None:

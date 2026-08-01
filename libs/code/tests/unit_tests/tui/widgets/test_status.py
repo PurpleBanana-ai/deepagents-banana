@@ -33,6 +33,24 @@ class StatusBarApp(App):
         yield StatusBar(id="status-bar")
 
 
+class TestApprovalModeDisplay:
+    """Tests for the three-state approval indicator."""
+
+    @pytest.mark.parametrize(
+        ("mode", "label"),
+        [("manual", "manual"), ("auto", "auto"), ("yolo", "YOLO")],
+    )
+    async def test_displays_mode(self, mode: str, label: str) -> None:
+        async with StatusBarApp().run_test() as pilot:
+            bar = pilot.app.query_one("#status-bar", StatusBar)
+            bar.set_approval_mode(mode)
+            await pilot.pause()
+
+            indicator = pilot.app.query_one("#auto-approve-indicator", Static)
+            assert str(indicator.render()) == label
+            assert indicator.has_class(mode)
+
+
 class TestCwdDisplay:
     """Tests for the cwd display in the status bar."""
 
@@ -102,8 +120,16 @@ class TestBranchDisplay:
             assert bar.branch == ""
             assert display.render() == ""
 
-    async def test_branch_display_shows_branch_name(self) -> None:
-        """Setting branch reactive should update the display widget."""
+    async def test_branch_display_shows_branch_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Setting branch reactive should update the display widget.
+
+        `HIDE_CWD` removes the cwd from the layout so the branch region isn't
+        starved of width by a deep pytest cwd -- otherwise this assertion flakes
+        on the actual run directory's path length rather than any real behavior.
+        """
+        monkeypatch.setenv(HIDE_CWD, "1")
         async with StatusBarApp().run_test() as pilot:
             bar = pilot.app.query_one("#status-bar", StatusBar)
             bar.branch = "main"
@@ -112,9 +138,16 @@ class TestBranchDisplay:
             rendered = str(display.render())
             assert "main" in rendered
 
-    async def test_branch_display_with_feature_branch(self) -> None:
-        """Feature branch names with slashes should display correctly."""
-        async with StatusBarApp().run_test(size=(120, 24)) as pilot:
+    async def test_branch_display_with_feature_branch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Feature branch names with slashes should display correctly.
+
+        `HIDE_CWD` keeps the branch region wide enough regardless of the pytest
+        cwd path length (see `test_branch_display_shows_branch_name`).
+        """
+        monkeypatch.setenv(HIDE_CWD, "1")
+        async with StatusBarApp().run_test() as pilot:
             bar = pilot.app.query_one("#status-bar", StatusBar)
             bar.branch = "feat/new-feature"
             await pilot.pause()
@@ -191,8 +224,17 @@ class TestBranchDisplay:
             assert visible.rstrip().endswith("\u2026")
             assert "feature/" in visible
 
-    async def test_short_branch_name_not_truncated(self) -> None:
-        """A branch that fits should render in full with no ellipsis."""
+    async def test_short_branch_name_not_truncated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A branch that fits should render in full with no ellipsis.
+
+        `HIDE_CWD` removes the cwd from the layout (as in
+        `test_branch_display_shows_branch_name`) so a deep real checkout path
+        cannot starve the branch region to zero width -- otherwise this flakes
+        on the run directory's length rather than any real behavior.
+        """
+        monkeypatch.setenv(HIDE_CWD, "1")
         async with StatusBarApp().run_test(size=(150, 24)) as pilot:
             bar = pilot.app.query_one("#status-bar", StatusBar)
             bar.branch = "main"
@@ -230,8 +272,15 @@ class TestBranchDisplay:
             monkeypatch.delenv("UI_CHARSET_MODE", raising=False)
             reset_glyphs_cache()
 
-    async def test_branch_display_contains_git_icon(self) -> None:
-        """Branch display should include the git branch glyph prefix."""
+    async def test_branch_display_contains_git_icon(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Branch display should include the git branch glyph prefix.
+
+        `HIDE_CWD` keeps the branch region wide enough regardless of the pytest
+        cwd path length (see `test_branch_display_shows_branch_name`).
+        """
+        monkeypatch.setenv(HIDE_CWD, "1")
         async with StatusBarApp().run_test() as pilot:
             bar = pilot.app.query_one("#status-bar", StatusBar)
             bar.branch = "develop"
@@ -393,6 +442,46 @@ class TestTokenDisplay:
             display = pilot.app.query_one("#tokens-display")
             assert str(display.render()) == "... tokens"
 
+    async def test_cost_update_while_pending_keeps_the_placeholder(self) -> None:
+        """A mid-turn cost update must not resurrect the stale token count.
+
+        Cost and tokens share one display slot, so setting the cost re-renders
+        both. Without latching the pending state that re-render would show the
+        *previous* turn's count -- exactly what the placeholder hides.
+        """
+        async with StatusBarApp().run_test() as pilot:
+            bar = pilot.app.query_one("#status-bar", StatusBar)
+            bar.set_tokens(5000)
+            await pilot.pause()
+            bar.show_pending_tokens()
+            await pilot.pause()
+
+            bar.set_cost(1.25)
+            await pilot.pause()
+
+            display = str(pilot.app.query_one("#tokens-display").render())
+            assert "... tokens" in display
+            assert "5.0K" not in display
+            assert "$1.25" in display
+
+    async def test_accurate_count_replaces_the_placeholder_with_cost(self) -> None:
+        async with StatusBarApp().run_test() as pilot:
+            bar = pilot.app.query_one("#status-bar", StatusBar)
+            bar.set_tokens(5000)
+            await pilot.pause()
+            bar.show_pending_tokens()
+            await pilot.pause()
+            bar.set_cost(1.25)
+            await pilot.pause()
+
+            bar.set_tokens(7500)
+            await pilot.pause()
+
+            display = str(pilot.app.query_one("#tokens-display").render())
+            assert "7.5K" in display
+            assert "... tokens" not in display
+            assert "$1.25" in display
+
     def test_show_pending_tokens_without_mount_is_noop(self) -> None:
         bar = StatusBar()
         bar.show_pending_tokens()
@@ -453,6 +542,68 @@ class TestTokenDisplay:
             assert display.display is False
 
 
+class TestCostDisplay:
+    """Tests for cumulative cost rendered inline with context tokens."""
+
+    async def test_tokens_and_cost_share_one_slot(self) -> None:
+        async with StatusBarApp().run_test() as pilot:
+            bar = pilot.app.query_one("#status-bar", StatusBar)
+            bar.set_tokens(12_500)
+            bar.set_cost(0.42)
+            await pilot.pause()
+            rendered = str(pilot.app.query_one("#tokens-display").render())
+            assert "12.5K tokens" in rendered
+            assert "$0.42" in rendered
+
+    async def test_cost_displays_without_tokens(self) -> None:
+        async with StatusBarApp().run_test() as pilot:
+            bar = pilot.app.query_one("#status-bar", StatusBar)
+            bar.set_cost(1.25)
+            await pilot.pause()
+            display = pilot.app.query_one("#tokens-display")
+            assert str(display.render()) == "$1.25"
+            assert display.display is True
+
+    async def test_zero_cost_is_hidden(self) -> None:
+        async with StatusBarApp().run_test() as pilot:
+            bar = pilot.app.query_one("#status-bar", StatusBar)
+            bar.set_tokens(5000)
+            bar.set_cost(0.0)
+            await pilot.pause()
+            rendered = str(pilot.app.query_one("#tokens-display").render())
+            assert rendered == "5.0K tokens"
+            assert "$" not in rendered
+
+    async def test_sub_cent_cost_uses_display_floor(self) -> None:
+        async with StatusBarApp().run_test() as pilot:
+            bar = pilot.app.query_one("#status-bar", StatusBar)
+            bar.set_cost(0.0045)
+            await pilot.pause()
+            assert str(pilot.app.query_one("#tokens-display").render()) == "<$0.01"
+
+    async def test_approximate_token_marker_survives_cost_update(self) -> None:
+        async with StatusBarApp().run_test() as pilot:
+            bar = pilot.app.query_one("#status-bar", StatusBar)
+            bar.set_tokens(5000, approximate=True)
+            bar.set_cost(0.42)
+            await pilot.pause()
+            rendered = str(pilot.app.query_one("#tokens-display").render())
+            assert "5.0K+ tokens" in rendered
+            assert "$0.42" in rendered
+
+    async def test_pending_tokens_keep_cost_visible(self) -> None:
+        async with StatusBarApp().run_test() as pilot:
+            bar = pilot.app.query_one("#status-bar", StatusBar)
+            bar.set_tokens(5000)
+            bar.set_cost(0.42)
+            await pilot.pause()
+            bar.show_pending_tokens()
+            await pilot.pause()
+            rendered = str(pilot.app.query_one("#tokens-display").render())
+            assert "... tokens" in rendered
+            assert "$0.42" in rendered
+
+
 class TestStatusMessageVisibility:
     """The status-message slot hides when empty so its padding adds no gap."""
 
@@ -473,6 +624,22 @@ class TestStatusMessageVisibility:
             bar.set_status_message("")
             await pilot.pause()
             assert msg.display is False
+
+    async def test_hook_and_agent_status_do_not_clobber(self) -> None:
+        """Hook and agent writers acquire/release the shared slot without clobber."""
+        async with StatusBarApp().run_test() as pilot:
+            bar = pilot.app.query_one("#status-bar", StatusBar)
+            msg = pilot.app.query_one("#status-message", Static)
+
+            bar.set_status_message("Loading thread", source="agent")
+            bar.set_status_message("Running [bold]hook[/bold]", source="hooks")
+            bar.set_status_message("Still loading", source="agent")
+            await pilot.pause()
+            assert str(msg.render()) == "Running [bold]hook[/bold]"
+
+            bar.set_status_message("", source="hooks")
+            await pilot.pause()
+            assert str(msg.render()) == "Still loading"
 
     async def test_busy_shows_slot_and_clearing_hides(self) -> None:
         """A busy indicator reveals the slot; clearing busy (no message) hides it."""
@@ -547,11 +714,29 @@ class TestModelLabelPrefixStripping:
         async with StatusBarApp().run_test() as pilot:
             label = pilot.app.query_one("#model-display", ModelLabel)
             label.provider = "fireworks"
-            label.model = "accounts/fireworks/routers/glm-5p1-fast"
+            label.model = "accounts/fireworks/routers/glm-5p2-fast"
             await pilot.pause()
             rendered = str(label.render())
-            assert "fireworks:glm-5p1-fast" in rendered
+            assert "fireworks:glm-5p2-fast" in rendered
             assert "accounts/fireworks/routers/" not in rendered
+
+    async def test_fireworks_prefix_stripped_case_insensitively(self) -> None:
+        """A mixed-case fireworks ID is stripped, preserving the tail's casing.
+
+        `detect_provider` resolves mixed-case `accounts/fireworks/...` IDs to
+        the `fireworks` provider, so the display layer strips the prefix
+        case-insensitively too. The remaining model name keeps its original
+        casing rather than being lowercased.
+        """
+        async with StatusBarApp().run_test() as pilot:
+            label = pilot.app.query_one("#model-display", ModelLabel)
+            label.provider = "fireworks"
+            label.model = "Accounts/Fireworks/Models/Kimi-K2P6"
+            await pilot.pause()
+            assert label._clean_model() == "Kimi-K2P6"
+            rendered = str(label.render())
+            assert "fireworks:Kimi-K2P6" in rendered
+            assert "Accounts/Fireworks/Models/" not in rendered
 
     async def test_get_content_width_uses_stripped_name(self) -> None:
         """`get_content_width` sizes to the stripped name, not the raw model."""

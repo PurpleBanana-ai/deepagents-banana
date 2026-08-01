@@ -4,10 +4,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from textual.app import App, ComposeResult
 from textual.content import Content
+from textual.style import Style as TStyle
 
+from deepagents_code import clipboard as clipboard_module
 from deepagents_code._env_vars import (
     DEBUG,
+    EXPERIMENTAL,
     HIDE_CWD,
     HIDE_LANGSMITH_TRACING,
     HIDE_SPLASH_VERSION,
@@ -16,8 +20,12 @@ from deepagents_code._env_vars import (
     SPLASH_SHOW_MODEL,
 )
 from deepagents_code._version import __version__
+from deepagents_code.tui.widgets import welcome as welcome_module
+from deepagents_code.tui.widgets._copy_spans import copy_span_target
 from deepagents_code.tui.widgets.welcome import (
     WelcomeBanner,
+    _debug_tag_style,
+    _experimental_tag_style,
     _home_prefixed,
     _langsmith_project_link,
     _langsmith_project_link_style,
@@ -29,6 +37,51 @@ _EDITABLE_PATH = "deepagents_code.tui.widgets.welcome._get_editable_install_path
 _PROJECT_NAME = "deepagents_code.tui.widgets.welcome.get_langsmith_project_name"
 _REPLICA_PROJECT = "deepagents_code.tui.widgets.welcome.get_langsmith_replica_project"
 _FETCH_URL = "deepagents_code.tui.widgets.welcome.fetch_langsmith_project_url"
+_DEBUG_STYLE = "deepagents_code.tui.widgets.welcome._debug_tag_style"
+_EXPERIMENTAL_STYLE = "deepagents_code.tui.widgets.welcome._experimental_tag_style"
+_LOCAL_STYLE = "deepagents_code.tui.widgets.welcome._local_tag_style"
+
+
+def _raw_style_covering(content: Content, needle: str) -> str | TStyle:
+    """Return the style of the single span whose text contains `needle`.
+
+    The style may be a `TStyle` (built from a themed style) or a raw `str` style
+    string (used under the ANSI theme branch, which `Content.assemble` preserves
+    verbatim — see `test_debug_tag_uses_ansi_markup_under_ansi_theme`). Use
+    `_style_covering` when the style must be a `TStyle`. Indexes the public
+    `content.plain` and reads the public `Span.style` field; update if Textual's
+    span model changes.
+
+    Args:
+        content: Assembled banner content to inspect.
+        needle: Substring identifying the span whose style to return.
+
+    Returns:
+        The style of the one span covering `needle`.
+    """
+    spans = [s for s in content.spans if needle in content.plain[s.start : s.end]]
+    assert len(spans) == 1, f"expected exactly one span covering {needle!r}"
+    return spans[0].style
+
+
+def _style_covering(content: Content, needle: str) -> TStyle:
+    """Return the `TStyle` of the single span whose text contains `needle`.
+
+    Only usable for spans whose style resolves to a `TStyle` (i.e. built from a
+    themed `TStyle`, not a raw `str` style string as used under the ANSI theme
+    branch, which `Content.assemble` preserves as a raw `str` — see
+    `test_debug_tag_uses_ansi_markup_under_ansi_theme`).
+
+    Args:
+        content: Assembled banner content to inspect.
+        needle: Substring identifying the span whose style to return.
+
+    Returns:
+        The `TStyle` of the one span covering `needle`.
+    """
+    style = _raw_style_covering(content, needle)
+    assert isinstance(style, TStyle)
+    return style
 
 
 def _make_banner(
@@ -175,7 +228,6 @@ class TestLocalTagStyle:
     def test_non_ansi_uses_themed_color(self) -> None:
         """Non-ANSI themes color the tag with the theme's tool color."""
         from textual.color import Color as TColor
-        from textual.style import Style as TStyle
 
         from deepagents_code.theme import DARK_COLORS
 
@@ -183,6 +235,48 @@ class TestLocalTagStyle:
         assert isinstance(style, TStyle)
         assert style.bold is True
         assert style.foreground == TColor.parse(DARK_COLORS.tool)
+
+
+class TestDebugTagStyle:
+    """Tests for the `(debug enabled)` tag style."""
+
+    def test_ansi_uses_bold_yellow_markup(self) -> None:
+        """Under ANSI themes the tag stays visible via bold yellow terminal text."""
+        from deepagents_code.theme import DARK_COLORS
+
+        assert _debug_tag_style(ansi=True, colors=DARK_COLORS) == "bold yellow"
+
+    def test_non_ansi_uses_themed_warning_color(self) -> None:
+        """Non-ANSI themes color the tag with the theme's warning color."""
+        from textual.color import Color as TColor
+
+        from deepagents_code.theme import DARK_COLORS
+
+        style = _debug_tag_style(ansi=False, colors=DARK_COLORS)
+        assert isinstance(style, TStyle)
+        assert style.bold is True
+        assert style.foreground == TColor.parse(DARK_COLORS.warning)
+
+
+class TestExperimentalTagStyle:
+    """Tests for the `(experimental)` tag style."""
+
+    def test_ansi_uses_bold_magenta_markup(self) -> None:
+        """Under ANSI themes the tag stays visible via bold magenta terminal text."""
+        from deepagents_code.theme import DARK_COLORS
+
+        assert _experimental_tag_style(ansi=True, colors=DARK_COLORS) == "bold magenta"
+
+    def test_non_ansi_uses_themed_accent_color(self) -> None:
+        """Non-ANSI themes color the tag with the theme's accent color."""
+        from textual.color import Color as TColor
+
+        from deepagents_code.theme import DARK_COLORS
+
+        style = _experimental_tag_style(ansi=False, colors=DARK_COLORS)
+        assert isinstance(style, TStyle)
+        assert style.bold is True
+        assert style.foreground == TColor.parse(DARK_COLORS.accent)
 
 
 class TestTitle:
@@ -199,18 +293,223 @@ class TestTitle:
         assert f"v{__version__}" in plain
         assert "(local)" not in plain
 
-    def test_hides_version_when_env_set(self) -> None:
-        """`HIDE_SPLASH_VERSION` removes the version from the title."""
-        plain = _make_banner(env={HIDE_SPLASH_VERSION: "1"})._build_banner().plain
+    def test_hides_version_and_local_tag_when_env_set(self) -> None:
+        """`HIDE_SPLASH_VERSION` removes version and local-install details."""
+        with patch(_EDITABLE, return_value=True):
+            plain = _make_banner(env={HIDE_SPLASH_VERSION: "1"})._build_banner().plain
         assert f"v{__version__}" not in plain
         assert "(local)" not in plain
 
     def test_marks_editable_install_as_local(self) -> None:
-        """Editable installs append a `(local)` tag to the version."""
+        """Editable installs show a `(local)` tag."""
         with patch(_EDITABLE, return_value=True):
             plain = _make_banner()._build_banner().plain
         assert f"v{__version__}" in plain
         assert "(local)" in plain
+
+    def test_no_debug_tag_by_default(self) -> None:
+        """No `(debug enabled)` tag when `DEEPAGENTS_CODE_DEBUG` is unset."""
+        with patch(_EDITABLE, return_value=False):
+            plain = _make_banner()._build_banner().plain
+        assert "(debug enabled)" not in plain
+
+    def test_no_debug_tag_when_env_falsy(self) -> None:
+        """A present-but-falsy `DEEPAGENTS_CODE_DEBUG` shows no `(debug enabled)` tag.
+
+        Locks the truthy gate (`is_env_truthy`) against a regression to a bare
+        presence check (`DEBUG in os.environ`), which every other test would pass.
+        """
+        with patch(_EDITABLE, return_value=False):
+            plain = _make_banner(env={DEBUG: "0"})._build_banner().plain
+        assert "(debug enabled)" not in plain
+
+    def test_marks_debug_enabled_when_env_set(self) -> None:
+        """`DEEPAGENTS_CODE_DEBUG` shows a `(debug enabled)` tag."""
+        with patch(_EDITABLE, return_value=False):
+            plain = _make_banner(env={DEBUG: "1"})._build_banner().plain
+        assert f"v{__version__}" in plain
+        # Leading space guards the separator from the preceding segment.
+        assert " (debug enabled)" in plain
+        assert "(local)" not in plain
+        assert plain.index(f"v{__version__}") < plain.index("(debug enabled)")
+
+    def test_debug_tag_precedes_local_tag(self) -> None:
+        """`(debug enabled)` renders before `(local)` when both apply."""
+        with patch(_EDITABLE, return_value=True):
+            plain = _make_banner(env={DEBUG: "1"})._build_banner().plain
+        assert "(debug enabled)" in plain
+        assert "(local)" in plain
+        assert plain.index("(debug enabled)") < plain.index("(local)")
+
+    def test_version_debug_local_render_in_order(self) -> None:
+        """Version, `(debug enabled)`, and `(local)` render in that fixed order.
+
+        The pairwise ordering assertions each pin only two of the three segments,
+        and under different editable states; this locks all three in one banner.
+        """
+        with patch(_EDITABLE, return_value=True):
+            plain = _make_banner(env={DEBUG: "1"})._build_banner().plain
+        assert (
+            plain.index(f"v{__version__}")
+            < plain.index("(debug enabled)")
+            < plain.index("(local)")
+        )
+
+    def test_debug_tag_when_version_hidden(self) -> None:
+        """The debug tag remains visible without exposing local-install details."""
+        with patch(_EDITABLE, return_value=True):
+            plain = (
+                _make_banner(env={DEBUG: "1", HIDE_SPLASH_VERSION: "1"})
+                ._build_banner()
+                .plain
+            )
+        assert f"v{__version__}" not in plain
+        assert "(debug enabled)" in plain
+        assert "(local)" not in plain
+
+    def test_no_experimental_tag_by_default(self) -> None:
+        """No `(experimental)` tag when `DEEPAGENTS_CODE_EXPERIMENTAL` is unset."""
+        with patch(_EDITABLE, return_value=False):
+            plain = _make_banner()._build_banner().plain
+        assert "(experimental)" not in plain
+
+    def test_no_experimental_tag_when_env_falsy(self) -> None:
+        """A present-but-falsy `DEEPAGENTS_CODE_EXPERIMENTAL` shows no tag.
+
+        Locks the truthy gate (`is_env_truthy`) against a regression to a bare
+        presence check (`EXPERIMENTAL in os.environ`), which every other test
+        would pass.
+        """
+        with patch(_EDITABLE, return_value=False):
+            plain = _make_banner(env={EXPERIMENTAL: "0"})._build_banner().plain
+        assert "(experimental)" not in plain
+
+    def test_marks_experimental_when_env_set(self) -> None:
+        """`DEEPAGENTS_CODE_EXPERIMENTAL` shows an `(experimental)` tag."""
+        with patch(_EDITABLE, return_value=False):
+            plain = _make_banner(env={EXPERIMENTAL: "1"})._build_banner().plain
+        assert f"v{__version__}" in plain
+        # Leading space guards the separator from the preceding segment.
+        assert " (experimental)" in plain
+        assert "(local)" not in plain
+        assert plain.index(f"v{__version__}") < plain.index("(experimental)")
+
+    def test_experimental_tag_follows_debug_precedes_local(self) -> None:
+        """`(experimental)` renders after `(debug enabled)`, before `(local)`."""
+        with patch(_EDITABLE, return_value=True):
+            plain = (
+                _make_banner(env={DEBUG: "1", EXPERIMENTAL: "1"})._build_banner().plain
+            )
+        assert (
+            plain.index("(debug enabled)")
+            < plain.index("(experimental)")
+            < plain.index("(local)")
+        )
+
+    def test_experimental_tag_when_version_hidden(self) -> None:
+        """The experimental tag stays visible without exposing local-install info."""
+        with patch(_EDITABLE, return_value=True):
+            plain = (
+                _make_banner(env={EXPERIMENTAL: "1", HIDE_SPLASH_VERSION: "1"})
+                ._build_banner()
+                .plain
+            )
+        assert f"v{__version__}" not in plain
+        assert "(experimental)" in plain
+        assert "(local)" not in plain
+
+    def test_experimental_tag_carries_its_own_style(self) -> None:
+        """The experimental span carries the experimental style helper's output."""
+        from textual.color import Color as TColor
+
+        experimental_style = TStyle(foreground=TColor.parse("#070809"), bold=True)
+        with (
+            patch(_EDITABLE, return_value=False),
+            patch(_EXPERIMENTAL_STYLE, return_value=experimental_style),
+        ):
+            content = _make_banner(env={EXPERIMENTAL: "1"})._build_banner()
+        assert _style_covering(content, "(experimental)").foreground == TColor.parse(
+            "#070809"
+        )
+
+    def test_experimental_tag_uses_ansi_markup_under_ansi_theme(self) -> None:
+        """Under an ANSI theme the experimental span carries bold-magenta markup."""
+        from textual._context import active_app
+
+        app = active_app.get()
+        previous_theme = app.theme
+        app.theme = "ansi-dark"
+        try:
+            with patch(_EDITABLE, return_value=False):
+                content = _make_banner(env={EXPERIMENTAL: "1"})._build_banner()
+        finally:
+            app.theme = previous_theme
+        assert _raw_style_covering(content, "(experimental)") == "bold magenta"
+
+    def test_title_tags_carry_their_own_styles(self) -> None:
+        """Each title tag's span carries its own style helper's output.
+
+        Guards against wiring regressions where a tag renders with the wrong
+        helper's style or the style lands on the wrong segment; the plain-text
+        assertions above cannot catch either.
+        """
+        from textual.color import Color as TColor
+
+        debug_style = TStyle(foreground=TColor.parse("#010203"), bold=True)
+        local_style = TStyle(foreground=TColor.parse("#040506"), bold=True)
+        with (
+            patch(_EDITABLE, return_value=True),
+            patch(_DEBUG_STYLE, return_value=debug_style),
+            patch(_LOCAL_STYLE, return_value=local_style),
+        ):
+            content = _make_banner(env={DEBUG: "1"})._build_banner()
+        assert _style_covering(content, "(debug enabled)").foreground == TColor.parse(
+            "#010203"
+        )
+        assert _style_covering(content, "(local)").foreground == TColor.parse("#040506")
+
+    def test_debug_tag_uses_ansi_markup_under_ansi_theme(self) -> None:
+        """Under an ANSI theme the assembled debug span carries bold-yellow markup.
+
+        `TestDebugTagStyle` covers `_debug_tag_style` in isolation; only an
+        assembled banner confirms the ANSI branch's markup survives
+        `Content.assemble`, which keeps it a raw `str` rather than a parsed
+        `TStyle` (so `_style_covering` cannot be used here). Guards the ANSI
+        rendering path that every other assembled test misses, since they run
+        under the non-ANSI default theme.
+        """
+        from textual._context import active_app
+
+        app = active_app.get()
+        previous_theme = app.theme
+        app.theme = "ansi-dark"
+        try:
+            with patch(_EDITABLE, return_value=False):
+                content = _make_banner(env={DEBUG: "1"})._build_banner()
+        finally:
+            app.theme = previous_theme
+        assert _raw_style_covering(content, "(debug enabled)") == "bold yellow"
+
+    def test_debug_tag_uses_themed_warning_color_when_assembled(self) -> None:
+        """The real themed warning color reaches the assembled debug span.
+
+        `TestDebugTagStyle` checks `_debug_tag_style` in isolation and
+        `test_title_tags_carry_their_own_styles` patches it with a sentinel;
+        neither confirms the unpatched helper's themed color lands on the span
+        under the default (non-ANSI) theme. Anchored to the banner's resolved
+        theme colors so it tracks whatever palette the active theme provides.
+        """
+        from textual.color import Color as TColor
+
+        from deepagents_code.theme import get_theme_colors
+
+        with patch(_EDITABLE, return_value=False):
+            banner = _make_banner(env={DEBUG: "1"})
+            content = banner._build_banner()
+        warning = get_theme_colors(banner).warning
+        assert _style_covering(content, "(debug enabled)").foreground == TColor.parse(
+            warning
+        )
 
 
 class TestModelLine:
@@ -317,8 +616,6 @@ class TestTracingLine:
 
     def test_project_name_is_clickable_when_url_resolved(self) -> None:
         """The project name is a hyperlink when the URL has been fetched."""
-        from textual.style import Style as TStyle
-
         widget = _make_banner(
             project_name="dcode-johannes",
             project_urls={
@@ -330,13 +627,11 @@ class TestTracingLine:
             s for s in content.spans if isinstance(s.style, TStyle) and s.style.link
         ]
         assert any(
-            "dcode-johannes" in content._text[s.start : s.end] for s in linked_spans
+            "dcode-johannes" in content.plain[s.start : s.end] for s in linked_spans
         )
 
     def test_project_name_not_clickable_without_url(self) -> None:
         """The project name has no link when the URL has not been fetched."""
-        from textual.style import Style as TStyle
-
         widget = _make_banner(project_name="dcode-johannes")
         content = widget._build_banner()
         linked = [
@@ -440,8 +735,6 @@ class TestReplicaTracingLine:
 
     def test_replica_project_is_clickable_when_url_resolved(self) -> None:
         """The replica project is a hyperlink when the URL has been fetched."""
-        from textual.style import Style as TStyle
-
         widget = _make_banner(
             project_name="dcode-primary",
             replica_project="dcode-replica",
@@ -454,7 +747,7 @@ class TestReplicaTracingLine:
             s for s in content.spans if isinstance(s.style, TStyle) and s.style.link
         ]
         assert any(
-            "dcode-replica" in content._text[s.start : s.end] for s in linked_spans
+            "dcode-replica" in content.plain[s.start : s.end] for s in linked_spans
         )
 
     async def test_fetch_and_update_sets_primary_and_replica_urls(self) -> None:
@@ -500,6 +793,156 @@ class TestThreadLine:
         """No thread row in debug mode when the thread ID is unset."""
         plain = _make_banner(thread_id=None, env={DEBUG: "1"})._build_banner().plain
         assert "thread:" not in plain
+
+    def test_thread_id_span_is_marked_copyable(self) -> None:
+        """The thread ID span carries the click-to-copy metadata."""
+        content = _make_banner(thread_id="abc-123", env={DEBUG: "1"})._build_banner()
+        style = _style_covering(content, "abc-123")
+        assert copy_span_target(style) == ("abc-123", "Thread ID")
+        assert style.dim is True
+
+    def test_langsmith_link_appended_once_project_url_resolves(self) -> None:
+        """A resolved project URL adds a thread trace link to the row."""
+        content = _make_banner(
+            thread_id="abc-123",
+            project_name="proj",
+            project_urls={"proj": "https://smith.langchain.com/o/org/projects/p/p1"},
+            env={DEBUG: "1"},
+        )._build_banner()
+        assert "(open in langsmith)" in content.plain
+        link = _style_covering(content, "(open in langsmith)").link
+        assert link == (
+            "https://smith.langchain.com/o/org/projects/p/p1/t/abc-123"
+            "?utm_source=deepagents-code"
+        )
+
+    def test_no_langsmith_link_before_project_url_resolves(self) -> None:
+        """The row stays link-free while the project URL is unresolved."""
+        plain = (
+            _make_banner(thread_id="abc-123", project_name="proj", env={DEBUG: "1"})
+            ._build_banner()
+            .plain
+        )
+        assert "(open in langsmith)" not in plain
+
+    def test_no_langsmith_link_without_tracing(self) -> None:
+        """No trace link when LangSmith tracing is not configured."""
+        plain = (
+            _make_banner(thread_id="abc-123", env={DEBUG: "1"})._build_banner().plain
+        )
+        assert "(open in langsmith)" not in plain
+
+
+class _BannerApp(App[None]):
+    """Minimal app that mounts a prebuilt `WelcomeBanner` for click tests."""
+
+    def __init__(self, banner: WelcomeBanner) -> None:
+        super().__init__()
+        self._banner = banner
+
+    def compose(self) -> ComposeResult:
+        yield self._banner
+
+
+def _click_offset(banner: WelcomeBanner, needle: str) -> tuple[int, int]:
+    """Return a click offset inside the rendered span containing `needle`.
+
+    Derives the offset from the rendered text instead of hardcoding columns, then
+    shifts it by the banner's border (1 column, 1 row) and horizontal padding
+    (2 columns) so it addresses the widget's own coordinate space.
+
+    Args:
+        banner: The banner whose content is measured.
+        needle: Substring identifying the target span.
+
+    Returns:
+        The `(x, y)` offset to click.
+    """
+    border_x, border_y, padding_x = 1, 1, 2
+    for y, line in enumerate(banner._build_banner().plain.split("\n")):
+        column = line.find(needle)
+        if column != -1:
+            return border_x + padding_x + column, border_y + y
+    msg = f"{needle!r} not found in the rendered banner"
+    raise AssertionError(msg)
+
+
+class TestThreadIdClickToCopy:
+    """Clicking the thread ID copies it; the trace link still opens."""
+
+    async def test_click_copies_thread_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Clicking the thread ID copies it and reports success."""
+        copied: list[str] = []
+
+        def fake_copy(_app: App[None], text: str) -> tuple[bool, str | None]:
+            copied.append(text)
+            return True, None
+
+        monkeypatch.setattr(clipboard_module, "copy_text_to_clipboard", fake_copy)
+        banner = _make_banner(thread_id="abc-123", show_model=False, env={DEBUG: "1"})
+        app = _BannerApp(banner)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.click(banner, offset=_click_offset(banner, "abc-123"))
+            await pilot.pause()
+
+            assert copied == ["abc-123"]
+            latest = list(app._notifications)[-1]
+            assert latest.message == "Thread ID copied"
+
+    async def test_copy_failure_notifies_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A clipboard failure surfaces the backend error in a warning toast."""
+
+        def fake_copy(_app: App[None], _text: str) -> tuple[bool, str | None]:
+            return False, "clipboard unavailable"
+
+        monkeypatch.setattr(clipboard_module, "copy_text_to_clipboard", fake_copy)
+        banner = _make_banner(thread_id="abc-123", show_model=False, env={DEBUG: "1"})
+        app = _BannerApp(banner)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.click(banner, offset=_click_offset(banner, "abc-123"))
+            await pilot.pause()
+
+            latest = list(app._notifications)[-1]
+            assert latest.severity == "warning"
+            assert "clipboard unavailable" in latest.message
+
+    async def test_clicking_trace_link_opens_it_without_copying(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The trace link opens in the browser and never copies."""
+        copied: list[str] = []
+
+        def fake_copy(_app: App[None], text: str) -> tuple[bool, str | None]:
+            copied.append(text)
+            return True, None
+
+        monkeypatch.setattr(clipboard_module, "copy_text_to_clipboard", fake_copy)
+        opened: list[object] = []
+        monkeypatch.setattr(
+            welcome_module, "open_style_link", lambda event: opened.append(event)
+        )
+        banner = _make_banner(
+            thread_id="abc-123", show_model=False, project_name="proj", env={DEBUG: "1"}
+        )
+        app = _BannerApp(banner)
+        project_url = "https://smith.langchain.com/o/org/projects/p/p1"
+        # The mounted banner renders the link only after its startup worker
+        # resolves the project URL, so patch the fetch and let the worker run.
+        with patch(_FETCH_URL, return_value=project_url):
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                assert banner._project_urls == {"proj": project_url}
+                await pilot.click(
+                    banner, offset=_click_offset(banner, "(open in langsmith)")
+                )
+                await pilot.pause()
+
+                assert len(opened) == 1
+                assert copied == []
 
 
 class TestMcpToolLine:
@@ -596,13 +1039,14 @@ class TestEditableInstallPath:
         assert "installed:" not in plain
 
     def test_no_install_path_when_version_hidden(self) -> None:
-        """No install path row when the version is hidden."""
+        """Hiding the version also hides the editable-install path."""
         with (
             patch(_EDITABLE, return_value=True),
             patch(_EDITABLE_PATH, return_value="~/code"),
         ):
             plain = _make_banner(env={HIDE_SPLASH_VERSION: "1"})._build_banner().plain
         assert "installed:" not in plain
+        assert "~/code" not in plain
 
     def test_no_install_path_when_cwd_hidden(self) -> None:
         """No install path row when local path displays are hidden."""
