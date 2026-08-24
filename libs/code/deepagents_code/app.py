@@ -18,6 +18,7 @@ import webbrowser
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
+from itertools import groupby
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -25,9 +26,11 @@ from typing import (
     ClassVar,
     Literal,
     NamedTuple,
-    TypeVar,
+    Protocol,
     assert_never,
     cast,
+    override,
+    runtime_checkable,
 )
 
 from textual import on
@@ -48,24 +51,28 @@ from textual.widgets._toast import (  # noqa: PLC2701
     Toast as _Toast,  # for Toast click routing
 )
 from textual.worker import NoActiveWorker, get_current_worker
-from typing_extensions import override
 
 # Applied as an import-time side effect; must come before any App is created.
 from deepagents_code import (
     _textual_patches,  # noqa: F401
     theme,
 )
-from deepagents_code._cli_context import CLIContext
+from deepagents_code._cli_context import (
+    INHERIT_CLASSIFIER_MODEL,
+    CLIContext,
+)
 from deepagents_code._constants import (
     DEFAULT_AGENT_NAME as DEFAULT_ASSISTANT_ID,
     MCP_REENABLED_PENDING_ERROR,
     SDK_DEFAULT_RUBRIC_MAX_ITERATIONS,
+    SESSION_END_DRAIN_TIMEOUT_SECONDS,
 )
 from deepagents_code._git import (
     read_git_branch_from_filesystem,
     read_git_branch_via_subprocess,
 )
 from deepagents_code._invocation import invoked_name
+from deepagents_code._markdown import escape_markdown as _escape_markdown
 from deepagents_code._session_stats import (
     USAGE_KIND_LABELS,
     USAGE_KIND_ORDER,
@@ -74,24 +81,51 @@ from deepagents_code._session_stats import (
     SpinnerStatus,
     finalize_recorded_requests,
     format_cost,
+    format_cost_estimate,
     format_token_count,
     record_message_usage,
 )
 
 # All config imports — settings, create_model, detect_provider, is_ascii_mode,
 # etc. — are deferred to local imports at their call sites since they are only
-# accessed after user interaction begins.
+# accessed after user interaction begins. The one exception is
+# `configuration.theme_resolution` below: the theme helpers run before the
+# first frame, and it pulls the `configuration` package but neither
+# `config_manifest` nor `config`.
 from deepagents_code._version import CHANGELOG_URL, DOCS_URL
+
+# Aliased to the names these helpers had while they lived in this module;
+# `tests/unit_tests/test_theme.py` still imports them from here.
+from deepagents_code.configuration.theme_resolution import (
+    as_toml_table as _as_toml_table,
+    resolve_terminal_mapping as _resolve_terminal_mapping,
+    resolve_theme_name as _resolve_theme_name,
+)
 from deepagents_code.formatting import format_message_timestamp
+from deepagents_code.goal_state_limits import (
+    GOAL_APPLICATION_CHAR_LIMIT,
+    GOAL_OBJECTIVE_CHAR_LIMIT,
+    RUBRIC_CHAR_LIMIT,
+    GoalStateSizeError,
+    validate_goal_application,
+    validate_goal_notice_text,
+    validate_goal_objective,
+    validate_goal_objective_rendered,
+    validate_rubric,
+)
 from deepagents_code.goal_state_notice import (
     build_goal_continuation,
     build_goal_state_notice,
+    goal_notice_size_error,
     goal_state_fingerprint,
     has_goal_or_rubric_state,
     is_human_message,
     is_internal_message,
     latest_goal_state_message_index,
     latest_goal_state_notice,
+    log_malformed_summarization_event as _log_malformed_summarization_event,
+    summarization_cutoff as _summarization_cutoff,
+    validated_summarization_cutoff as _validated_summarization_cutoff,
 )
 from deepagents_code.iterm_cursor_guide import restore_iterm_cursor_guide
 from deepagents_code.notifications import (
@@ -104,6 +138,7 @@ from deepagents_code.notifications import (
 )
 from deepagents_code.tui.widgets._links import open_url_async
 from deepagents_code.tui.widgets.chat_input import ChatInput
+from deepagents_code.tui.widgets.context_usage import ContextUsageScreen
 from deepagents_code.tui.widgets.goal_status import GoalStatusPanel
 from deepagents_code.tui.widgets.loading import LoadingWidget
 from deepagents_code.tui.widgets.message_store import (
@@ -117,6 +152,7 @@ from deepagents_code.tui.widgets.messages import (
     AssistantMessage,
     DiffMessage,
     ErrorMessage,
+    LazyToolGroupSummary,
     QueuedUserMessage,
     RubricResultMessage,
     SkillMessage,
@@ -133,10 +169,71 @@ logger = logging.getLogger(__name__)
 _GRACEFUL_EXIT_WAIT_SECONDS = 2.0
 _monotonic = time.monotonic
 
+
+@runtime_checkable
+class _SupportsReverseNav(Protocol):
+    """Cursor-style modal that can step its selection up on `shift+tab`.
+
+    The app's priority `shift+tab -> toggle_auto_approve` binding consumes the
+    key before any screen binding fires, so `action_toggle_auto_approve`
+    routes the key to every active screen matching this protocol. A new modal
+    that implements `action_move_up` is routed automatically.
+
+    `runtime_checkable` protocols match on method *presence* only, so this is
+    opt-out, not opt-in: a screen that defines `action_move_up` for its own
+    arrow keys is enrolled in reverse-nav whether or not it was written with
+    `shift+tab` in mind. A screen that wants different behavior -- or none --
+    needs an explicit branch ahead of the protocol check in
+    `action_toggle_auto_approve`.
+
+    Enrollment is by method *name*, so it covers only one of the two cursor
+    conventions in this codebase. `OptionList`-hosting modals name their action
+    `action_cursor_up` instead; those never match this protocol, fall through
+    to the `ModalScreen` catch-all, and swallow `shift+tab` with no error while
+    their footer still advertises it. Such a screen must be added to the
+    explicit `isinstance` tuple in `action_toggle_auto_approve`.
+    """
+
+    def action_move_up(self) -> None: ...
+
+
+async def _wait_for_session_end(
+    session_end: Awaitable[None],
+    *,
+    timeout_seconds: float | None = None,
+) -> None:
+    """Bound Hooks v2 `SessionEnd` while a client session is torn down.
+
+    Args:
+        session_end: Session-end invocation or its already-running task.
+        timeout_seconds: Optional timeout override for deterministic tests.
+    """
+    timeout = (
+        SESSION_END_DRAIN_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else timeout_seconds
+    )
+    try:
+        await asyncio.wait_for(session_end, timeout=timeout)
+    except TimeoutError:
+        logger.warning(
+            "SessionEnd hook drain did not finish within %ss; continuing session "
+            "teardown",
+            timeout,
+        )
+
+
 _DEFERRED_START_NOTICE = (
     "No model is configured yet. Run `/model` to choose one. "
     "Deep Agents will ask for credentials for the selected provider."
 )
+
+_AUTO_CLASSIFIER_RECOMMENDED_MODELS = {
+    "anthropic:claude-haiku-4-5": "Claude Haiku 4.5",
+    "google_genai:gemini-3.7-flash": "Gemini 3.7 Flash",
+    "openai:gpt-5.6-luna": "GPT-5.6 Luna",
+}
+"""Lower-latency models recommended for repeated Auto action reviews."""
 
 
 def _parse_rubric_max_iterations(raw: str) -> tuple[int | None, str | None]:
@@ -166,11 +263,13 @@ def _parse_rubric_max_iterations(raw: str) -> tuple[int | None, str | None]:
     return parsed, None
 
 
-# Config `config.toml` writes are serialized by the single process-wide lock
-# `model_config._config_write_lock`, imported lazily at each write site (below).
-# It is shared with `model_config`'s writers so a theme/UI write here cannot
-# clobber, e.g., an effort or default-model write; a lock local to this module
-# would not mutually exclude against those. See that lock's docstring.
+# Config `config.toml` writes here go through
+# `configuration.writer.update_user_config`, which holds
+# `USER_CONFIG_WRITE_LOCK` for the whole read-modify-write.
+# `model_config._config_write_lock` is an alias for that same lock object, so a
+# theme/UI write here cannot clobber, e.g., an effort or default-model write; a
+# lock local to this module would not mutually exclude against those. See that
+# lock's docstring.
 
 _DEEPAGENTS_IMPORT_LOCK = threading.RLock()
 """Serializes process-local cold imports into the Deep Agents SDK graph.
@@ -181,14 +280,22 @@ deadlock detector when two threads cold-import overlapping modules.
 """
 
 _TOOL_GROUP_EXCLUSIONS = frozenset({"ask_user", "edit_file", "write_todos"})
-"""Tools that stay expanded instead of collapsing into step summaries.
+"""Tools kept out of the collapsing step summaries.
 
-Each surfaces user-facing content worth keeping visible on its own — an
-interactive prompt (`ask_user`), a diff (`edit_file`), or a todo list
-(`write_todos`) — so it renders standalone and acts as a boundary between
-adjacent tool groups. Add a tool here only when its collapsed one-line
-summary would hide something the user needs to see.
+Each named tool surfaces user-facing content worth keeping visible on its own —
+an interactive prompt (`ask_user`) or a todo list (`write_todos`) — so it renders
+standalone and acts as a boundary between adjacent tool groups. Add a tool here
+only when its collapsed one-line summary would hide something the user needs to
+see.
+
+`edit_file` is here because its successful row hides itself in favour of the
+`DiffMessage` that replaces it. The group-reveal paths do consult
+`has_own_hide_reason`, so a groupable superseded row would stay hidden — but the
+group summary would still count and phrase a row the user cannot see, and one
+`display` flag with two independent owners is a standing hazard even when both
+currently agree.
 """
+
 
 _MESSAGE_TIMESTAMP_FOOTER_CLASS = "message-timestamp-footer"
 """CSS class applied to individual message timestamp footer widgets."""
@@ -222,6 +329,35 @@ feedback) are not conversation turns, so they do not get timestamp footers.
 reason.
 """
 
+_SERVER_OUTPUT_MESSAGE_TYPES: frozenset[MessageType] = frozenset(
+    {MessageType.ASSISTANT, MessageType.TOOL, MessageType.SKILL}
+)
+"""Message types marking a thread the user did conversational work in.
+
+Read via `_store_has_server_output` to decide whether a thread is worth
+offering a way back to. `USER` alone is not enough: local-only flows
+(`/update`, `!shell`, most slash commands) mount a `UserMessage` widget
+without ever invoking the server.
+
+Membership in this set is necessary but not sufficient — non-incognito `!`
+shell output renders through `AssistantMessage`, so `_store_has_server_output`
+also excludes rows flagged `assistant_local_only`.
+
+This is deliberately *stricter* than "has a resumable checkpoint row".
+Non-conversational commands (`/goal`, `/rubric set`) persist thread state
+through `aupdate_state`, and merely registering a thread in server mode
+(`aensure_thread`) writes a row too, so `thread_exists` alone reports a
+brand-new thread as resumable. Threads holding only that state are
+intentionally treated as "nothing happened here" — `/rubric set` with no
+conversation is a config tweak, not work left behind.
+
+`SKILL` is the loosest member: `SkillMessage` mounts just *before*
+`_send_to_agent`, which can bail out without reaching the server, so a
+`SKILL` row means a turn was attempted rather than completed. That
+direction is safe — it only over-offers a hint that
+`_mount_previous_thread_hint` still validates against the checkpoint store.
+"""
+
 
 def _message_timestamp_footer_id(message_id: str) -> str:
     """Return the DOM id for a message timestamp footer."""
@@ -239,6 +375,43 @@ def _read_text_file_expanding_user(path_arg: str) -> tuple[Path, str]:
     """
     path = Path(path_arg).expanduser()
     return path, path.read_text(encoding="utf-8")
+
+
+def _load_float_option(
+    key: str,
+    default: float,
+    *,
+    label: str,
+    toml_data: dict[str, Any],
+    minimum: float | None = None,
+) -> float:
+    """Resolve a float config option, falling back to *default* when unusable.
+
+    Args:
+        key: Manifest option key.
+        default: Value used when the option is absent or fails validation.
+        label: Human-readable option name for the invalid-value warning.
+        toml_data: Pre-loaded config data, so callers reading several options
+            parse `config.toml` once.
+        minimum: Lowest accepted value, or `None` to accept any finite float.
+
+    Returns:
+        The configured value, or *default* when it is missing or invalid.
+    """
+    from deepagents_code.config_manifest import get_option, resolve_scalar
+
+    option = get_option(key)
+    value: object = default
+    if option is not None:
+        value, _ = resolve_scalar(option, toml_data=toml_data)
+    if (
+        not isinstance(value, float)
+        or not math.isfinite(value)
+        or (minimum is not None and value < minimum)
+    ):
+        logger.warning("Invalid %s %r; using the default", label, value)
+        return default
+    return value
 
 
 def _coerce_session_cost_usd(value: object) -> float:
@@ -313,6 +486,20 @@ def _coerce_provisional_cost_delta_usd(value: object) -> float | None:
         logger.warning("Discarding a provisional cost delta that is not finite.")
         return None
     return delta_usd
+
+
+def _persisted_context_tokens(state_values: dict[str, Any]) -> int:
+    """Read a checkpoint's `_context_tokens`, coercing absent or invalid to 0.
+
+    Args:
+        state_values: Thread state values from the checkpoint.
+
+    Returns:
+        The persisted context size, or 0 when it is missing or not a
+        non-negative `int`.
+    """
+    raw = state_values.get("_context_tokens")
+    return raw if isinstance(raw, int) and raw >= 0 else 0
 
 
 def _warn_discarded_goal_channels(state_values: dict[str, Any]) -> list[str]:
@@ -401,35 +588,30 @@ user why an unrelated next turn might fail and how to recover.
 """
 
 
-def _summarization_cutoff(event: Any) -> int:  # noqa: ANN401
-    """Return the absolute cutoff index of a `_summarization_event`.
-
-    Args:
-        event: A `_summarization_event` mapping (as persisted in state), or
-            `None`.
-
-    Returns:
-        The `cutoff_index`, or `0` when the event is missing or malformed.
-    """
-    if isinstance(event, dict):
-        cutoff = event.get("cutoff_index")
-        if isinstance(cutoff, int):
-            return cutoff
-    return 0
-
-
 def _effective_conversation(messages: list[Any], event: Any) -> list[Any]:  # noqa: ANN401
     """Reconstruct the effective conversation the model would see.
 
     A hardened local variant of
     `SummarizationMiddleware._apply_event_to_messages`, kept in the client
     because it runs against possibly-malformed remote-snapshot dicts and must
-    degrade gracefully (a `None` summary or non-int cutoff returns the full
-    list) rather than raise or emit a `None`-led list. Like the SDK method,
-    when a prior summarization event exists the effective conversation is the
-    summary message followed by the messages from `cutoff_index` onward, and it
+    degrade gracefully rather than raise or emit a `None`-led list. When the
+    event is usable the effective conversation is the summary message followed
+    by the messages from `cutoff_index` onward, matching the SDK method, and it
     works on both LangChain message objects and serialized dicts since it only
     slices and prepends.
+
+    An unusable event — a `None` summary, or a cutoff that is not a non-negative
+    int within bounds — is logged and returns the full list.
+
+    The bounds case diverges deliberately from the SDK. The SDK reads a cutoff
+    past the end as "everything was summarized" and returns `[summary]` alone.
+    Here, a list shorter than the cutoff means history was removed after the
+    summary was written; the `/offload` failure paths issue `RemoveMessage`. The
+    survivors are therefore recent messages, and `[summary]` would hide live
+    turns. Callers size context and detect dangling tool calls, where
+    over-reporting the window is the safe direction.
+    `validated_summarization_cutoff` holds the matching decision for the notice
+    predicate.
 
     Args:
         messages: Full message list from state.
@@ -438,14 +620,19 @@ def _effective_conversation(messages: list[Any], event: Any) -> list[Any]:  # no
     Returns:
         The effective message list.
     """
+    if event is None:
+        return list(messages)
     if not isinstance(event, dict):
+        _log_malformed_summarization_event(event, len(messages))
         return list(messages)
     summary = event.get("summary_message")
-    cutoff = event.get("cutoff_index")
-    if summary is None or not isinstance(cutoff, int):
+    cutoff = _validated_summarization_cutoff(
+        event,
+        message_count=len(messages),
+    )
+    if summary is None or cutoff is None:
+        _log_malformed_summarization_event(event, len(messages))
         return list(messages)
-    if cutoff > len(messages):
-        return [summary]
     return [summary, *messages[cutoff:]]
 
 
@@ -651,7 +838,242 @@ class _ConfigWriteResult:
     """Toast severity to use when `message` is shown."""
 
 
-ScreenResultT = TypeVar("ScreenResultT")
+_McpRefreshStatus = Literal["fresh", "disabled", "unavailable"]
+"""Why a `_ServerRespawnResult` carries the MCP metadata it does.
+
+- `fresh`: the post-restart preload returned metadata; `mcp_server_info` is
+    current and non-`None`.
+- `disabled`: MCP is off for this session (`--no-mcp`), so there is nothing
+    to refresh and `mcp_server_info` is `None`.
+- `unavailable`: the preload raised, or the restart failed or was never
+    attempted; `mcp_server_info` is `None`, so the freshness of any
+    previously captured metadata is unknown.
+"""
+
+
+@dataclass(frozen=True)
+class _ServerRespawnResult:
+    """Result of restarting the app-owned server."""
+
+    restarted: bool
+    """Whether the server subprocess was respawned and the agent rebuilt."""
+
+    mcp_server_info: list[MCPServerInfo] | None = None
+    """Post-restart MCP metadata; non-`None` exactly when `mcp_status` is
+    `fresh`.
+
+    Read `mcp_status` rather than testing this for `None`: a `None` here means
+    "disabled" and "refresh failed" alike, and those warrant opposite messages.
+    """
+
+    mcp_status: _McpRefreshStatus = "unavailable"
+    """Whether the MCP metadata is current, and if not, why.
+
+    Only meaningful when `restarted`. Defaults to the pessimistic value so a
+    failed restart never reads as "MCP is fine".
+    """
+
+    mcp_error: str | None = None
+    """Why the preload failed, when `mcp_status` is `unavailable`.
+
+    Carried so `/reload` can name the cause rather than emitting a bare "couldn't
+    be determined" — the underlying errors identify the offending server or
+    config file, and that text otherwise reaches only the log.
+    """
+
+
+def _format_mcp_server_changes(
+    previous: list[MCPServerInfo] | None,
+    current: list[MCPServerInfo] | None,
+    error: str | None = None,
+) -> str:
+    """Format MCP server changes for the `/reload` report.
+
+    Every server in `current` lands in exactly one bucket — loaded, failed,
+    unavailable, recovered, status-changed, reconfigured, or still-broken — so a
+    status the app grows later cannot silently fall through into "no changes".
+    Config files whose parse status changed are flagged separately, since they
+    arrive as synthetic entries rather than as servers.
+
+    Same-name servers are diffed on status, transport, and tool count. A server
+    can keep its name while recovering from an error or switching transport, so
+    reporting that as "no changes" would be actively misleading in the case
+    `/reload` most exists to serve.
+
+    Args:
+        previous: Metadata captured before the reload, or `None` when no
+            baseline was available.
+        current: Metadata captured after the reload, or `None` when the
+            refresh failed.
+        error: Why the refresh failed, when `current` is `None`. Named in the
+            summary so the user gets the offending server or config file
+            instead of a bare "couldn't be determined".
+
+    Returns:
+        A user-facing MCP server change summary.
+    """
+    if current is None:
+        detail = f" ({error})" if error else ""
+        return f"MCP server changes couldn't be determined{detail}; use /mcp to check."
+
+    # Config-load failures arrive as synthetic entries rather than servers;
+    # bucketing them under "Loaded" would announce a parse error as a success.
+    servers = {s.name: s for s in current if s.transport != "config"}
+    config_errors = sorted(s.name for s in current if s.transport == "config")
+
+    if previous is None:
+        # Without a baseline there is no diff to report, but the current state is
+        # still worth stating — filtered by status, since calling an erroring
+        # server "loaded" contradicts the rule the bucketing below applies.
+        usable = sorted(name for name, s in servers.items() if s.status == "ok")
+        unusable = sorted(
+            f"{name} ({s.status})" for name, s in servers.items() if s.status != "ok"
+        )
+        parts = [f"currently loaded: {', '.join(usable) or 'none'}"]
+        if unusable:
+            parts.append(f"unavailable: {', '.join(unusable)}")
+        if config_errors:
+            parts.append(f"config errors: {', '.join(config_errors)}")
+        return (
+            "MCP server changes couldn't be determined (no baseline metadata); "
+            f"{'; '.join(parts)}."
+        )
+
+    before = {s.name: s for s in previous if s.transport != "config"}
+    before_config_errors = {s.name for s in previous if s.transport == "config"}
+
+    # "Loaded" means newly added and actually usable — a new server already
+    # failing its first tool discovery is a failure, not a successful load.
+    loaded = sorted(
+        name for name in servers.keys() - before.keys() if servers[name].status == "ok"
+    )
+    removed = sorted(before.keys() - servers.keys())
+    failing = sorted(
+        name
+        for name, server in servers.items()
+        if server.status == "error"
+        # Unlike `recovered` below, this deliberately avoids a self-default: a
+        # name absent from the baseline is a new server, and a new server
+        # erroring on its first tool discovery is a failed load, not a
+        # self-comparison that would report it as unchanged.
+        and (name not in before or before[name].status != "error")
+    )
+    unavailable = sorted(
+        name
+        for name, server in servers.items()
+        if name not in before and server.status not in {"ok", "error"}
+    )
+    recovered = sorted(
+        name
+        for name, server in servers.items()
+        if server.status == "ok" and before.get(name, server).status != "ok"
+    )
+    status_changed = sorted(
+        name
+        for name, server in servers.items()
+        if (
+            name in before
+            and before[name].status != server.status
+            and name not in failing
+            and name not in recovered
+        )
+    )
+    # A same-name server whose status held steady can still have been edited
+    # underneath the name. `transport` and `tools` are the only other fields
+    # `MCPServerInfo` carries, so they are the whole of what a config edit can
+    # surface here — without them, editing a server's transport and reloading
+    # to apply it answers "no changes detected".
+    reconfigured = sorted(
+        name
+        for name, server in servers.items()
+        if name in before
+        and before[name].status == server.status
+        and (
+            before[name].transport != server.transport
+            or len(before[name].tools) != len(server.tools)
+        )
+    )
+    new_config_errors = [
+        name for name in config_errors if name not in before_config_errors
+    ]
+    resolved_config_errors = sorted(before_config_errors - set(config_errors))
+
+    # A server that was already broken before the reload lands in no bucket — it
+    # did not *change*. Listing only the changes would still read as "all good",
+    # so name it in both branches below rather than only when nothing changed.
+    reported = (
+        set(loaded)
+        | set(failing)
+        | set(unavailable)
+        | set(recovered)
+        | set(status_changed)
+        | set(reconfigured)
+    )
+    stuck = sorted(
+        [
+            name
+            for name, server in servers.items()
+            if name not in reported
+            and (server.status == "error" or server.needs_attention())
+        ]
+        # Unrepaired config errors are excluded from `servers` entirely, and are
+        # the one thing `/reload` most exists to surface.
+        + list(set(config_errors) & before_config_errors),
+    )
+
+    if not (
+        loaded
+        or removed
+        or failing
+        or unavailable
+        or recovered
+        or status_changed
+        or reconfigured
+        or new_config_errors
+        or resolved_config_errors
+    ):
+        if stuck:
+            return (
+                "MCP server changes: no changes detected "
+                f"(still needs attention: {', '.join(stuck)}; use /mcp)."
+            )
+        return "MCP server changes: no changes detected."
+
+    lines = ["MCP server changes:"]
+    if loaded:
+        lines.append(f"  - Loaded: {', '.join(loaded)}")
+    if removed:
+        lines.append(f"  - Removed: {', '.join(removed)}")
+    if failing:
+        lines.append(f"  - Failed to load: {', '.join(failing)} (use /mcp for details)")
+    if unavailable:
+        statuses = ", ".join(f"{name} ({servers[name].status})" for name in unavailable)
+        lines.append(f"  - Unavailable: {statuses} (use /mcp for details)")
+    if recovered:
+        lines.append(f"  - Recovered: {', '.join(recovered)}")
+    if status_changed:
+        transitions = ", ".join(
+            f"{name} ({before[name].status} → {servers[name].status})"
+            for name in status_changed
+        )
+        lines.append(f"  - Status changed: {transitions}")
+    if reconfigured:
+        edits = []
+        for name in reconfigured:
+            was, now = before[name], servers[name]
+            if was.transport != now.transport:
+                edits.append(f"{name} ({was.transport} → {now.transport})")
+            else:
+                edits.append(f"{name} ({len(was.tools)} → {len(now.tools)} tools)")
+        lines.append(f"  - Reconfigured: {', '.join(edits)}")
+    if new_config_errors:
+        lines.append(f"  - Config errors: {', '.join(new_config_errors)}")
+    if resolved_config_errors:
+        lines.append(f"  - Resolved config errors: {', '.join(resolved_config_errors)}")
+    if stuck:
+        lines.append(f"  - Still needs attention: {', '.join(stuck)} (use /mcp)")
+    return "\n".join(lines)
+
 
 if TYPE_CHECKING:
     from collections.abc import (
@@ -680,6 +1102,7 @@ if TYPE_CHECKING:
     from deepagents_code.approval_mode import ApprovalMode
     from deepagents_code.client.launch.server import ServerProcess
     from deepagents_code.client.remote_client import RemoteAgent
+    from deepagents_code.cold_cache import ColdCacheReason, ColdCacheWarning
     from deepagents_code.config import ModelResult
     from deepagents_code.config_manifest import CursorStyle
     from deepagents_code.event_bus import EventSource, ExternalEvent
@@ -700,6 +1123,10 @@ if TYPE_CHECKING:
     from deepagents_code.resume_state import GoalProposalKind, GoalStatus
     from deepagents_code.skills.load import ExtendedSkillMetadata
     from deepagents_code.tool_catalog import ToolCatalog, UnavailableServer
+    from deepagents_code.tui.modals.plugin_manager.models import (
+        PluginManagerAction,
+        PluginManagerResult,
+    )
     from deepagents_code.tui.textual_adapter import TextualUIAdapter
     from deepagents_code.tui.widgets.approval import ApprovalMenu
     from deepagents_code.tui.widgets.ask_user import AskUserMenu, AskUserTextArea
@@ -737,6 +1164,17 @@ state as the single app-wide progress indicator.
 
 _UPDATE_RECHECK_INTERVAL_SECONDS = 60 * 60
 """How often long-running TUI sessions quietly re-check for app updates."""
+
+_CONCURRENT_UPDATE_MESSAGE = (
+    "An update is already being installed. Try again once it finishes."
+)
+"""Shown when the update install lock is held.
+
+Deliberately does not name *another* session as the holder: the lock also
+refuses a second install started from this one (`/update` racing the update
+notification), and blaming a nonexistent other terminal would send the user
+looking for something to wait on that isn't there.
+"""
 
 _MODAL_WATCHDOG_TIMEOUT_SECONDS = 600.0
 """Upper bound on awaiting a confirmation modal's dismissal.
@@ -788,133 +1226,43 @@ class _PluginFingerprint(NamedTuple):
     __hash__ = None  # type: ignore[assignment]
 
 
-def _resolve_theme_name(value: object) -> str | None:
-    """Resolve a user-supplied theme name to a canonical registry key.
-
-    Accepts the registry key or the human-readable label, case-insensitive
-    on both, with surrounding whitespace stripped — config values
-    (especially `[ui.terminal_themes]`) and the `DEEPAGENTS_CODE_THEME`
-    env var are commonly hand-edited. Also applies the legacy
-    `textual-ansi` → `ansi-light` migration (pre-Textual 8.2.5).
-
-    Args:
-        value: Raw value read from TOML or an environment variable.
-
-    Returns:
-        The canonical registry key, or `None` if the value is not a string or
-            does not match any registered theme by key or label
-            (case-insensitive).
-    """
-    if not isinstance(value, str):
-        return None
-    name = value.strip()
-    if name == "textual-ansi":
-        name = "ansi-light"
-    registry = theme.get_registry()
-    if name in registry:
-        return name
-    folded = name.casefold()
-    for registered, entry in registry.items():
-        if registered.casefold() == folded or entry.label.casefold() == folded:
-            return registered
-    return None
-
-
-def _as_toml_table(value: object) -> dict[str, object] | None:
-    """Return `value` as a TOML table when it has the expected runtime shape."""
-    if not isinstance(value, dict):
-        return None
-    # `tomllib` parses TOML tables as string-keyed dicts; `ty` cannot infer
-    # that from a runtime `dict` check. Keep the cast at this boundary so it
-    # does not become a general-purpose escape hatch.
-    return cast("dict[str, object]", value)
-
-
-def _resolve_terminal_mapping(ui: Mapping[str, object]) -> str | None:
-    """Resolve `[ui.terminal_themes][TERM_PROGRAM]` to a registered theme.
-
-    Centralizes both the lookup and the misconfiguration warnings shared by
-    `_load_theme_preference` (startup) and `_load_terminal_default` (picker
-    badge). Misconfiguration is logged exactly once per call.
-
-    Args:
-        ui: The `[ui]` table parsed from `config.toml`.
-
-    Returns:
-        The canonical registry key, or `None` if `terminal_themes` is absent,
-            malformed, references an unknown theme, or `TERM_PROGRAM` is unset
-            despite a non-empty mapping.
-    """
-    terminal_themes = ui.get("terminal_themes")
-    if terminal_themes is None:
-        return None
-    terminal_themes_table = _as_toml_table(terminal_themes)
-    if terminal_themes_table is None:
-        logger.warning(
-            "[ui.terminal_themes] should be a table mapping TERM_PROGRAM "
-            "values to theme names; got %s",
-            type(terminal_themes).__name__,
-        )
-        return None
-    term_program = os.environ.get("TERM_PROGRAM", "").strip()
-    if not term_program:
-        if terminal_themes_table:
-            logger.warning(
-                "[ui.terminal_themes] is configured but TERM_PROGRAM is unset; "
-                "no per-terminal theme will be applied",
-            )
-        return None
-    mapped = terminal_themes_table.get(term_program)
-    resolved = _resolve_theme_name(mapped)
-    if resolved is not None:
-        return resolved
-    if isinstance(mapped, str):
-        logger.warning(
-            "Unknown theme '%s' mapped to TERM_PROGRAM='%s' "
-            "in [ui.terminal_themes]; ignoring",
-            mapped,
-            term_program,
-        )
-    elif mapped is not None:
-        logger.warning(
-            "Expected string theme name for TERM_PROGRAM='%s' in "
-            "[ui.terminal_themes], got %s; ignoring",
-            term_program,
-            type(mapped).__name__,
-        )
-    return None
-
-
 def _load_terminal_default() -> str | None:
     """Return the saved default theme for the current `TERM_PROGRAM`.
 
-    Reads `[ui.terminal_themes][TERM_PROGRAM]` from `config.toml` and
-    resolves the value via `_resolve_theme_name`, so labels and case variants
-    are accepted. Used by `ThemeSelectorScreen` to badge the matching option
-    with `(default)`.
+    Reads `[ui.terminal_themes][TERM_PROGRAM]` from managed config merged over
+    `config.toml` and resolves the value via `_resolve_theme_name`, so labels
+    and case variants are accepted. A managed mapping still applies when the
+    user file is unusable. Used by `ThemeSelectorScreen` to badge the matching
+    option with `(default)`.
 
     Returns:
-        The canonical registry key, or `None` if `TERM_PROGRAM` is unset, the
-            file is missing/unreadable, no mapping is set, or the mapped value
-            doesn't match a registered theme. Read errors and misconfigurations
-            are logged at WARNING.
+        The canonical registry key, or `None` if `TERM_PROGRAM` is unset,
+            neither layer sets a mapping, or the mapped value doesn't match a
+            registered theme. Read errors and misconfigurations are logged at
+            WARNING.
     """
     if not os.environ.get("TERM_PROGRAM", "").strip():
         return None
 
-    import tomllib
+    from deepagents_code.configuration.service import get_config_sources
 
-    from deepagents_code.model_config import DEFAULT_CONFIG_PATH
-
-    if not DEFAULT_CONFIG_PATH.exists():
-        return None
-    try:
-        with DEFAULT_CONFIG_PATH.open("rb") as f:
-            data = tomllib.load(f)
-    except (tomllib.TOMLDecodeError, PermissionError, OSError) as exc:
-        logger.warning("Could not read config for terminal theme default: %s", exc)
-        return None
-
+    sources = get_config_sources()
+    if not sources.user.status.usable:
+        logger.warning(
+            "Could not read config for terminal theme default: %s",
+            sources.user.status.detail or sources.user.status.health.value,
+        )
+        # Managed policy parsed cleanly and must still apply, so keep
+        # going with the merged data (managed-only when the user file
+        # failed) instead of discarding it with the user's file.
+    dropped = sources.dropped_managed_detail()
+    if dropped is not None:
+        logger.error(
+            "Managed policy from %s is not being applied: %s",
+            sources.managed.status.path,
+            dropped,
+        )
+    data, _ = sources.merged()
     ui = data.get("ui")
     if not isinstance(ui, dict):
         if ui is not None:
@@ -931,214 +1279,114 @@ def _load_theme_preference() -> str:
 
     Resolution order:
 
-    1. `DEEPAGENTS_CODE_THEME` env var (explicit override). If it is set but
-        cannot be resolved, the default theme is used immediately.
-    2. `[ui.terminal_themes]` mapping keyed by `TERM_PROGRAM` — wins over the
-        saved preference so a user moving between terminals (e.g. dark iTerm,
-        light Apple Terminal) gets the right theme automatically.
-    3. `[ui].theme` in `~/.deepagents/config.toml` (saved preference, used
-        when no terminal mapping matches).
+    1. Managed `[ui.terminal_themes]` or `[ui].theme` policy.
+    2. `DEEPAGENTS_CODE_THEME` env var.
+    3. User `[ui.terminal_themes]` or `[ui].theme` preference.
     4. `theme.DEFAULT_THEME`.
 
     Returns:
         A Textual theme name (e.g., `'langchain'`, `'langchain-light'`).
     """
     from deepagents_code._env_vars import THEME
+    from deepagents_code.config_manifest import (
+        _resolve_theme,
+        load_config_toml,
+        load_managed_config_toml,
+    )
 
+    managed = _resolve_theme(load_managed_config_toml(), source="managed config")
+    if managed is not None:
+        return managed[0]
     env_name = os.environ.get(THEME)
     if env_name is not None:
         resolved = _resolve_theme_name(env_name)
         if resolved is not None:
             return resolved
         logger.warning(
-            "Unknown theme '%s' in %s; falling back to default",
+            "Unknown theme '%s' in %s; falling through to config.toml",
             env_name,
             THEME,
         )
-        return theme.DEFAULT_THEME
+    user = _resolve_theme(load_config_toml(), source="config.toml")
+    return user[0] if user is not None else theme.DEFAULT_THEME
 
-    import tomllib
 
-    from deepagents_code.model_config import DEFAULT_CONFIG_PATH
+def _load_bool_display_preference(key: str, *, fallback: bool) -> bool:
+    """Deferred-import wrapper around `config_manifest`.
 
-    if not DEFAULT_CONFIG_PATH.exists():
-        return theme.DEFAULT_THEME
-    try:
-        with DEFAULT_CONFIG_PATH.open("rb") as f:
-            data = tomllib.load(f)
-    except (tomllib.TOMLDecodeError, PermissionError, OSError) as exc:
-        logger.warning("Could not read config for theme preference: %s", exc)
-        return theme.DEFAULT_THEME
+    Written once here rather than inlined at each caller, so that
+    `config_manifest` stays off `app.py`'s import path. See
+    `load_bool_display_preference` for the resolution rules and arguments.
 
-    ui = data.get("ui", {})
-    if not isinstance(ui, dict):
-        logger.warning(
-            "[ui] should be a table; got %s while loading theme preference",
-            type(ui).__name__,
-        )
-        return theme.DEFAULT_THEME
+    Deliberately does not forward `on_rejected`: these are startup reads, and
+    the TUI owns the screen by the time they run.
 
-    resolved = _resolve_terminal_mapping(ui)
-    if resolved is not None:
-        return resolved
+    Returns:
+        The resolved value.
+    """
+    from deepagents_code.config_manifest import load_bool_display_preference
 
-    saved = ui.get("theme")
-    resolved = _resolve_theme_name(saved)
-    if resolved is not None:
-        return resolved
-    if isinstance(saved, str):
-        logger.warning(
-            "Unknown theme '%s' in config; falling back to default",
-            saved,
-        )
-
-    return theme.DEFAULT_THEME
+    return load_bool_display_preference(key, fallback=fallback)
 
 
 def _load_message_timestamps_visible() -> bool:
-    """Load the saved message-timestamp-footer visibility preference.
+    """Resolve whether chat messages show a timestamp footer.
 
-    Reads `[ui].show_message_timestamps` from `~/.deepagents/config.toml`.
+    Toggled in-app with `/timestamps`, or preset with
+    `DEEPAGENTS_CODE_SHOW_MESSAGE_TIMESTAMPS` / `[ui].show_message_timestamps`.
 
     Returns:
-        The saved preference, or `False` when it is unset or unreadable.
+        The resolved preference, or `False` when unset, unreadable, or
+        malformed.
     """
-    import tomllib
+    return _load_bool_display_preference(
+        "display.show_message_timestamps", fallback=False
+    )
 
-    from deepagents_code.model_config import DEFAULT_CONFIG_PATH
 
-    if not DEFAULT_CONFIG_PATH.exists():
-        return False
-    try:
-        with DEFAULT_CONFIG_PATH.open("rb") as f:
-            data = tomllib.load(f)
-    except (tomllib.TOMLDecodeError, PermissionError, OSError) as exc:
-        logger.warning("Could not read config for timestamp preference: %s", exc)
-        return False
+def _load_show_diff_line_numbers() -> bool:
+    """Resolve whether diff hunks show file line numbers.
 
-    ui = data.get("ui", {})
-    if not isinstance(ui, dict):
-        logger.warning(
-            "[ui] should be a table; got %s while loading timestamp preference",
-            type(ui).__name__,
-        )
-        return False
+    Toggled in-app with `/line-numbers`, or preset with
+    `[ui].show_diff_line_numbers`. There is no env var for this option.
 
-    value = ui.get("show_message_timestamps")
-    if isinstance(value, bool):
-        return value
-    if value is not None:
-        logger.warning(
-            "[ui].show_message_timestamps should be a boolean; got %s",
-            type(value).__name__,
-        )
-    return False
+    Returns:
+        Whether file-relative line numbers are enabled, defaulting to `True`
+        when unset, unreadable, or malformed.
+    """
+    return _load_bool_display_preference(
+        "display.show_diff_line_numbers", fallback=True
+    )
 
 
 def _load_show_scrollbar() -> bool:
-    """Load the chat scrollbar visibility preference.
+    """Resolve whether the chat area shows a vertical scrollbar.
 
-    Reads `DEEPAGENTS_CODE_SHOW_SCROLLBAR` env var, falling back to
-    `[ui].show_scrollbar` from `~/.deepagents/config.toml`, and finally `False`.
+    Toggled in-app with `/scrollbar`, or preset with
+    `DEEPAGENTS_CODE_SHOW_SCROLLBAR` / `[ui].show_scrollbar`.
 
     Returns:
-        The resolved preference.
+        The resolved preference, or `False` when unset, unreadable, or
+        malformed.
     """
-    from deepagents_code._env_vars import SHOW_SCROLLBAR, classify_env_bool
-
-    raw = os.environ.get(SHOW_SCROLLBAR)
-    if raw is not None and raw.strip():
-        env = classify_env_bool(raw)
-        if env is not None:
-            return env
-
-    import tomllib
-
-    from deepagents_code.model_config import DEFAULT_CONFIG_PATH
-
-    if not DEFAULT_CONFIG_PATH.exists():
-        return False
-    try:
-        with DEFAULT_CONFIG_PATH.open("rb") as f:
-            data = tomllib.load(f)
-    except (tomllib.TOMLDecodeError, PermissionError, OSError) as exc:
-        logger.warning("Could not read config for scrollbar preference: %s", exc)
-        return False
-
-    ui = data.get("ui", {})
-    if not isinstance(ui, dict):
-        logger.warning(
-            "[ui] should be a table; got %s while loading scrollbar preference",
-            type(ui).__name__,
-        )
-        return False
-
-    value = ui.get("show_scrollbar")
-    if isinstance(value, bool):
-        return value
-    if value is not None:
-        logger.warning(
-            "[ui].show_scrollbar should be a boolean; got %s",
-            type(value).__name__,
-        )
-    return False
+    return _load_bool_display_preference("display.show_scrollbar", fallback=False)
 
 
 def _load_debug_console_click_to_copy() -> bool:
-    r"""Load the `Ctrl+\` Debug Console click-to-copy preference.
+    r"""Resolve whether the `Ctrl+\` Debug Console copies a row on click.
 
-    Reads `DEEPAGENTS_CODE_DEBUG_CONSOLE_CLICK_TO_COPY` env var, falling back to
-    `[ui].debug_console_click_to_copy` from `~/.deepagents/config.toml`, and
-    finally `False` (click-to-copy off; Enter-to-copy is always available).
+    Toggled from the console's own "Click to copy" checkbox, or preset with
+    `DEEPAGENTS_CODE_DEBUG_CONSOLE_CLICK_TO_COPY` /
+    `[ui].debug_console_click_to_copy`; while the env var is set the checkbox
+    will not appear to stick. Enter-to-copy is always available.
 
     Returns:
-        The resolved preference.
+        The resolved preference, or `False` when unset, unreadable, or
+        malformed.
     """
-    from deepagents_code._env_vars import (
-        DEBUG_CONSOLE_CLICK_TO_COPY,
-        classify_env_bool,
+    return _load_bool_display_preference(
+        "display.debug_console_click_to_copy", fallback=False
     )
-
-    raw = os.environ.get(DEBUG_CONSOLE_CLICK_TO_COPY)
-    if raw is not None and raw.strip():
-        env = classify_env_bool(raw)
-        if env is not None:
-            return env
-
-    import tomllib
-
-    from deepagents_code.model_config import DEFAULT_CONFIG_PATH
-
-    if not DEFAULT_CONFIG_PATH.exists():
-        return False
-    try:
-        with DEFAULT_CONFIG_PATH.open("rb") as f:
-            data = tomllib.load(f)
-    except (tomllib.TOMLDecodeError, PermissionError, OSError) as exc:
-        logger.warning(
-            "Could not read config for debug console click-to-copy preference: %s",
-            exc,
-        )
-        return False
-
-    ui = data.get("ui", {})
-    if not isinstance(ui, dict):
-        logger.warning(
-            "[ui] should be a table; got %s while loading debug console "
-            "click-to-copy preference",
-            type(ui).__name__,
-        )
-        return False
-
-    value = ui.get("debug_console_click_to_copy")
-    if isinstance(value, bool):
-        return value
-    if value is not None:
-        logger.warning(
-            "[ui].debug_console_click_to_copy should be a boolean; got %s",
-            type(value).__name__,
-        )
-    return False
 
 
 def _replace_malformed_ui(
@@ -1164,65 +1412,73 @@ def _replace_malformed_ui(
     )
 
 
+def _with_write_error(message: str, error: str | None) -> str:
+    """Append a failed write's cause to a user-facing message.
+
+    `WriteResult.error` already carries the path and the reason ("could not
+    update <path>: [Errno 13] Permission denied"). The toast used to drop it and
+    the detail went only to a logger that has no handler in the TUI outside
+    debug mode, so the user could not tell a read-only home directory from a
+    full disk.
+
+    Returns:
+        The message, with the cause appended when there is one.
+    """
+    if not error:
+        return message
+    return f"{message} ({error})"
+
+
 def _save_theme_preference_result(name: str) -> _ConfigWriteResult:
     """Persist theme preference and return TUI-facing status details.
 
     Returns:
         Write status and a message suitable for a toast when the user needs to
-            know about a repair or failure.
+            know about a repair or failure, or a notice that managed config
+            keeps the saved preference from taking effect.
     """
     if name not in theme.get_registry():
         logger.warning("Refusing to save unknown theme '%s'", name)
         return _ConfigWriteResult(False, f"Unknown theme '{name}' was not saved.")
 
-    import contextlib
-    import tempfile
-    import tomllib
+    from deepagents_code.configuration.writer import update_user_config
 
-    try:
-        import tomli_w
+    repair_message: str | None = None
 
-        from deepagents_code.model_config import (
-            DEFAULT_CONFIG_PATH,
-            _config_write_lock,
-        )
+    def mutate(data: dict[str, Any]) -> bool:
+        nonlocal repair_message
+        ui, repair_message = _replace_malformed_ui(data)
+        ui["theme"] = name
+        return True
 
-        DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _config_write_lock:
-            if DEFAULT_CONFIG_PATH.exists():
-                with DEFAULT_CONFIG_PATH.open("rb") as f:
-                    data = tomllib.load(f)
-            else:
-                data = {}
-
-            ui, repair_message = _replace_malformed_ui(data)
-            ui["theme"] = name
-
-            fd, tmp_path = tempfile.mkstemp(
-                dir=DEFAULT_CONFIG_PATH.parent,
-                suffix=".tmp",
-            )
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    tomli_w.dump(data, f)
-                Path(tmp_path).replace(DEFAULT_CONFIG_PATH)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    Path(tmp_path).unlink()
-                raise
-    except (
-        OSError,
-        tomllib.TOMLDecodeError,
-        ImportError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        logger.exception("Could not save theme preference")
+    result = update_user_config(mutate)
+    if not result.ok:
+        logger.error("Could not save theme preference: %s", result.error)
         return _ConfigWriteResult(
             False,
-            f"Theme applied for this session but could not be saved "
-            f"({type(exc).__name__}).",
+            _with_write_error(
+                "Theme applied for this session but could not be saved.",
+                result.error,
+            ),
             "error",
+        )
+
+    from deepagents_code.config_manifest import (
+        _resolve_theme,
+        load_managed_config_toml,
+    )
+
+    if (
+        _resolve_theme(
+            load_managed_config_toml(),
+            source="managed config",
+        )
+        is not None
+    ):
+        return _ConfigWriteResult(
+            True,
+            "Theme preference saved, but managed config remains effective.",
+            "warning",
         )
     return _ConfigWriteResult(True, repair_message)
 
@@ -1239,68 +1495,17 @@ def save_theme_preference(name: str) -> bool:
     return _save_theme_preference_result(name).ok
 
 
-def _load_bool_ui_preference(key: str, *, log_label: str) -> bool:
-    """Load a boolean `[ui]` preference from `~/.deepagents/config.toml`.
-
-    These preferences have no in-app command; the file is edited manually. The
-    loader is intentionally forgiving: any problem reading or parsing the config
-    falls back to `True` (the feature stays on) after logging a warning, so a
-    typo in a cosmetic setting never breaks startup.
-
-    Args:
-        key: The key to read from the `[ui]` table.
-        log_label: Human-readable name of the preference, used in warning logs.
-
-    Returns:
-        The saved `[ui].<key>` value, or `True` when unset, unreadable,
-            or malformed.
-    """
-    import tomllib
-
-    from deepagents_code.model_config import DEFAULT_CONFIG_PATH
-
-    if not DEFAULT_CONFIG_PATH.exists():
-        return True
-    try:
-        with DEFAULT_CONFIG_PATH.open("rb") as f:
-            data = tomllib.load(f)
-    except (tomllib.TOMLDecodeError, PermissionError, OSError) as exc:
-        logger.warning("Could not read config for %s preference: %s", log_label, exc)
-        return True
-
-    ui = data.get("ui", {})
-    if not isinstance(ui, dict):
-        logger.warning(
-            "[ui] should be a table; got %s while loading %s preference",
-            type(ui).__name__,
-            log_label,
-        )
-        return True
-
-    value = ui.get(key)
-    if isinstance(value, bool):
-        return value
-    if value is not None:
-        logger.warning(
-            "[ui].%s should be a boolean; got %s",
-            key,
-            type(value).__name__,
-        )
-    return True
-
-
 def _load_cursor_blink_preference() -> bool:
-    """Load the saved cursor-blink preference from `~/.deepagents/config.toml`.
+    """Resolve whether the chat input cursor should blink.
 
-    The chat input cursor blink can be turned off by setting
-    `[ui].cursor_blink = false` in the config file. There is no in-app command
-    for this; the file is edited manually.
+    The blink can be turned off with `DEEPAGENTS_CODE_CURSOR_BLINK=0` or
+    `[ui].cursor_blink = false`. There is no in-app command for this.
 
     Returns:
-        The saved `[ui].cursor_blink` value, or `True` (blink on) when unset,
+        The resolved cursor-blink preference, or `True` (blink on) when unset,
         unreadable, or malformed.
     """
-    return _load_bool_ui_preference("cursor_blink", log_label="cursor blink")
+    return _load_bool_display_preference("display.cursor_blink", fallback=True)
 
 
 def _load_cursor_style_preference() -> CursorStyle:
@@ -1331,19 +1536,19 @@ def _load_cursor_style_preference() -> CursorStyle:
 
 
 def _load_terminal_progress_preference() -> bool:
-    """Load the `OSC 9;4` progress preference from `~/.deepagents/config.toml`.
+    """Resolve whether to emit `OSC 9;4` terminal progress.
 
-    The terminal taskbar/dock/tab progress indicator (where supported) can be
-    turned off by setting `[ui].terminal_progress = false` in the config file.
-    There is no in-app command for this; the file is edited manually. The
+    The taskbar/dock/tab progress indicator (where supported) can be turned off
+    with `DEEPAGENTS_CODE_TERMINAL_PROGRESS=0` or
+    `[ui].terminal_progress = false`. There is no in-app command for this. The
     `DEEPAGENTS_CODE_NO_TERMINAL_ESCAPE` environment variable still disables all
     terminal escapes regardless of this value.
 
     Returns:
-        The saved `[ui].terminal_progress` value, or `True` (progress on) when
+        The resolved terminal-progress preference, or `True` (progress on) when
         unset, unreadable, or malformed.
     """
-    return _load_bool_ui_preference("terminal_progress", log_label="terminal progress")
+    return _load_bool_display_preference("display.terminal_progress", fallback=True)
 
 
 def _save_terminal_theme_mapping_result(
@@ -1354,7 +1559,8 @@ def _save_terminal_theme_mapping_result(
 
     Returns:
         Write status and a message suitable for a toast when the user needs to
-            know about a repair or failure.
+            know about a repair or failure, or a notice that managed config
+            keeps the saved preference from taking effect.
     """
     if name not in theme.get_registry():
         logger.warning("Refusing to map unknown theme '%s'", name)
@@ -1367,71 +1573,57 @@ def _save_terminal_theme_mapping_result(
             "TERM_PROGRAM is unset; can't set a per-terminal default.",
         )
 
-    import contextlib
-    import tempfile
-    import tomllib
+    from deepagents_code.configuration.writer import update_user_config
 
-    try:
-        import tomli_w
+    repair_messages: list[str] = []
 
-        from deepagents_code.model_config import (
-            DEFAULT_CONFIG_PATH,
-            _config_write_lock,
-        )
+    def mutate(data: dict[str, Any]) -> bool:
+        ui, repair_message = _replace_malformed_ui(data)
+        if repair_message is not None:
+            repair_messages.append(repair_message)
+        terminal_themes = ui.get("terminal_themes")
+        terminal_themes_table = _as_toml_table(terminal_themes)
+        if terminal_themes_table is None:
+            if terminal_themes is not None:
+                logger.warning(
+                    "Existing [ui.terminal_themes] is not a table (got %r); "
+                    "replacing with a fresh table",
+                    terminal_themes,
+                )
+                repair_messages.append(
+                    "Existing [ui.terminal_themes] was not a table and was "
+                    "replaced while saving this terminal default.",
+                )
+            terminal_themes_table = {}
+            ui["terminal_themes"] = terminal_themes_table
+        terminal_themes_table[term_program] = name
+        return True
 
-        DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        repair_messages: list[str] = []
-        with _config_write_lock:
-            if DEFAULT_CONFIG_PATH.exists():
-                with DEFAULT_CONFIG_PATH.open("rb") as f:
-                    data = tomllib.load(f)
-            else:
-                data = {}
-
-            ui, repair_message = _replace_malformed_ui(data)
-            if repair_message is not None:
-                repair_messages.append(repair_message)
-            terminal_themes = ui.get("terminal_themes")
-            terminal_themes_table = _as_toml_table(terminal_themes)
-            if terminal_themes_table is None:
-                if terminal_themes is not None:
-                    logger.warning(
-                        "Existing [ui.terminal_themes] is not a table (got %r); "
-                        "replacing with a fresh table",
-                        terminal_themes,
-                    )
-                    repair_messages.append(
-                        "Existing [ui.terminal_themes] was not a table and was "
-                        "replaced while saving this terminal default.",
-                    )
-                terminal_themes_table = {}
-                ui["terminal_themes"] = terminal_themes_table
-            terminal_themes_table[term_program] = name
-
-            fd, tmp_path = tempfile.mkstemp(
-                dir=DEFAULT_CONFIG_PATH.parent,
-                suffix=".tmp",
-            )
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    tomli_w.dump(data, f)
-                Path(tmp_path).replace(DEFAULT_CONFIG_PATH)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    Path(tmp_path).unlink()
-                raise
-    except (
-        OSError,
-        tomllib.TOMLDecodeError,
-        ImportError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        logger.exception("Could not save terminal theme mapping")
+    result = update_user_config(mutate)
+    if not result.ok:
+        logger.error("Could not save terminal theme mapping: %s", result.error)
         return _ConfigWriteResult(
             False,
-            f"Could not save terminal mapping ({type(exc).__name__}).",
+            _with_write_error("Could not save terminal mapping.", result.error),
             "error",
+        )
+
+    from deepagents_code.config_manifest import (
+        _resolve_theme,
+        load_managed_config_toml,
+    )
+
+    if (
+        _resolve_theme(
+            load_managed_config_toml(),
+            source="managed config",
+        )
+        is not None
+    ):
+        return _ConfigWriteResult(
+            True,
+            "Terminal mapping saved, but managed config remains effective.",
+            "warning",
         )
     return _ConfigWriteResult(True, " ".join(repair_messages) or None)
 
@@ -1458,190 +1650,139 @@ def save_terminal_theme_mapping(term_program: str, name: str) -> bool:
     return _save_terminal_theme_mapping_result(term_program, name).ok
 
 
+def _save_ui_bool_result(
+    *,
+    toml_key: str,
+    option_key: str,
+    value: bool,
+    failure_message: str,
+) -> _ConfigWriteResult:
+    """Persist one user UI boolean and report managed shadowing.
+
+    Returns:
+        Write status and optional user-facing detail.
+    """
+    from deepagents_code.configuration.writer import update_user_config
+
+    repair_message: str | None = None
+
+    def mutate(data: dict[str, Any]) -> bool:
+        nonlocal repair_message
+        ui, repair_message = _replace_malformed_ui(data)
+        ui[toml_key] = value
+        return True
+
+    result = update_user_config(mutate)
+    if not result.ok:
+        logger.error("Could not save %s: %s", option_key, result.error)
+        # Carry the cause into the toast. `WriteResult.error` is already
+        # path-plus-errno ("could not update <path>: [Errno 13] Permission
+        # denied"), and in the TUI this logger has no handler unless debug mode
+        # is on, so dropping it left the user with no way to learn why.
+        return _ConfigWriteResult(
+            False,
+            _with_write_error(failure_message, result.error),
+            "error",
+        )
+
+    from deepagents_code.config_manifest import (
+        get_option,
+        load_managed_config_toml,
+        resolve_scalar,
+    )
+
+    option = get_option(option_key)
+    if option is not None:
+        from deepagents_code.configuration.service import managed_decided
+
+        _, source = resolve_scalar(
+            option,
+            toml_data={},
+            managed_toml_data=load_managed_config_toml(),
+        )
+        if managed_decided(source):
+            return _ConfigWriteResult(
+                True,
+                "Preference saved, but managed config remains effective.",
+                "warning",
+            )
+    return _ConfigWriteResult(True, repair_message)
+
+
 def _save_message_timestamps_visible_result(visible: bool) -> _ConfigWriteResult:
     """Persist the timestamp-footer visibility preference.
 
-    Writes `[ui].show_message_timestamps` atomically (temp file +
-    `Path.replace`). Mirrors `_save_theme_preference_result`.
+    Persists `[ui].show_message_timestamps` through `_save_ui_bool_result`.
 
     Returns:
         Write status and a message suitable for a toast when the user needs to
-            know about a repair or failure.
+            know about a repair or failure, or a notice that managed config
+            keeps the saved preference from taking effect.
     """
-    import contextlib
-    import tempfile
-    import tomllib
-
-    try:
-        import tomli_w
-
-        from deepagents_code.model_config import (
-            DEFAULT_CONFIG_PATH,
-            _config_write_lock,
-        )
-
-        DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _config_write_lock:
-            if DEFAULT_CONFIG_PATH.exists():
-                with DEFAULT_CONFIG_PATH.open("rb") as f:
-                    data = tomllib.load(f)
-            else:
-                data = {}
-
-            ui, repair_message = _replace_malformed_ui(data)
-            ui["show_message_timestamps"] = visible
-
-            fd, tmp_path = tempfile.mkstemp(
-                dir=DEFAULT_CONFIG_PATH.parent,
-                suffix=".tmp",
-            )
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    tomli_w.dump(data, f)
-                Path(tmp_path).replace(DEFAULT_CONFIG_PATH)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    Path(tmp_path).unlink()
-                raise
-    except (
-        OSError,
-        tomllib.TOMLDecodeError,
-        ImportError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        logger.exception("Could not save timestamp preference")
-        return _ConfigWriteResult(
-            False,
-            f"Timestamps toggled for this session but could not be saved "
-            f"({type(exc).__name__}).",
-            "error",
-        )
-    return _ConfigWriteResult(True, repair_message)
+    return _save_ui_bool_result(
+        toml_key="show_message_timestamps",
+        option_key="display.show_message_timestamps",
+        value=visible,
+        failure_message=("Timestamps toggled for this session but could not be saved."),
+    )
 
 
 def _save_show_scrollbar_result(visible: bool) -> _ConfigWriteResult:
     """Persist the chat scrollbar visibility preference.
 
-    Writes `[ui].show_scrollbar` atomically (temp file +
-    `Path.replace`). Mirrors `_save_message_timestamps_visible_result`.
+    Persists `[ui].show_scrollbar` through `_save_ui_bool_result`.
 
     Returns:
         Write status and a message suitable for a toast when the user needs to
-            know about a repair or failure.
+            know about a repair or failure, or a notice that managed config
+            keeps the saved preference from taking effect.
     """
-    import contextlib
-    import tempfile
-    import tomllib
+    return _save_ui_bool_result(
+        toml_key="show_scrollbar",
+        option_key="display.show_scrollbar",
+        value=visible,
+        failure_message="Scrollbar toggled for this session but could not be saved.",
+    )
 
-    try:
-        import tomli_w
 
-        from deepagents_code.model_config import (
-            DEFAULT_CONFIG_PATH,
-            _config_write_lock,
-        )
+def _save_show_diff_line_numbers_result(enabled: bool) -> _ConfigWriteResult:
+    """Persist the diff line-number visibility preference.
 
-        DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _config_write_lock:
-            if DEFAULT_CONFIG_PATH.exists():
-                with DEFAULT_CONFIG_PATH.open("rb") as f:
-                    data = tomllib.load(f)
-            else:
-                data = {}
+    Persists `[ui].show_diff_line_numbers` through `_save_ui_bool_result`.
 
-            ui, repair_message = _replace_malformed_ui(data)
-            ui["show_scrollbar"] = visible
-
-            fd, tmp_path = tempfile.mkstemp(
-                dir=DEFAULT_CONFIG_PATH.parent,
-                suffix=".tmp",
-            )
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    tomli_w.dump(data, f)
-                Path(tmp_path).replace(DEFAULT_CONFIG_PATH)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    Path(tmp_path).unlink()
-                raise
-    except (
-        OSError,
-        tomllib.TOMLDecodeError,
-        ImportError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        logger.exception("Could not save scrollbar preference")
-        return _ConfigWriteResult(
-            False,
-            f"Scrollbar toggled for this session but could not be saved "
-            f"({type(exc).__name__}).",
-            "error",
-        )
-    return _ConfigWriteResult(True, repair_message)
+    Returns:
+        Write status and a message suitable for a toast when the user needs to
+            know about a repair or failure, or a notice that managed config
+            keeps the saved preference from taking effect.
+    """
+    return _save_ui_bool_result(
+        toml_key="show_diff_line_numbers",
+        option_key="display.show_diff_line_numbers",
+        value=enabled,
+        failure_message=(
+            "Diff line numbers toggled for this session but could not be saved."
+        ),
+    )
 
 
 def _save_debug_console_click_to_copy_result(enabled: bool) -> _ConfigWriteResult:
     r"""Persist the `Ctrl+\` Debug Console click-to-copy preference.
 
-    Writes `[ui].debug_console_click_to_copy` atomically (temp file +
-    `Path.replace`). Mirrors `_save_show_scrollbar_result`.
+    Persists `[ui].debug_console_click_to_copy` through `_save_ui_bool_result`.
 
     Returns:
         Write status and a message suitable for a toast when the user needs to
-            know about a repair or failure.
+            know about a repair or failure, or a notice that managed config
+            keeps the saved preference from taking effect.
     """
-    import contextlib
-    import tempfile
-    import tomllib
-
-    try:
-        import tomli_w
-
-        from deepagents_code.model_config import (
-            DEFAULT_CONFIG_PATH,
-            _config_write_lock,
-        )
-
-        DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _config_write_lock:
-            if DEFAULT_CONFIG_PATH.exists():
-                with DEFAULT_CONFIG_PATH.open("rb") as f:
-                    data = tomllib.load(f)
-            else:
-                data = {}
-
-            ui, repair_message = _replace_malformed_ui(data)
-            ui["debug_console_click_to_copy"] = enabled
-
-            fd, tmp_path = tempfile.mkstemp(
-                dir=DEFAULT_CONFIG_PATH.parent,
-                suffix=".tmp",
-            )
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    tomli_w.dump(data, f)
-                Path(tmp_path).replace(DEFAULT_CONFIG_PATH)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    Path(tmp_path).unlink()
-                raise
-    except (
-        OSError,
-        tomllib.TOMLDecodeError,
-        ImportError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        logger.exception("Could not save debug console click-to-copy preference")
-        return _ConfigWriteResult(
-            False,
-            f"Click-to-copy toggled for this session but could not be saved "
-            f"({type(exc).__name__}).",
-            "error",
-        )
-    return _ConfigWriteResult(True, repair_message)
+    return _save_ui_bool_result(
+        toml_key="debug_console_click_to_copy",
+        option_key="display.debug_console_click_to_copy",
+        value=enabled,
+        failure_message=(
+            "Click-to-copy toggled for this session but could not be saved."
+        ),
+    )
 
 
 def _extract_model_params_flag(raw_arg: str) -> tuple[str, dict[str, Any] | None]:
@@ -1819,6 +1960,10 @@ escape hatch. Tight enough that a deliberate copy-then-interrupt sequence,
 which has much larger gaps, never trips it."""
 
 
+SubmissionOrigin = Literal["interactive", "external"]
+"""Source policy controlling whether a normal message may open a cost modal."""
+
+
 @dataclass(frozen=True, slots=True)
 class QueuedMessage:
     """Represents a queued user message awaiting processing."""
@@ -1828,6 +1973,9 @@ class QueuedMessage:
 
     mode: InputMode
     """The input mode that determines message routing."""
+
+    origin: SubmissionOrigin = "interactive"
+    """Submission source retained until dispatch for advisory warning policy."""
 
 
 class ExternalInput(Message):
@@ -1921,6 +2069,20 @@ class _ThreadHistoryPayload:
     model_params: dict[str, Any] | None = None
     """Persisted `_model_params` from the checkpoint, if any."""
 
+    cache_state: Mapping[str, Any] | None = None
+    """Prompt-cache channels from the checkpoint, or `None` when absent.
+
+    One field rather than a presence flag beside nullable values: absence and
+    content are the same fact, so the "flag set, values missing" skew is not
+    representable. `None` means the checkpoint predates cold-cache tracking.
+
+    Values are deliberately unvalidated: `_sync_cache_state_from_state` owns
+    the parsing and logs each discard, so pre-filtering here would drop
+    malformed values (a non-string written by a newer build, say) without a
+    trace. The log names the discarded type, not the reason, so every
+    malformed string reports identically.
+    """
+
     session_cost_usd: float = 0.0
     """Persisted cumulative `_session_cost_usd` from the checkpoint."""
 
@@ -1982,6 +2144,16 @@ class _ThreadHistoryPayload:
     goal_criteria_request_active: bool = False
     """Whether a newer or unfinished criteria request remains in the checkpoint."""
 
+    goal_status_recorded: bool = False
+    """Whether the checkpoint carried a `_goal_status` channel at all.
+
+    Distinct from `goal_status`: legacy checkpoints predate the status channel,
+    so absence means the goal ran as `active` (the implicit pre-status status),
+    while a *present* value that `coerce_goal_status` does not recognize means a
+    corrupt or forward-version checkpoint. Only the latter is normalized to
+    `paused` on restore; the former keeps its legacy `active` behavior.
+    """
+
     @property
     def has_model_usage(self) -> bool:
         """Whether restored state contains evidence of model usage."""
@@ -2029,18 +2201,25 @@ class _GoalApplication:
     request_id: str | None = None
 
     def __post_init__(self) -> None:
-        """Reject empty objective or rubric at construction.
+        """Reject an empty or oversized objective or rubric at construction.
 
-        Callers already screen these (`_accept_goal_rubric`), so this only
-        guards against a future construction site skipping that check and
-        queuing a goal that would clear the active one to nothing.
+        Callers already screen these (`_accept_goal_rubric`), so this guards
+        against a future construction site skipping that check — queuing a goal
+        that would clear the active one to nothing, or one whose text cannot
+        render as a goal-state notice. Holding both invariants here means they
+        do not depend on every construction site remembering; callers keep their
+        own checks so they can report a targeted message before mutating UI
+        state.
 
         Raises:
             ValueError: If `objective` or `rubric` is empty.
-        """
+            GoalStateSizeError: If either exceeds its own limit, or their
+                combined text exceeds `GOAL_APPLICATION_CHAR_LIMIT`.
+        """  # noqa: DOC502 - propagates from `validate_goal_application`
         if not self.objective or not self.rubric:
             msg = "goal application requires a non-empty objective and rubric"
             raise ValueError(msg)
+        validate_goal_application(self.objective, self.rubric)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2123,30 +2302,6 @@ def _truncate(text: str, *, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
-
-
-_MARKDOWN_ESCAPES = str.maketrans({char: f"\\{char}" for char in "\\&`*_[]<>|~"})
-"""Translation table backing `_escape_markdown`.
-
-Covers the inline constructs Rich's markdown parser acts on (emphasis, code
-spans, links, autolinks/HTML, HTML entities, strikethrough) plus the `|`
-table-cell separator. Block-level punctuation (`#`, `-`, `>`) only has meaning
-at the start of a line; line breaks are normalized before translation, and `>`
-is escaped anyway because it is cheap.
-"""
-
-
-def _escape_markdown(text: str) -> str:
-    """Normalize line breaks and escape markdown syntax in external text.
-
-    Args:
-        text: Display string that may contain markdown punctuation.
-
-    Returns:
-        `text` on one line with markdown-significant characters escaped.
-    """
-    normalized = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-    return normalized.translate(_MARKDOWN_ESCAPES)
 
 
 def _markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -2243,9 +2398,6 @@ provider key is *not* a LangSmith gateway key. Only the prefix is inspected —
 the secret value is never logged or otherwise introspected.
 """
 
-_LANGSMITH_GATEWAY_HOST = "smith.langchain.com"
-"""Host substring identifying the LangSmith gateway endpoint."""
-
 
 def _langsmith_gateway_key_mismatch(provider: str | None) -> str | None:
     """Detect a non-LangSmith key being routed through the LangSmith gateway.
@@ -2268,15 +2420,18 @@ def _langsmith_gateway_key_mismatch(provider: str | None) -> str | None:
     if not provider:
         return None
     try:
+        from urllib.parse import urlsplit
+
         from deepagents_code.model_config import (
             ModelConfig,
             get_credential_env_var,
+            is_langsmith_gateway_host,
             resolve_env_var,
             resolved_env_var_name,
         )
 
         base_url = ModelConfig.load().get_base_url(provider)
-        if not base_url or _LANGSMITH_GATEWAY_HOST not in base_url:
+        if not base_url or not is_langsmith_gateway_host(urlsplit(base_url).hostname):
             return None
         key_env = get_credential_env_var(provider)
         if not key_env:
@@ -2629,12 +2784,12 @@ class _ChatScroll(VerticalScroll):
         message. Scrollbar-track clicks do post `ScrollUp`/`ScrollDown`, but this
         container's own `_on_scroll_up`/`_on_scroll_down` handlers consume them
         via `event.stop()` before they can bubble to the app. Watching `scroll_y`
-        covers every input device uniformly. Validated against Textual 8.2.7.
+        covers every input device uniformly. Validated against Textual 8.2.8.
         """
 
     # The deferred-anchor logic below drives the base class through its private
     # anchor state (`_anchored`, `_anchor_released`) and mirrors the compositor's
-    # arrange-then-check ordering. Validated against Textual 8.2.7; a base-class
+    # arrange-then-check ordering. Validated against Textual 8.2.8; a base-class
     # rename or reflow change could break it silently, so `TestChatScrollAnchoring`
     # is the safety net for Textual upgrades.
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -2892,6 +3047,18 @@ class DeepAgentsApp(App):
         Binding("3", "approval_position(2)", "Select third", show=False),
         Binding("a", "approval_auto", "Auto", show=False),
         Binding("n", "approval_no", "No", show=False),
+        # Unlike its siblings above, this needs `priority=True`: `Screen.BINDINGS`
+        # binds `tab -> app.focus_next`, and the screen is resolved before the
+        # app, so a non-priority mirror here would never fire. `check_action`
+        # steps it aside whenever no approval is pending (or the chat input is
+        # focused) so `tab` reverts to focus traversal and completion.
+        Binding(
+            "tab",
+            "approval_reject_with_reason",
+            "Reject with feedback",
+            show=False,
+            priority=True,
+        ),
     ]
     """App-level keybindings for interrupt, quit, toggles, and approval menu
     navigation."""
@@ -3043,12 +3210,7 @@ class DeepAgentsApp(App):
 
         self._register_custom_themes()
         self._hook_trust: WorkspaceTrust | None = hook_trust
-        """Project-hook trust policy, forwarded verbatim to `HooksManager`.
-
-        Carried rather than applied: session state — and therefore the hooks
-        coordinator that owns and resolves this policy — cannot be built until
-        after construction. The app never inspects it.
-        """
+        """Project-hook trust shared across pending and live manager state."""
 
         self.theme = _load_theme_preference()
         """Active Textual theme name.
@@ -3136,6 +3298,15 @@ class DeepAgentsApp(App):
         during background startup.
         """
         self._initial_resume_requested = resume_thread is not None
+        """Whether `-r` resume is still in play.
+
+        Gates the startup tip out of `compose`. Every fallback branch of
+        `_resolve_resume_thread` clears this, which is the signal
+        `_restore_startup_tip_after_resume_fallback` uses to mount the tip.
+        """
+
+        self._startup_tip_dismissed = False
+        """Whether the startup tip has been dismissed and must not be remounted."""
 
         self._resume_thread_resolved_event = asyncio.Event()
         """Set once `-r` resume resolution has completed or is unnecessary."""
@@ -3209,6 +3380,9 @@ class DeepAgentsApp(App):
         self._session_plugin_ids: frozenset[str] = frozenset()
         """Plugin ids loaded into the current session (startup or last `/reload`)."""
 
+        self._plugin_auto_update_started = False
+        """Whether this session has started its first-prompt plugin update."""
+
         self._discovered_plugin_ids: frozenset[str] = frozenset()
         """Plugin ids found by the latest background skill discovery."""
 
@@ -3262,6 +3436,13 @@ class DeepAgentsApp(App):
         self._active_mcp_viewer: Any = None
         """Handle to the `/mcp` modal so server-ready events can refresh it."""
 
+        self._active_plugin_manager: Any = None
+        """Handle to the `/plugins` modal so connection-settled events refresh it.
+
+        Set on push and cleared on dismiss. Both `ServerReady` and
+        `ServerStartFailed` push the settled state into it.
+        """
+
         self._mcp_viewer_disable_toggled = False
         """Whether the current/last `/mcp` viewer session toggled a disable state.
 
@@ -3289,7 +3470,10 @@ class DeepAgentsApp(App):
         """
 
         self._modal_command_tasks: dict[str, asyncio.Task[None]] = {}
-        """Detached slash-command continuations that drive a confirmation modal.
+        """Detached continuations that drive a confirmation modal.
+
+        Mostly slash commands, but not exclusively: the cold-cache
+        confirmation is admitted here from ordinary message dispatch.
 
         Only one continuation may run at a time, regardless of its context, so
         installs and updates cannot mutate the tool environment concurrently.
@@ -3377,9 +3561,18 @@ class DeepAgentsApp(App):
         self._sandbox_type: str | None = raw if raw and raw != "none" else None
         """Normalized sandbox type (or `None`), attached to trace metadata."""
         self._auto_mode_eligible = self._sandbox_type is None
+        self._auto_downgraded_by_sandbox = False
+        """Whether a startup Auto was downgraded because a sandbox is active."""
+        self._persisted_startup_mode: str | None = None
+        """Last mode this session wrote to `[startup].recent`, if any."""
         if self._approval_mode is ApprovalMode.AUTO and not self._auto_mode_eligible:
             self._approval_mode = ApprovalMode.MANUAL
             self._auto_approve = False
+            # `notify` is unavailable this early, so defer the explanation to
+            # `_notify_auto_mode_not_restored`. A restored `[startup].recent`
+            # makes this reachable without the user choosing Auto this launch,
+            # so a silent downgrade reads as the preference being forgotten.
+            self._auto_downgraded_by_sandbox = True
         self._approval_mode_blocked = False
         self._auto_mode_notice_pending = False
         self._yolo_mode_notice_pending = False
@@ -3482,6 +3675,22 @@ class DeepAgentsApp(App):
         )
         """Optional grader iterations per rubric attempt."""
 
+        self._auto_classifier_model: str | None = (server_kwargs or {}).get(
+            "auto_classifier_model"
+        )
+        """Effective model spec the Auto approval classifier reviews with.
+
+        The launch path resolves the CLI/env/TOML preference before app
+        construction. `None` means reviews inherit the main agent model."""
+
+        self._auto_classifier_model_cleared: bool = False
+        """Whether the user cleared the classifier back to the main agent model.
+
+        An absent per-run value leaves the server's startup classifier in place,
+        so "no override" and "review with the main agent model" are different
+        statements. This flag puts `INHERIT_CLASSIFIER_MODEL` on the run context
+        for the latter."""
+
         self._active_goal: str | None = None
         """Goal objective accepted by the user and backed by the active rubric."""
 
@@ -3517,6 +3726,14 @@ class DeepAgentsApp(App):
         """Whether message timestamp footers are shown in the chat surface.
 
         Restored from `[ui].show_message_timestamps` and re-persisted on toggle.
+        """
+
+        self._show_diff_line_numbers = _load_show_diff_line_numbers()
+        """Whether file-relative line numbers are shown in diff hunks.
+
+        Restored from `[ui].show_diff_line_numbers` and re-persisted on
+        `/line-numbers` toggle. Captured per diff widget at mount, so the
+        toggle only affects diffs rendered after it.
         """
 
         self._show_scrollbar = _load_show_scrollbar()
@@ -3583,6 +3800,12 @@ class DeepAgentsApp(App):
         self._agent_worker: Worker[None] | None = None
         """Active `_run_agent_task` worker, tracked so it can be cancelled
         on interrupt (`Ctrl+C`) or exit."""
+
+        self._offload_worker: Worker[None] | None = None
+        """Active `/offload` worker, tracked so Escape can cancel it."""
+
+        self._offload_task_started = False
+        """Whether the current `/offload` worker reached its first task step."""
 
         self._agent_turn_started = False
         """True once the current `_run_agent_task` invocation has begun.
@@ -3822,6 +4045,30 @@ class DeepAgentsApp(App):
         self._message_store = MessageStore()
         """Message virtualization store."""
 
+        self._transcript_generation = 0
+        """Invalidates hydration/pruning work when the transcript is cleared."""
+
+        self._hydration_requests: set[Literal["above", "below"]] = set()
+        """Coalesced transcript hydration directions awaiting one UI slice."""
+
+        self._hydration_preferred_direction: Literal["above", "below"] = "above"
+        """Most recently requested direction, prioritized on direction changes."""
+
+        self._hydration_scheduled = False
+        """Whether a hydration slice is queued or currently running."""
+
+        self._history_prefetch_active = False
+        """Whether resumed history is warming toward the soft window size."""
+
+        self._transcript_prune_timer: Timer | None = None
+        """Idle timer that defers opposite-edge pruning while scrolling."""
+
+        self._transcript_prune_running = False
+        """Whether one bounded prune slice is currently mutating the DOM."""
+
+        self._transcript_prune_direction: Literal["above", "below"] = "above"
+        """Mounted-window edge to trim when the idle prune timer fires."""
+
         self._message_measure_width: int | None = None
         """Chat width used for cached message height hints."""
 
@@ -3855,6 +4102,18 @@ class DeepAgentsApp(App):
         copy for the status bar.
         """
 
+        self._last_model_request_at: str | None = None
+        """Latest successful main-model request start restored from graph state."""
+
+        self._last_cache_model_spec: str = ""
+        """Model spec associated with `_last_model_request_at`."""
+
+        self._last_cache_model_params: dict[str, Any] | None = None
+        """Model params associated with `_last_model_request_at`."""
+
+        self._last_cache_endpoint: str | None = None
+        """Endpoint identity associated with `_last_model_request_at`."""
+
         self._tokens_approximate: bool = False
         """Whether the cached token count is stale (interrupted generation)."""
 
@@ -3865,6 +4124,52 @@ class DeepAgentsApp(App):
         the streamed absolute total during a turn. The client never adds its own
         estimates here.
         """
+
+        from deepagents_code.config_manifest import (
+            COLD_CACHE_WARNING_THRESHOLD_USD_DEFAULT,
+            SESSION_COST_WARNING_THRESHOLD_USD_DEFAULT,
+            load_config_toml,
+        )
+
+        toml_data = load_config_toml()
+        self._session_cost_warning_threshold_usd = _load_float_option(
+            "warnings.session_cost_threshold_usd",
+            SESSION_COST_WARNING_THRESHOLD_USD_DEFAULT,
+            label="session cost warning threshold",
+            toml_data=toml_data,
+        )
+        """Configured soft limit for the active thread's estimated cost."""
+
+        # Negative is rejected here but accepted above: the manifest documents
+        # a negative session-cost threshold as "disabled", while a negative
+        # cold-cache delta has no meaning -- every delta would clear it.
+        self._cold_cache_warning_threshold_usd = _load_float_option(
+            "warnings.cold_cache_min_delta_usd",
+            COLD_CACHE_WARNING_THRESHOLD_USD_DEFAULT,
+            label="cold-cache warning threshold",
+            toml_data=toml_data,
+            minimum=0.0,
+        )
+        """Minimum estimated cold-versus-warm cost delta that opens the modal."""
+
+        self._cold_cache_degraded_notified = False
+        """Whether this session already reported that the warning failed open.
+
+        Latched so a persistent cause cannot toast on every send; see
+        `_notify_cold_cache_degraded_once`.
+        """
+
+        self._cold_cache_suppressed_for_session = False
+        """Whether the user muted the cold-cache warning until app restart.
+
+        Set from the warning modal's "don't warn again this session" choice.
+        Unlike the persisted `[warnings].suppress` entry this is in-memory
+        only; the debug env var (`DEEPAGENTS_CODE_DEBUG_COLD_CACHE`) still
+        bypasses it so the modal stays reachable while developing.
+        """
+
+        self._session_cost_warning_shown = False
+        """Whether the active thread has already crossed its cost soft limit."""
 
         self._provisional_cost_usd: float = 0.0
         """Streamed spend the graph has not reported a total for yet.
@@ -3996,6 +4301,25 @@ class DeepAgentsApp(App):
         Used by `_invoke_skill` to skip re-walking all skill directories on
         every invocation.
         """
+
+        self._reload_task: asyncio.Task[None] | None = None
+        """The in-flight detached `/reload` task, if any (see `_schedule_reload`).
+
+        Tests and shutdown await it; production callers fire-and-forget via the
+        `_log_task_exception` done callback.
+        """
+
+        self._reloading = False
+        """Whether `/reload` is refreshing mutable runtime state.
+
+        Keeps submitted prompts queued for the entire reload, including its
+        pre-restart discovery phases. A server restart only protects the final
+        phase, and allowing a prompt to start before it would let that restart
+        cancel the prompt's worker.
+        """
+
+        self._restart_requested_during_reload = False
+        """Whether an explicit `/restart` still needs a reload-owned respawn."""
 
         self._plugin_fingerprints: dict[str, _PluginFingerprint] | None = None
         """Rolling plugin-fingerprint baseline keyed by plugin id.
@@ -4139,7 +4463,7 @@ class DeepAgentsApp(App):
             # until the first spawn event; sits at the top of the bottom
             # container, above the startup tip and input.
             yield SubagentPanel(id="subagent-panel")
-            if show_startup_tip():
+            if not self._initial_resume_requested and show_startup_tip():
                 yield StartupTip(id="startup-tip")
             yield GoalStatusPanel(id="goal-status-panel")
             yield ChatInput(
@@ -4203,7 +4527,7 @@ class DeepAgentsApp(App):
 
         self._status_bar.set_approval_mode(self._approval_mode.value)
         if self._approval_mode.value == "auto":
-            self._notify_auto_mode_enabled_once()
+            self._notify_auto_classifier_active()
         elif self._approval_mode.value == "yolo":
             self._warn_yolo_active(timeout=10)
 
@@ -4264,6 +4588,7 @@ class DeepAgentsApp(App):
         self.call_after_refresh(self._notify_interpreter_tools_without_interpreter)
         self.call_after_refresh(self._notify_interpreter_disabled_by_sandbox)
         self.call_after_refresh(self._notify_orphaned_tracing_disabled)
+        self.call_after_refresh(self._notify_auto_mode_not_restored)
 
         # Surface a `-m`/`--message` prompt as a queued message right away,
         # while the server is still connecting, instead of waiting for
@@ -4297,6 +4622,34 @@ class DeepAgentsApp(App):
             self.notify(notice, severity="warning", timeout=8, markup=False)
         except Exception:
             logger.exception("Failed to surface orphaned-tracing disabled notice")
+
+    def _notify_auto_mode_not_restored(self) -> None:
+        """Toast when a remembered Auto mode did not survive startup.
+
+        Two independent causes land here, and neither is visible on its own:
+        the notice gate declined a stored `[startup].recent = "auto"` (recorded
+        in `model_config`), or a sandbox made Auto ineligible. Both leave the
+        status bar reading `MANUAL` with nothing to explain it, which reads as
+        the preference not being remembered at all.
+        """
+        from deepagents_code.model_config import (
+            consume_recent_auto_not_restored_notice,
+        )
+
+        notice = consume_recent_auto_not_restored_notice()
+        if self._auto_downgraded_by_sandbox:
+            self._auto_downgraded_by_sandbox = False
+            # The sandbox is the operative reason: it blocks Auto for the whole
+            # session, so it outranks a stale notice the user could re-confirm.
+            notice = "Auto is unavailable with a sandbox; starting in Manual."
+        if notice is None:
+            return
+        # Best-effort, like the other deferred advisories: the durable channel
+        # is the `logger.warning` at each mutation site.
+        try:
+            self.notify(notice, severity="warning", timeout=8, markup=False)
+        except Exception:
+            logger.exception("Failed to surface Auto-not-restored notice")
 
     def _notify_interpreter_tools_without_interpreter(self) -> None:
         """Toast when `--interpreter-tools` was set while the interpreter is off.
@@ -4533,6 +4886,7 @@ class DeepAgentsApp(App):
             on_subagent_event=self._on_subagent_event,
             on_auto_mode_event=self._on_auto_mode_event,
             on_approval_mode_fallback=self._on_approval_mode_fallback,
+            show_diff_line_numbers=self._show_diff_line_numbers,
         )
         # Wire token display callbacks
         self._ui_adapter._on_tokens_update = self._on_tokens_update
@@ -4540,6 +4894,7 @@ class DeepAgentsApp(App):
         self._ui_adapter._on_tokens_show = self._show_tokens
         self._ui_adapter._on_session_cost = self._set_session_cost
         self._ui_adapter._on_provisional_cost = self._add_provisional_cost
+        self._ui_adapter._on_usage_update = self._refresh_cache_display
         self._ui_adapter._on_stream_complete = self._mark_thread_turn_completed
 
         if self._server_startup_deferred:
@@ -4722,6 +5077,87 @@ class DeepAgentsApp(App):
         from pathlib import Path
 
         await self._hooks.reload(cwd=Path(self._cwd), plugins=plugins)
+
+    async def _retarget_hooks_after_cwd_switch(
+        self,
+        *,
+        reload_manager: bool = True,
+    ) -> None:
+        """Resolve project-hook trust after a successful cwd switch.
+
+        Args:
+            reload_manager: Whether to activate the target workspace's runtime
+                immediately. In-session resumes defer activation until the outgoing
+                runtime has received `SessionEnd`.
+        """
+        from deepagents_code.hooks.loading import project_hooks_path
+        from deepagents_code.hooks.trust import project_root_for, trust_project_hooks
+        from deepagents_code.tui.widgets.cwd_switch import HookTrustScreen
+
+        state = self._session_state
+        trust = (
+            state.hooks.trust
+            if state is not None
+            else self._hook_trust or self._hooks.trust
+        )
+        try:
+            root = await asyncio.to_thread(project_root_for, Path(self._cwd))
+            config_path = project_hooks_path(root)
+            has_project_hooks = await asyncio.to_thread(config_path.is_file)
+        except (OSError, ValueError):
+            logger.warning(
+                "Could not inspect project hooks after cwd switch",
+                exc_info=True,
+            )
+        else:
+            if has_project_hooks and not await asyncio.to_thread(trust.allows, root):
+                trust = await asyncio.to_thread(trust.without_session_grant, root)
+                if trust.consult_store:
+                    prompt_grant = await asyncio.to_thread(
+                        trust.with_session_grant, root
+                    )
+                    if self.is_running:
+                        refreshed = asyncio.Event()
+                        if self.call_after_refresh(refreshed.set):
+                            await refreshed.wait()
+                    try:
+                        choice = await self._push_screen_wait(
+                            HookTrustScreen(
+                                project_root=str(root),
+                                config_path=str(config_path),
+                            )
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Project hooks trust prompt failed after cwd switch",
+                            exc_info=True,
+                        )
+                        self.notify(
+                            "Project hooks were not loaded because the trust prompt "
+                            "failed.",
+                            severity="warning",
+                            markup=False,
+                        )
+                        choice = None
+
+                    if choice in {"allow_once", "always_allow"}:
+                        trust = prompt_grant
+                        if choice == "always_allow" and not await asyncio.to_thread(
+                            trust_project_hooks,
+                            root,
+                            store_path=trust.store_path,
+                        ):
+                            self.notify(
+                                "Approved for this session, but the decision could not "
+                                "be saved — you may be asked again next time.",
+                                severity="warning",
+                                markup=False,
+                            )
+
+        self._hook_trust = trust
+        self._hooks.trust = trust
+        if reload_manager:
+            await self._reload_hooks()
 
     async def _run_session_start_hook(self, cause: SessionStartCause) -> bool:
         """Run `SessionStart`, surfacing a stop as a chat message.
@@ -5183,7 +5619,15 @@ class DeepAgentsApp(App):
             # it constructs the state.
             if self._session_state:
                 self._session_state.thread_id = self._lc_thread_id
+            # Signal before restoring the tip: resolution is complete at this
+            # point, and the tip is cosmetic follow-up work. Awaiting it first
+            # would let a mount failure skip `set()` and strand every waiter
+            # (`_write_launch_name_memory`), hanging onboarding.
             self._resume_thread_resolved_event.set()
+            try:
+                await self._restore_startup_tip_after_resume_fallback()
+            except Exception:
+                logger.exception("Failed to restore startup tip after resume fallback")
 
     async def _start_server_background(self) -> None:
         """Background worker: resolve resume-thread intent, start server + MCP preload.
@@ -5406,6 +5850,17 @@ class DeepAgentsApp(App):
             task = asyncio.create_task(_refresh_viewer())
             task.add_done_callback(_log_task_exception)
 
+        # A `/plugins` manager opened mid-startup holds a connecting snapshot
+        # (empty `mcp_server_info`, `mcp_connecting=True`) that would otherwise
+        # suppress the settled connected/`/reload` status until the modal is
+        # reopened. Push both halves: clearing the flag alone would render
+        # every MCP-declaring plugin as disconnected instead.
+        if self._active_plugin_manager is not None:
+            self._active_plugin_manager.update_connection_state(
+                self._mcp_server_info or [],
+                mcp_connecting=False,
+            )
+
         # Session-start sequence: load resumed history, run `--startup-cmd`
         # (if any), then dispatch the initial prompt/skill and drain
         # user-typed messages. Sequenced through a single task so the
@@ -5446,6 +5901,25 @@ class DeepAgentsApp(App):
         self._connecting = False
         self._reconnecting = False
         self._connection_ready_event.set()
+
+        # A failed startup settles the connection just as `ServerReady` does.
+        # Without this the manager keeps `mcp_connecting=True` for the life of
+        # the modal, re-creating the stale-snapshot bug on the failure branch.
+        #
+        # On a failed *reconnect* `_mcp_server_info` still holds the last
+        # healthy snapshot, so the manager can show those servers as connected
+        # while the server is down. There is no truthful alternative to push:
+        # `mcp_connecting=True` would pin the modal to "loading" forever, and
+        # `[]` would render every plugin as disconnected on a failed first
+        # startup, where `/reload` cannot help either. The last-known snapshot
+        # is the least-wrong settled state, and matches what `ServerReady`
+        # itself delivers when the post-restart MCP preload fails.
+        if self._active_plugin_manager is not None:
+            self._active_plugin_manager.update_connection_state(
+                self._mcp_server_info or [],
+                mcp_connecting=False,
+            )
+
         headline_truncated = False
         if isinstance(event.error, MCPConfigError):
             # Already carries the path + hint; showing the class name is noise.
@@ -6218,6 +6692,33 @@ class DeepAgentsApp(App):
             )
             await self._mount_update_failure(exc)
 
+    def _update_splash_version(self, version: str) -> None:
+        """Show the installed version in the splash after an in-session update.
+
+        Call this only once the install is known to be the version a relaunch
+        will actually run: the shadowed-`dcode` paths deliberately leave the
+        old version on the banner, because a stale shim earlier on PATH means
+        relaunching keeps the old binary.
+
+        Repainting the splash is cosmetic, so a missing banner is logged rather
+        than raised — callers emit the authoritative success messaging around
+        this call and must not have it turned into a failure report.
+
+        Args:
+            version: The newly installed `deepagents-code` version.
+        """
+        try:
+            banner = self.query_one("#welcome-banner", WelcomeBanner)
+        except NoMatches:
+            # The banner is composed once and never removed, so a miss here
+            # means it has silently vanished — surface it.
+            logger.warning("Welcome banner not found during splash version sync")
+            return
+        except ScreenStackError:
+            logger.debug("Screen stack empty during splash version sync", exc_info=True)
+            return
+        banner.update_version(version)
+
     async def _perform_app_upgrade(
         self,
         *,
@@ -6227,15 +6728,26 @@ class DeepAgentsApp(App):
         upgrade_include_prereleases: bool | None,
         pin_upgrade_version: str | None,
     ) -> None:
-        """Serialize an app upgrade against every other environment mutation."""
+        """Serialize an app upgrade against every other environment mutation.
+
+        `_environment_mutation_lock` only covers this process, so the
+        cross-process update lock is taken too: a concurrent terminal may
+        already be installing into the same tool environment.
+        """
+        from deepagents_code.update_check import update_install_lock
+
         async with self._environment_mutation_lock:
-            await self._perform_app_upgrade_unlocked(
-                current=current,
-                latest=latest,
-                include_prereleases=include_prereleases,
-                upgrade_include_prereleases=upgrade_include_prereleases,
-                pin_upgrade_version=pin_upgrade_version,
-            )
+            with update_install_lock() as holding_update_lock:
+                if not holding_update_lock:
+                    await self._mount_message(AppMessage(_CONCURRENT_UPDATE_MESSAGE))
+                    return
+                await self._perform_app_upgrade_unlocked(
+                    current=current,
+                    latest=latest,
+                    include_prereleases=include_prereleases,
+                    upgrade_include_prereleases=upgrade_include_prereleases,
+                    pin_upgrade_version=pin_upgrade_version,
+                )
 
     async def _perform_app_upgrade_unlocked(
         self,
@@ -6264,12 +6776,12 @@ class DeepAgentsApp(App):
         from deepagents_code._env_vars import DEBUG_UPDATE
         from deepagents_code.update_check import (
             _PRERELEASE_UNSUPPORTED_MESSAGE,
+            create_update_log_file,
             detect_shadowed_dcode_safe,
-            format_dependency_changes,
             format_installed_age_suffix,
+            format_log_follow_command,
             format_release_age_parenthetical,
             format_shadowed_dcode_warning,
-            parse_dependency_changes,
             perform_upgrade,
             prerelease_upgrade_supported,
             upgrade_command,
@@ -6303,12 +6815,31 @@ class DeepAgentsApp(App):
                 AppMessage("Skipped update install (debug mode)."),
             )
             return
-        success, output = await perform_upgrade(
+        # Mount the log hint *before* awaiting the upgrade: the whole point of
+        # replacing the post-upgrade dependency summary with a log pointer is
+        # that the user can follow the install while it streams. Creating the
+        # file eagerly (rather than just naming it) keeps that hint honest even
+        # when `perform_upgrade` refuses before spawning an installer. Run it
+        # off the event loop — it globs and unlinks in the cache dir — and
+        # tolerate a `None` so a log-path failure can't turn an otherwise fine
+        # upgrade into an "/update failed" report.
+        log_path = await asyncio.to_thread(create_update_log_file)
+        if log_path is not None:
+            await self._mount_message(
+                AppMessage(f"Update log: {format_log_follow_command(log_path)}"),
+            )
+        success, output, installed = await perform_upgrade(
+            log_path=log_path,
             include_prereleases=include_prereleases,
             target_version=latest,
         )
         if success:
             self._update_available = (False, None)
+            # The install command is unpinned, so the installer may have
+            # resolved a release newer than the one the update check observed
+            # (a release published while the session sat open). Report what
+            # actually landed on disk rather than the stale check result.
+            upgraded_to = installed or latest
             # uv may have installed the upgraded shim into a directory that
             # isn't first on the user's PATH (e.g. a leftover pre-uv
             # `dcode` from a former `pipx` install). Detect that before
@@ -6321,27 +6852,18 @@ class DeepAgentsApp(App):
             if shadow is None:
                 await self._mount_message(
                     AppMessage(
-                        f"Updated to v{latest}. Quit and relaunch dcode "
+                        f"Updated to v{upgraded_to}. Quit and relaunch dcode "
                         "to use the new version."
                     ),
                 )
+                # After the success line: this method runs inside the caller's
+                # `except Exception -> _mount_update_failure`, so a cosmetic
+                # repaint must not be able to precede (and replace) the
+                # success message with an "/update failed" report.
+                self._update_splash_version(upgraded_to)
             else:
                 await self._mount_message(
                     ErrorMessage(format_shadowed_dcode_warning(shadow)),
-                )
-            # The upgrade re-resolves the whole environment, so surface any
-            # dependency bumps that rode along with the dcode release.
-            dep_changes = [
-                change
-                for change in parse_dependency_changes(output)
-                if change.name != "deepagents-code"
-            ]
-            if dep_changes:
-                await self._mount_message(
-                    AppMessage(
-                        "Dependencies updated:\n"
-                        f"{format_dependency_changes(dep_changes)}",
-                    ),
                 )
         else:
             cmd = upgrade_command(
@@ -6349,8 +6871,16 @@ class DeepAgentsApp(App):
                 version=pin_upgrade_version,
             )
             detail = f": {output[:200]}" if output else ""
+            # Repeat the log path here rather than relying on the hint above:
+            # a failed resolution streams hundreds of lines through the TUI in
+            # between, so by now that hint has scrolled away — and `detail` is
+            # truncated, making the full log the only complete record. Matches
+            # the sibling install-failure branches, which all end in `Log:`.
+            log_line = f"\nLog: {log_path}" if log_path is not None else ""
             await self._mount_message(
-                AppMessage(f"Auto-update failed{detail}\nRun manually: {cmd}"),
+                AppMessage(
+                    f"Auto-update failed{detail}{log_line}\nRun manually: {cmd}",
+                ),
             )
 
     async def _refresh_dependencies(
@@ -6359,12 +6889,24 @@ class DeepAgentsApp(App):
         include_prereleases: bool | None,
         app_update_version: str | None = None,
     ) -> None:
-        """Serialize dependency refresh against all environment mutations."""
+        """Serialize dependency refresh against all environment mutations.
+
+        A refresh runs `uv tool install -U deepagents-code==<current>`, which
+        replaces the installed distribution just as an upgrade does, so it takes
+        the cross-process update lock for the same reason `_perform_app_upgrade`
+        does: `_environment_mutation_lock` only covers this process.
+        """
+        from deepagents_code.update_check import update_install_lock
+
         async with self._environment_mutation_lock:
-            await self._refresh_dependencies_unlocked(
-                include_prereleases=include_prereleases,
-                app_update_version=app_update_version,
-            )
+            with update_install_lock() as holding_update_lock:
+                if not holding_update_lock:
+                    await self._mount_message(AppMessage(_CONCURRENT_UPDATE_MESSAGE))
+                    return
+                await self._refresh_dependencies_unlocked(
+                    include_prereleases=include_prereleases,
+                    app_update_version=app_update_version,
+                )
 
     async def _refresh_dependencies_unlocked(
         self,
@@ -7237,6 +7779,11 @@ class DeepAgentsApp(App):
         Driven by `_ChatScroll.Scrolled` (see that message for why hydration
         keys off the scroll offset rather than the scrollbar messages).
         """
+        if (
+            self._transcript_prune_timer is not None
+            and not self._message_store.hard_window_exceeded()
+        ):
+            self._schedule_transcript_prune(self._transcript_prune_direction)
         self._check_hydration_needed()
         self._check_hydration_below_needed()
 
@@ -7419,6 +7966,29 @@ class DeepAgentsApp(App):
         if self._status_bar:
             self._status_bar.show_pending_tokens()
 
+    def _refresh_cache_display(self) -> None:
+        """Show active-thread cache totals and hit rate, including in-flight use."""
+        if self._status_bar is None:
+            return
+        inputs = self._thread_stats.input_tokens
+        reads = self._thread_stats.cache_read_tokens
+        writes = self._thread_stats.cache_write_tokens
+        if self._inflight_turn_stats is not None and (
+            self._inflight_thread_id == self._lc_thread_id
+        ):
+            inputs += self._inflight_turn_stats.input_tokens
+            reads += self._inflight_turn_stats.cache_read_tokens
+            writes += self._inflight_turn_stats.cache_write_tokens
+        # The usage worker can fire while `/reload` has the status bar
+        # mid-compose or mid-teardown, before `#cache-display` is queryable.
+        # `set_cache_tokens` also touches the DOM, so skip both on that race;
+        # the next usage update (or `_reset_thread_usage` on the new thread)
+        # repaints.
+        with suppress(NoMatches):
+            cache_display = self._status_bar.query_one("#cache-display")
+            cache_display.visible = self._thread_has_completed_turn and writes > 0
+            self._status_bar.set_cache_tokens(reads, writes, input_tokens=inputs)
+
     def _set_session_cost(
         self,
         cost_usd: float,
@@ -7458,6 +8028,21 @@ class DeepAgentsApp(App):
         self._session_cost_usd = _coerce_session_cost_usd(cost_usd)
         self._provisional_cost_usd = 0.0
         self._refresh_session_cost_display()
+        threshold = self._session_cost_warning_threshold_usd
+        if (
+            not self._session_cost_warning_shown
+            and 0 < threshold < self._session_cost_usd
+        ):
+            self._session_cost_warning_shown = True
+            self.notify(
+                f"Estimated session cost is {format_cost(self._session_cost_usd)}, "
+                f"above the configured {format_cost(threshold)} threshold. Consider "
+                "/offload to reduce context usage or /clear to start fresh.",
+                title="Session cost warning",
+                severity="warning",
+                timeout=12,
+                markup=False,
+            )
 
     @property
     def _displayed_cost_usd(self) -> float:
@@ -7482,11 +8067,17 @@ class DeepAgentsApp(App):
             has_restored_model_usage: Whether restored history contains model usage.
         """
         self._thread_stats = SessionStats()
+        self._refresh_cache_display()
         self._thread_restored_cost_usd = _coerce_session_cost_usd(cost_usd)
         self._thread_has_restored_model_usage = (
             has_restored_model_usage or self._thread_restored_cost_usd > 0
         )
         self._thread_has_completed_turn = False
+        self._last_model_request_at = None
+        self._last_cache_model_spec = ""
+        self._last_cache_model_params = None
+        self._last_cache_endpoint = None
+        self._session_cost_warning_shown = False
         self._set_session_cost(self._thread_restored_cost_usd)
 
     def _mark_thread_turn_completed(self) -> None:
@@ -7601,6 +8192,7 @@ class DeepAgentsApp(App):
                         f"{priced_request_count} of {request_count} recorded requests "
                         f"{included_verb} included."
                     ),
+                    "",
                     *self._unpriced_request_lines(),
                 ]
             )
@@ -7628,7 +8220,7 @@ class DeepAgentsApp(App):
             and self._thread_stats.per_kind[kind].priced_request_count
         ]
         if priced_kinds:
-            lines.append("By type since this thread was loaded:")
+            lines.extend(["", "By type since this thread was loaded:"])
             for kind, kind_stats in priced_kinds:
                 lines.append(
                     f"- {USAGE_KIND_LABELS[kind]}: {format_cost(kind_stats.cost_usd)}"
@@ -7639,7 +8231,7 @@ class DeepAgentsApp(App):
             if model.priced_request_count
         ]
         if priced_models:
-            lines.append("By model since this thread was loaded:")
+            lines.extend(["", "By model since this thread was loaded:"])
             for model in priced_models:
                 label = (
                     f"{model.provider}:{model.model_name}"
@@ -7739,8 +8331,126 @@ class DeepAgentsApp(App):
             _coerce_session_cost_usd(state_values.get("_session_cost_usd"))
         )
 
+    def _sync_cache_state_from_state(self, state_values: Mapping[str, Any]) -> None:
+        """Adopt the latest successful model request's prompt-cache identity.
+
+        A snapshot without `_last_model_request_at` is a no-op: the three
+        in-memory cache fields are preserved rather than cleared, so a partial
+        state read (a post-compaction refresh, say) cannot silently disable
+        cold-cache warnings for the rest of the session.
+
+        Raw checkpoint values are validated here rather than by callers, so
+        every entry point logs the same discards. The warnings name the
+        discarded value's type rather than why it failed, so a garbage string
+        and a naive datetime report identically.
+
+        `_last_cache_model_spec` falls back to `_model_spec` because threads
+        checkpointed before cold-cache tracking carry only the latter. The two
+        channels hold the same value on every write since; the fallback exists
+        for those older checkpoints, not for a case where they diverge.
+        """
+        if "_last_model_request_at" not in state_values:
+            return
+        from deepagents_code.cold_cache import parse_cache_timestamp
+
+        raw_timestamp = state_values.get("_last_model_request_at")
+        timestamp = parse_cache_timestamp(raw_timestamp)
+        if timestamp is None:
+            # Without a parseable request time the age cannot be computed, so
+            # the next send is treated as `age_unknown` -- which warns rather
+            # than staying silent. It self-heals once any model request
+            # checkpoints a fresh timestamp.
+            logger.warning(
+                "Discarding checkpointed _last_model_request_at (%s); the next "
+                "send is treated as unknown cache age and will warn",
+                type(raw_timestamp).__name__,
+            )
+        self._last_model_request_at = timestamp.isoformat() if timestamp else None
+
+        def _usable_spec(value: object) -> str | None:
+            # Blank is as unusable as a non-string here, and both must reach
+            # the warning below: an empty spec never matches the current model,
+            # so it silently pins every later send to "model changed".
+            return value.strip() if isinstance(value, str) and value.strip() else None
+
+        def _usable_endpoint_identity(value: object) -> str | None:
+            # Shape-checked, not merely non-empty: `endpoint_cache_identity`
+            # only ever mints `"default"`, `"invalid:<digest>"`, or a value
+            # containing `"://"`. Anything else (a hand-edited row, a future
+            # format) can never equal a freshly computed identity, so accepting
+            # it would report `identity_changed` on the next send while the
+            # discard warning below stayed silent. Discarding is the quieter
+            # wrong answer and it self-heals on the next checkpoint write.
+            usable = _usable_spec(value)
+            if usable is None:
+                return None
+            if usable == "default" or usable.startswith("invalid:") or "://" in usable:
+                return usable
+            return None
+
+        raw_spec = _usable_spec(
+            state_values.get("_last_cache_model_spec")
+        ) or _usable_spec(state_values.get("_model_spec"))
+        if raw_spec is None:
+            # Neither `_last_cache_model_spec` nor the `_model_spec` fallback
+            # gave us a usable spec. Storing "" means the next send never
+            # matches the current model, so it is treated as a model change --
+            # and the modal then shows its "model changed" copy even though the
+            # real cause is unreadable checkpoint state.
+            logger.warning(
+                "Discarding checkpointed _last_cache_model_spec (%s) and "
+                "_model_spec (%s); the next send is treated as a model change "
+                "for cold-cache warnings",
+                type(state_values.get("_last_cache_model_spec")).__name__,
+                type(state_values.get("_model_spec")).__name__,
+            )
+        self._last_cache_model_spec = raw_spec or ""
+        raw_params = state_values.get("_last_cache_params")
+        self._last_cache_model_params = (
+            dict(raw_params) if isinstance(raw_params, dict) else None
+        )
+        raw_endpoint = state_values.get("_last_cache_endpoint")
+        self._last_cache_endpoint = _usable_endpoint_identity(raw_endpoint)
+        if raw_endpoint is not None and self._last_cache_endpoint is None:
+            # Unlike a bad spec, a discarded endpoint fails *quietly*: `None`
+            # reads back as "never recorded", which suppresses endpoint-change
+            # detection instead of over-warning. It self-heals once any model
+            # call re-checkpoints, but nothing else would surface the gap, so it
+            # is logged here.
+            logger.warning(
+                "Discarding checkpointed _last_cache_endpoint (%s); endpoint "
+                "changes will not be detected until the next successful model "
+                "request records a fresh one",
+                type(raw_endpoint).__name__,
+            )
+
+    def _stamp_cache_identity_locally(self) -> None:
+        """Record the just-run model as the cache identity, without a checkpoint.
+
+        Used when a turn reached the model but ended without a readable
+        checkpoint (an interrupt, say). The timestamp is "now" rather than the
+        turn's last request time, which the client does not track: within a
+        long turn that slightly understates the true age, and the next
+        checkpoint read corrects it. Understating age is the safe direction
+        here only because the alternative -- leaving the field unset -- warns
+        on every subsequent send with a reason that is plainly false.
+        """
+        from datetime import UTC, datetime
+
+        from deepagents_code.cold_cache import cache_identity_params
+
+        self._last_model_request_at = datetime.now(UTC).isoformat()
+        self._last_cache_model_spec = self._effective_model_spec() or ""
+        # Record only the cache-identity projection of the session overrides,
+        # matching what the middleware checkpoints in `_last_cache_params`:
+        # the comparison side filters through `cache_identity_params` too, so
+        # unrelated knobs must not read as a cache change here either.
+        self._last_cache_model_params = (
+            cache_identity_params(self._model_params_override) or None
+        )
+
     async def _sync_session_cost_from_checkpoint(self) -> None:
-        """Reconcile the displayed cost with the thread's committed total.
+        """Reconcile displayed cost and prompt-cache state from the checkpoint.
 
         The streamed totals already track spend during a turn; this settles the
         display at the end of one, and covers a turn whose final events were
@@ -7752,11 +8462,12 @@ class DeepAgentsApp(App):
             state_values = await self._get_thread_state_values(self._lc_thread_id)
         except Exception:
             logger.debug(
-                "Could not load thread state while reconciling cost",
+                "Could not load thread state while reconciling cost and cache state",
                 exc_info=True,
             )
             return
         self._sync_session_cost_from_state(state_values)
+        self._sync_cache_state_from_state(state_values)
 
     def _notify_hydration_failure(self) -> None:
         """Surface transcript hydration failures to the user, once per session.
@@ -7775,11 +8486,78 @@ class DeepAgentsApp(App):
             markup=False,
         )
 
-    def _check_hydration_needed(self) -> None:
-        """Check if we need to hydrate messages from the store.
+    def _request_hydration(self, direction: Literal["above", "below"]) -> None:
+        """Coalesce a transcript hydration request into one UI-thread slice."""
+        self._hydration_requests.add(direction)
+        self._hydration_preferred_direction = direction
+        if self._hydration_scheduled:
+            return
+        self._hydration_scheduled = True
+        self.call_later(self._run_hydration_slice)
 
-        Called when user scrolls up near the top of visible messages.
-        """
+    async def _run_hydration_slice(self) -> None:
+        """Mount one small history batch, then yield to Textual for a repaint."""
+        hydrated_count = 0
+        direction: Literal["above", "below"] | None = None
+        try:
+            if not self._hydration_requests:
+                return
+            direction = self._hydration_preferred_direction
+            self._hydration_requests.discard(direction)
+            count = self._message_store.HYDRATE_BUFFER
+            if direction == "above" and self._history_prefetch_active:
+                count = min(
+                    count,
+                    max(
+                        0,
+                        self._message_store.WINDOW_SIZE
+                        - self._message_store.visible_count,
+                    ),
+                )
+            hydrated_count = await self._hydrate_messages(direction, count=count)
+        finally:
+            self._hydration_scheduled = False
+
+        if hydrated_count == 0 and direction == "above":
+            self._history_prefetch_active = False
+        if hydrated_count or self._hydration_requests:
+            self.call_after_refresh(lambda: self._continue_hydration(direction))
+
+    def _continue_hydration(self, direction: Literal["above", "below"] | None) -> None:
+        """Continue coalesced or background hydration after layout catches up."""
+        if self._hydration_requests:
+            pending_direction = self._hydration_preferred_direction
+            if pending_direction not in self._hydration_requests:
+                pending_direction = next(iter(self._hydration_requests))
+            self._request_hydration(pending_direction)
+            return
+
+        if self._history_prefetch_active:
+            if (
+                self._message_store.has_messages_above
+                and self._message_store.visible_count < self._message_store.WINDOW_SIZE
+            ):
+                self._request_hydration("above")
+                return
+            self._history_prefetch_active = False
+            return
+
+        if direction == "above":
+            self._check_hydration_needed()
+        elif direction == "below":
+            self._check_hydration_below_needed()
+
+    def _start_history_prefetch(self) -> None:
+        """Warm resumed history toward the soft window without blocking startup."""
+        self._history_prefetch_active = (
+            self._message_store.has_messages_above
+            and self._message_store.visible_count < self._message_store.WINDOW_SIZE
+        )
+        if self._history_prefetch_active:
+            self._request_hydration("above")
+
+    def _check_hydration_needed(self) -> None:
+        """Prefetch older messages near the mounted-window boundary."""
         if not self._message_store.has_messages_above:
             return
 
@@ -7789,14 +8567,17 @@ class DeepAgentsApp(App):
             logger.debug("Skipping hydration check: #chat container not found")
             return
 
-        scroll_y = chat.scroll_y
-        viewport_height = chat.size.height
-
-        if self._message_store.should_hydrate_above(scroll_y, viewport_height):
-            self.call_later(self._hydrate_messages_above)
+        start, _end = self._message_store.get_visible_range()
+        top_spacer_bottom = self._message_store.range_height(0, start)
+        if self._message_store.should_hydrate_above(
+            chat.scroll_y,
+            chat.size.height,
+            top_spacer_bottom,
+        ):
+            self._request_hydration("above")
 
     def _check_hydration_below_needed(self) -> None:
-        """Check if newer messages should be mounted below the current window."""
+        """Prefetch newer messages near the mounted-window boundary."""
         if not self._message_store.has_messages_below:
             return
         try:
@@ -7812,149 +8593,210 @@ class DeepAgentsApp(App):
             bottom_spacer_top,
             max_scroll=chat.max_scroll_y,
         ):
-            self.call_later(self._hydrate_messages_below)
+            self._request_hydration("below")
 
-    async def _hydrate_messages_above(self) -> None:
-        """Hydrate older messages when user scrolls near the top.
+    async def _mount_hydration_batch(
+        self,
+        messages_container: Container,
+        entries: list[tuple[Widget, MessageData, Static | None]],
+        *,
+        before: Widget | None = None,
+        generation: int,
+    ) -> bool:
+        """Mount and render one prepared hydration batch in a single DOM call.
 
-        This recreates widgets for archived messages and inserts them
-        at the top of the messages container.
+        Args:
+            messages_container: Transcript container receiving the batch.
+            entries: Ordered `(widget, data, footer)` rows to mount.
+            before: Optional insertion anchor for hydrate-above.
+            generation: Transcript generation that owns the batch.
+
+        Returns:
+            Whether the complete batch mounted for the active transcript.
+
+        Raises:
+            asyncio.CancelledError: If mounting or assistant rendering is cancelled.
         """
-        if not self._message_store.has_messages_above:
-            return
+        nodes = [
+            node
+            for widget, _data, footer in entries
+            for node in ((widget, footer) if footer is not None else (widget,))
+        ]
 
+        async def remove_attached_nodes() -> None:
+            for node in reversed(nodes):
+                if not node.is_attached:
+                    continue
+                try:
+                    await node.remove()
+                except Exception:
+                    logger.warning(
+                        "Failed to remove hydrated node %s during rollback",
+                        node.id or type(node).__name__,
+                        exc_info=True,
+                    )
+
+        try:
+            await self._mount_transcript_nodes(
+                messages_container,
+                nodes,
+                before=before,
+            )
+        except asyncio.CancelledError:
+            await remove_attached_nodes()
+            raise
+        except Exception:
+            logger.warning("Failed to mount hydrated transcript batch", exc_info=True)
+            await remove_attached_nodes()
+            self._notify_hydration_failure()
+            return False
+
+        if generation != self._transcript_generation:
+            await remove_attached_nodes()
+            return False
+
+        assistant_updates = [
+            widget.set_content(data.content)
+            for widget, data, _footer in entries
+            if isinstance(widget, AssistantMessage) and data.content
+        ]
+        if assistant_updates:
+            try:
+                results = await asyncio.gather(
+                    *assistant_updates, return_exceptions=True
+                )
+            except asyncio.CancelledError:
+                await remove_attached_nodes()
+                raise
+            for error in results:
+                if isinstance(error, asyncio.CancelledError):
+                    await remove_attached_nodes()
+                    raise error
+                if isinstance(error, Exception):
+                    logger.warning(
+                        "Failed to render hydrated assistant message: %s", error
+                    )
+                    self._notify_hydration_failure()
+
+        if generation != self._transcript_generation:
+            await remove_attached_nodes()
+            return False
+        return True
+
+    async def _hydrate_messages(
+        self,
+        direction: Literal["above", "below"],
+        *,
+        count: int | None = None,
+    ) -> int:
+        """Hydrate one contiguous batch at a mounted-window edge.
+
+        Args:
+            direction: Edge receiving stored messages.
+            count: Maximum messages to mount; defaults to `HYDRATE_BUFFER`.
+
+        Returns:
+            Number of messages mounted.
+        """
+        above = direction == "above"
+        if not (
+            self._message_store.has_messages_above
+            if above
+            else self._message_store.has_messages_below
+        ):
+            return 0
+        generation = self._transcript_generation
         try:
             chat = self.query_one("#chat", VerticalScroll)
-        except NoMatches:
-            logger.debug("Skipping hydration: #chat not found")
-            return
-
-        try:
             messages_container = self.query_one("#messages", Container)
         except NoMatches:
-            logger.debug("Skipping hydration: #messages not found")
-            return
+            logger.debug("Skipping hydration: chat/messages container not found")
+            return 0
         await self._ensure_transcript_spacers(messages_container)
 
-        to_hydrate = self._message_store.get_messages_to_hydrate()
+        to_hydrate = (
+            self._message_store.get_messages_to_hydrate(count)
+            if above
+            else self._message_store.get_messages_to_hydrate_below(count)
+        )
         if not to_hydrate:
-            return
+            return 0
 
         old_scroll_y = chat.scroll_y
-        first_child = self._first_transcript_child(messages_container)
+        rows = reversed(to_hydrate) if above else iter(to_hydrate)
+        entries = [self._build_hydration_entry(data) for data in rows]
+        if above:
+            entries.reverse()
+        if not await self._mount_hydration_batch(
+            messages_container,
+            entries,
+            before=(
+                self._first_transcript_child(messages_container) if above else None
+            ),
+            generation=generation,
+        ):
+            return 0
 
-        # Mount from the window edge outward (newest archived first), each
-        # inserted before the running `first_child` so the DOM stays
-        # chronological. Stop at the first failure: `mark_hydrated` advances
-        # `_visible_start` by a plain count, so the mounted rows must remain a
-        # contiguous block adjacent to the window or the store desyncs from the
-        # DOM.
-        hydrated_count = 0
-        for msg_data in reversed(to_hydrate):
-            try:
-                widget = msg_data.to_widget()
-                footer = self._build_message_timestamp_footer(
-                    msg_data, visible=self._message_timestamps_visible
-                )
-                nodes: list[Widget] = [widget]
-                if footer is not None:
-                    nodes.append(footer)
-                await self._mount_transcript_nodes(
-                    messages_container,
-                    nodes,
-                    before=first_child,
-                )
-                first_child = widget
-                hydrated_count += 1
-                self._schedule_message_height_measurement(msg_data.id)
-                # Render Markdown content for hydrated assistant messages
-                if isinstance(widget, AssistantMessage) and msg_data.content:
-                    await widget.set_content(msg_data.content)
-            except Exception:
-                logger.warning(
-                    "Failed to hydrate message %s above window; stopping to "
-                    "keep the mounted window contiguous",
-                    msg_data.id,
-                    exc_info=True,
-                )
-                self._notify_hydration_failure()
-                break
-
-        if hydrated_count > 0:
-            self._message_store.mark_hydrated(hydrated_count)
-            await self._prune_messages_below_window(messages_container)
-            self._sync_transcript_spacers(messages_container)
-
-        # The top spacer already shrank by the hydrated rows' estimated height
-        # (via `_sync_transcript_spacers` above) while real widgets filled the
-        # freed space, so total content above the viewport is unchanged and the
-        # anchor holds without adjusting scroll_y. (Mirrors _hydrate_below.)
-        chat.scroll_y = old_scroll_y
-
-        # Collapse any completed tool runs brought in above the window so
-        # hydrated history matches the live transcript.
-        await self._regroup_completed_tools()
-        if hydrated_count > 0:
-            # Re-check after layout because a boundary scroll cannot emit
-            # another `Scrolled` message while its offset remains unchanged.
-            self.call_after_refresh(self._check_hydration_needed)
-
-    async def _hydrate_messages_below(self) -> None:
-        """Hydrate newer messages when scrolling down toward the tail."""
-        if not self._message_store.has_messages_below:
-            return
-        try:
-            chat = self.query_one("#chat", VerticalScroll)
-            messages_container = self.query_one("#messages", Container)
-        except NoMatches:
-            logger.debug("Skipping hydrate below: chat/messages container not found")
-            return
-        await self._ensure_transcript_spacers(messages_container)
-
-        to_hydrate = self._message_store.get_messages_to_hydrate_below()
-        if not to_hydrate:
-            return
-
-        old_scroll_y = chat.scroll_y
-        hydrated_count = 0
-        # Mount in order from the window edge downward, stopping at the first
-        # failure so `mark_hydrated_below`'s count stays contiguous with the
-        # mounted rows (a mid-batch gap would desync `_visible_end`).
-        for msg_data in to_hydrate:
-            try:
-                widget = msg_data.to_widget()
-                footer = self._build_message_timestamp_footer(
-                    msg_data, visible=self._message_timestamps_visible
-                )
-                nodes = [widget]
-                if footer is not None:
-                    nodes.append(footer)
-                await self._mount_transcript_nodes(messages_container, nodes)
-                hydrated_count += 1
-                self._schedule_message_height_measurement(msg_data.id)
-                if isinstance(widget, AssistantMessage) and msg_data.content:
-                    await widget.set_content(msg_data.content)
-            except Exception:
-                logger.warning(
-                    "Failed to hydrate message %s below window; stopping to "
-                    "keep the mounted window contiguous",
-                    msg_data.id,
-                    exc_info=True,
-                )
-                self._notify_hydration_failure()
-                break
-
-        if hydrated_count == 0:
-            return
-
-        self._message_store.mark_hydrated_below(hydrated_count)
-        await self._prune_old_messages()
+        hydrated_ids = [data.id for _widget, data, _footer in entries]
+        if above:
+            self._message_store.mark_hydrated(len(entries))
+        else:
+            self._message_store.mark_hydrated_below(len(entries))
+        self._schedule_message_height_measurements(hydrated_ids)
         self._sync_transcript_spacers(messages_container)
+        self._schedule_transcript_prune("below" if above else "above")
         chat.scroll_y = old_scroll_y
         await self._regroup_completed_tools()
-        # Re-check after layout because a boundary scroll cannot emit another
-        # `Scrolled` message while its offset remains unchanged.
-        self.call_after_refresh(self._check_hydration_below_needed)
+        return len(entries)
+
+    def _schedule_transcript_prune(
+        self,
+        direction: Literal["above", "below"],
+        *,
+        immediate: bool = False,
+    ) -> None:
+        """Debounce opposite-edge pruning until scrolling or hydration settles."""
+        self._transcript_prune_direction = direction
+        if self._transcript_prune_running:
+            return
+        if not self._message_store.window_exceeded():
+            if self._transcript_prune_timer is not None:
+                self._transcript_prune_timer.stop()
+                self._transcript_prune_timer = None
+            return
+
+        if self._transcript_prune_timer is not None:
+            self._transcript_prune_timer.stop()
+        delay = (
+            0.001 if immediate or self._message_store.hard_window_exceeded() else 0.2
+        )
+        self._transcript_prune_timer = self.set_timer(
+            delay, self._run_transcript_prune_slice
+        )
+
+    async def _run_transcript_prune_slice(self) -> None:
+        """Remove one small opposite-edge batch after the transcript goes idle."""
+        self._transcript_prune_timer = None
+        if self._transcript_prune_running:
+            return
+        excess = self._message_store.visible_count - self._message_store.WINDOW_SIZE
+        if excess <= 0:
+            return
+
+        self._transcript_prune_running = True
+        try:
+            count = min(excess, self._message_store.HYDRATE_BUFFER)
+            pruned = await self._prune_messages(
+                self._transcript_prune_direction, count=count
+            )
+        finally:
+            self._transcript_prune_running = False
+
+        if pruned and self._message_store.window_exceeded():
+            direction = self._transcript_prune_direction
+            self.call_after_refresh(
+                lambda: self._schedule_transcript_prune(direction, immediate=True)
+            )
 
     async def _mount_before_queued(self, container: Container, widget: Widget) -> None:
         """Mount a widget in the messages container, kept above the bottom anchors.
@@ -8056,7 +8898,10 @@ class DeepAgentsApp(App):
 
         if not container.query(f"#{_MESSAGE_TOP_SPACER_ID}"):
             top = Static("", id=_MESSAGE_TOP_SPACER_ID, classes=_MESSAGE_SPACER_CLASS)
-            first = container.children[0] if container.children else None
+            first = next(
+                (child for child in container.children if child.parent is container),
+                None,
+            )
             if first is None:
                 await container.mount(top)
             else:
@@ -8104,24 +8949,31 @@ class DeepAgentsApp(App):
             self._message_store.range_height(end, self._message_store.total_count),
         )
 
-    def _schedule_message_height_measurement(self, message_id: str) -> None:
-        """Measure a message after Textual lays it out."""
-        self.call_after_refresh(self._measure_message_height, message_id)
+    def _schedule_message_height_measurements(self, message_ids: list[str]) -> None:
+        """Measure a mounted batch in one post-layout spacer update."""
+        if message_ids:
+            self.call_after_refresh(self._measure_message_heights, tuple(message_ids))
 
-    def _measure_message_height(self, message_id: str) -> None:
-        """Cache the mounted row height for spacer estimates."""
+    def _measure_message_heights(self, message_ids: tuple[str, ...]) -> None:
+        """Cache mounted row heights and update virtual spacers once."""
         try:
             messages = self.query_one("#messages", Container)
-            widget = messages.query_one(f"#{message_id}")
         except NoMatches:
             return
-        height = max(1, widget.region.height)
-        footer_id = _message_timestamp_footer_id(message_id)
-        with suppress(NoMatches):
-            footer = messages.query_one(f"#{footer_id}")
-            if footer.display:
-                height += max(1, footer.region.height)
-        if self._message_store.set_height_hint(message_id, height):
+        changed = False
+        for message_id in message_ids:
+            try:
+                widget = messages.query_one(f"#{message_id}")
+            except NoMatches:
+                continue
+            height = max(1, widget.region.height)
+            footer_id = _message_timestamp_footer_id(message_id)
+            with suppress(NoMatches):
+                footer = messages.query_one(f"#{footer_id}")
+                if footer.display:
+                    height += max(1, footer.region.height)
+            changed = self._message_store.set_height_hint(message_id, height) or changed
+        if changed:
             self._sync_transcript_spacers(messages)
 
     async def _mount_transient_app_message(self, content: str) -> AppMessage | None:
@@ -8184,9 +9036,15 @@ class DeepAgentsApp(App):
         logged and swallowed because the OSC background sync is cosmetic.
 
         ANSI themes intentionally skip this step so the terminal's native
-        background is preserved.
+        background is preserved. This method also skips Apple Terminal, which
+        sets `TERM_PROGRAM` to `Apple_Terminal`. Apple Terminal applies the
+        `OSC 11` background but does not restore the original background on
+        `OSC 111`.
         """
         if self.theme in {"ansi-dark", "ansi-light"}:
+            return
+        # Apple Terminal applies OSC 11 but will not restore it with OSC 111.
+        if os.environ.get("TERM_PROGRAM", "").strip() == "Apple_Terminal":
             return
 
         from deepagents_code.terminal_escape import set_terminal_background
@@ -8346,7 +9204,7 @@ class DeepAgentsApp(App):
 
         is_auto_fallback = any(
             isinstance(request.get("description"), str)
-            and request["description"].startswith("Auto human fallback ")
+            and request["description"].startswith("Auto human fallback")
             for request in action_requests or []
         )
         if settings.shell_allow_list and action_requests and not is_auto_fallback:
@@ -8408,6 +9266,7 @@ class DeepAgentsApp(App):
             assistant_id,
             id=unique_id,
             auto_mode_eligible=self._auto_mode_eligible,
+            show_diff_line_numbers=self._show_diff_line_numbers,
         )
         menu.set_future(result_future)
 
@@ -8555,6 +9414,37 @@ class DeepAgentsApp(App):
         self._session_state.approval_mode_key = live_key
         return True
 
+    async def _persist_startup_approval_mode(self, mode: ApprovalMode) -> None:
+        """Persist a safe app-selected mode for the next bare launch.
+
+        YOLO returns before any await, so callers that must warn before
+        suspending are unaffected when they select it.
+
+        Args:
+            mode: Mode the user just selected.
+        """
+        from deepagents_code.approval_mode import ApprovalMode
+        from deepagents_code.model_config import save_recent_startup_mode
+
+        if mode is ApprovalMode.YOLO:
+            return
+        if mode.value == self._persisted_startup_mode:
+            # Two entry points can activate Auto from one confirmation modal
+            # (the awaiting caller and the task the modal result schedules), so
+            # skip the duplicate round-trip. Without this, a read-only config
+            # directory reports the same failure twice as two distinct toasts.
+            return
+        if not await asyncio.to_thread(save_recent_startup_mode, mode.value):
+            self.notify(
+                "Approval mode changed for this session, but the startup "
+                "preference could not be saved. Check permissions for "
+                "~/.deepagents/.",
+                severity="warning",
+                markup=False,
+            )
+            return
+        self._persisted_startup_mode = mode.value
+
     def _warn_live_approval_mode_unavailable(self, message: str) -> None:
         """Surface live approval-mode degradation to the user."""
         self.notify(message, severity="warning", timeout=8, markup=False)
@@ -8585,9 +9475,9 @@ class DeepAgentsApp(App):
         Deliberately synchronous. Callers warn *before* awaiting anything, so
         that a cancellation or a raise downstream can never land between "YOLO
         is live" and "the user was told". Offloading the small config read to
-        a thread (as `_show_notification_settings` does) would reopen exactly
-        that window. An unreadable or malformed config fails open: when
-        suppression cannot be determined, the warning still fires.
+        a thread (as the notification hub's settings load does) would reopen
+        exactly that window. An unreadable or malformed config fails open:
+        when suppression cannot be determined, the warning still fires.
 
         Args:
             timeout: Seconds the toast stays on screen.
@@ -8612,109 +9502,70 @@ class DeepAgentsApp(App):
             markup=False,
         )
 
-    def _notify_auto_mode_enabled_once(self) -> None:
-        """Show the Auto first-enable modal at most once per install.
-
-        Auto is already active when this runs. Enter keeps Auto and records the
-        notice; Esc (or a non-true dismiss) reverts to Manual without saving so
-        the notice can appear again. Save is best-effort on accept so a failed
-        write only re-shows on a later successful enable path.
-        """
-        from deepagents_code.approval_mode import (
-            has_auto_mode_notice,
-            save_auto_mode_notice,
-        )
-        from deepagents_code.tui.widgets.auto_mode_notice import AutoModeNoticeScreen
-
-        if has_auto_mode_notice() or getattr(self, "_auto_mode_notice_pending", False):
-            return
-
-        def handle_result(accepted: bool | None) -> None:
-            self._auto_mode_notice_pending = False
-            # Only an explicit continue persists "do not show again". Esc/None
-            # invert Auto back to Manual without recording the notice.
-            if accepted is True:
-                save_auto_mode_notice()
-                return
-            # `push_screen` callbacks are sync; schedule the Manual revert.
-            task = asyncio.create_task(self._revert_auto_mode_after_notice_cancel())
-            task.add_done_callback(_log_task_exception)
-
-        try:
-            self.push_screen(
-                AutoModeNoticeScreen(),
-                handle_result,
-            )
-        except Exception:
-            # Cosmetic notice must never break an already-applied Auto enable.
-            logger.warning("Could not show Auto first-enable notice", exc_info=True)
-            return
-
-        # Mark pending only after the push succeeds so a failed push can't
-        # strand the guard True and suppress the notice for the whole session.
-        self._auto_mode_notice_pending = True
-
-    async def _revert_auto_mode_after_notice_cancel(self) -> None:
-        """Leave Auto after the first-enable modal is cancelled with Esc.
-
-        Best-effort live Store write mirrors the Manual toggle path: local TUI
-        state always returns to Manual; a failed live write warns and blocks new
-        runs when a live session was already writing approval mode.
-        """
-        from deepagents_code.approval_mode import ApprovalMode
-
-        # Already left Auto (e.g. a concurrent toggle) — nothing to undo.
-        if self._approval_mode is not ApprovalMode.AUTO:
-            return
-
-        should_persist_live = (
-            self._agent is not None and self._session_state is not None
-        )
-        if should_persist_live and not await self._write_live_approval_mode(
-            ApprovalMode.MANUAL
-        ):
-            self._approval_mode_blocked = True
-            self._warn_live_approval_mode_unavailable(
-                "Manual could not be persisted after declining Auto; active work "
-                "was cancelled and new runs are blocked."
-            )
-            if self._agent_running:
-                self._force_interrupt_active_work()
-            # Still flip the UI so the user is not left trusting a declined Auto.
-            self._approval_mode = ApprovalMode.MANUAL
-            self._auto_approve = False
-            if self._session_state:
-                self._session_state.approval_mode = ApprovalMode.MANUAL
-            if self._status_bar:
-                self._status_bar.set_approval_mode(ApprovalMode.MANUAL.value)
-            return
-
-        self._approval_mode_blocked = False
-        self._approval_mode = ApprovalMode.MANUAL
-        self._auto_approve = False
-        if self._session_state:
-            self._session_state.approval_mode = ApprovalMode.MANUAL
-        if self._status_bar:
-            self._status_bar.set_approval_mode(ApprovalMode.MANUAL.value)
-        self.notify(
-            "Returned to Manual approval.",
-            severity="information",
-            markup=False,
-        )
-
     async def _on_auto_approve_enabled(self) -> bool:
         """Enable Auto only after the live Store acknowledges it.
+
+        Shows the first-enable confirmation modal before activating Auto when
+        the notice has not been shown yet. If the user cancels (Esc), returns
+        `False` so the inline approval loop continues asking.
 
         Returns:
             `True` when Auto is active for subsequent actions.
         """
-        from deepagents_code.approval_mode import ApprovalMode
+        from deepagents_code.approval_mode import (
+            ApprovalMode,
+            has_auto_mode_notice,
+            save_auto_mode_notice,
+        )
+        from deepagents_code.tui.widgets.auto_mode_notice import AutoModeNoticeScreen
 
         if not self._auto_mode_eligible:
             self._warn_live_approval_mode_unavailable(
                 "Auto is unavailable with a sandbox."
             )
             return False
+
+        if not has_auto_mode_notice():
+            pending: asyncio.Future[bool] | None = getattr(
+                self, "_auto_mode_confirmation_future", None
+            )
+            if pending is not None and not pending.done():
+                # Another entry point already pushed the modal — await its result
+                # rather than bypassing the confirmation.
+                confirmed = await pending
+                if not confirmed:
+                    return False
+            else:
+                # Pre-confirmation: show modal before activating Auto
+                loop = asyncio.get_running_loop()
+                future: asyncio.Future[bool] = loop.create_future()
+                self._auto_mode_confirmation_future = future
+
+                def handle_result(accepted: bool | None) -> None:
+                    self._auto_mode_notice_pending = False
+                    if not future.done():
+                        future.set_result(accepted is True)
+
+                try:
+                    self.push_screen(
+                        AutoModeNoticeScreen(
+                            model_label=self._auto_classifier_review_model_spec(),
+                            distinct_from_main_model=self._auto_classifier_is_distinct(),
+                        ),
+                        handle_result,
+                    )
+                except Exception:
+                    logger.warning("Could not show Auto confirmation", exc_info=True)
+                    self._auto_mode_confirmation_future = None
+                    return False
+                self._auto_mode_notice_pending = True
+
+                confirmed = await future
+                self._auto_mode_confirmation_future = None
+                if not confirmed:
+                    return False
+                save_auto_mode_notice()
+
         if not await self._write_live_approval_mode(ApprovalMode.AUTO):
             self._warn_live_approval_mode_unavailable(
                 "Auto could not be persisted; this approval remains pending in Manual."
@@ -8726,12 +9577,20 @@ class DeepAgentsApp(App):
             self._status_bar.set_approval_mode(ApprovalMode.AUTO.value)
         if self._session_state:
             self._session_state.approval_mode = ApprovalMode.AUTO
-        self._notify_auto_mode_enabled_once()
+        # Notify before the awaits below. State is already committed above, so
+        # the classifier notice must be attempted before a suspension point that
+        # can raise or be cancelled.
+        self._notify_auto_classifier_active()
+        await self._persist_startup_approval_mode(ApprovalMode.AUTO)
         await self._auto_accept_pending_goal_rubric()
         return True
 
     async def _switch_to_manual_from_fallback(self) -> bool:
         """Persist Manual before asking again about a fallback action.
+
+        Manual also becomes the next launch's startup mode, replacing a stored
+        Auto. The user chose Manual at this prompt, so the preference follows
+        the choice.
 
         Returns:
             `True` when Manual is active.
@@ -8753,6 +9612,7 @@ class DeepAgentsApp(App):
             self._session_state.approval_mode = ApprovalMode.MANUAL
         if self._status_bar:
             self._status_bar.set_approval_mode(ApprovalMode.MANUAL.value)
+        await self._persist_startup_approval_mode(ApprovalMode.MANUAL)
         return True
 
     async def _remove_inline_prompt_widget(  # noqa: PLR6301  # Shared inline-prompt cleanup; kept an instance method for handler symmetry
@@ -9213,6 +10073,8 @@ class DeepAgentsApp(App):
                         ),
                     )
                     return
+                if start_cause is SessionStartCause.RESUME:
+                    await self._restore_resumed_context_tokens()
 
             if not await self._run_session_start_hook(start_cause):
                 self._initial_session_start_stopped = True
@@ -9224,6 +10086,9 @@ class DeepAgentsApp(App):
                 # One-shot: clear to avoid re-running on any subsequent server swap.
                 self._startup_cmd = None
                 await self._run_startup_command(cmd)
+
+            if start_cause is SessionStartCause.RESUME:
+                await self._maybe_compact_after_resume()
 
             if should_load_history:
                 await self._remount_pending_goal_rubric_review()
@@ -9444,7 +10309,7 @@ class DeepAgentsApp(App):
                     ),
                 )
 
-    def _push_screen_result_future(
+    def _push_screen_result_future[ScreenResultT](
         self,
         screen: ModalScreen[ScreenResultT],
     ) -> asyncio.Future[ScreenResultT | None]:
@@ -9614,7 +10479,7 @@ class DeepAgentsApp(App):
         self.push_screen(screen, handle_result)
         return result_future
 
-    async def _push_screen_wait(
+    async def _push_screen_wait[ScreenResultT](
         self,
         screen: ModalScreen[ScreenResultT],
     ) -> ScreenResultT | None:
@@ -9831,6 +10696,7 @@ class DeepAgentsApp(App):
                 allow_empty_submit=True,
                 input_placeholder="Tavily API key (optional)",
                 submit_label="Enter save/skip",
+                show_cancel_hint=False,
             )
         )
         if result is not AuthResult.SAVED:
@@ -10049,6 +10915,7 @@ class DeepAgentsApp(App):
         from deepagents_code.command_registry import (
             BYPASS_WHEN_CONNECTING,
             IMMEDIATE_UI,
+            IMMEDIATE_UI_ARG_FORMS,
             SIDE_EFFECT_FREE,
             STARTUP_RECOVERY_COMMANDS,
         )
@@ -10076,12 +10943,508 @@ class DeepAgentsApp(App):
                 or self._modal_command_running()
             )
         if cmd in IMMEDIATE_UI:
-            # Only bare form (no args) bypasses — the selector-opening form is
-            # safe, but an argument form does a direct action that shouldn't
-            # race the agent (e.g. `/model <name>` switches models, `/threads
-            # -r <id>` resumes a thread).
-            return value == cmd
+            # Only UI-opening forms bypass: the bare command, or an argument
+            # form whitelisted in IMMEDIATE_UI_ARG_FORMS (e.g. `/auto model`,
+            # which opens the classifier picker). Other argument forms do a
+            # direct action that shouldn't race the agent (e.g. `/model <name>`
+            # switches models, `/threads -r <id>` resumes a thread,
+            # `/auto model <spec>` mutates classifier state). Whitespace is
+            # canonicalized for the whitelist check because `_handle_command`
+            # strips and reparses the same way — `/auto  model` (double space,
+            # tab) reaches the selector branch once processed.
+            return value == cmd or " ".join(value.split()) in IMMEDIATE_UI_ARG_FORMS
         return cmd in SIDE_EFFECT_FREE
+
+    async def _cold_cache_warning_for(
+        self,
+        message: QueuedMessage,
+    ) -> ColdCacheWarning | None:
+        """Build a warning when an interactive turn may miss a material cache.
+
+        Returns:
+            Validated warning data, or `None` when dispatch should proceed.
+        """
+        from deepagents_code._env_vars import DEBUG_COLD_CACHE, is_env_truthy
+
+        debug_forced = is_env_truthy(DEBUG_COLD_CACHE)
+        threshold = self._cold_cache_warning_threshold_usd
+        model_spec = self._effective_model_spec() or ""
+        timestamp_value = self._last_model_request_at
+        context_tokens = self._context_tokens
+        # Cheap structural skips first; these are the overwhelmingly common
+        # path (every slash command, every ACP prompt) and warrant no logging.
+        if (
+            message.mode != "normal"
+            or message.origin != "interactive"
+            or not model_spec
+            or (self._cold_cache_suppressed_for_session and not debug_forced)
+        ):
+            return None
+        # Each remaining skip is a decision to spend without asking, so each
+        # says why. Silence here was previously indistinguishable from the
+        # feature working correctly.
+        if not debug_forced and threshold <= 0:
+            logger.debug(
+                "Skipping cold-cache warning: threshold %.4f disables the warning",
+                threshold,
+            )
+            return None
+        if not debug_forced and context_tokens <= 0:
+            logger.debug(
+                "Skipping cold-cache warning: no context tokens recorded yet",
+            )
+            return None
+
+        last_spec = self._last_cache_model_spec
+        last_params = self._last_cache_model_params
+        last_endpoint = self._last_cache_endpoint
+
+        def _evaluate() -> ColdCacheWarning | None:
+            from datetime import UTC, datetime
+
+            from deepagents_code.cold_cache import (
+                COLD_CACHE_WARNING_KEY,
+                ColdCacheWarning,
+                RewarmEstimate,
+                cache_identity_params,
+                debug_stand_in_policy,
+                endpoint_cache_identity,
+                estimate_rewarm_cost,
+                load_trusted_cache_endpoints,
+                parse_cache_timestamp,
+                resolve_prompt_cache_policy,
+            )
+            from deepagents_code.model_config import (
+                ModelConfig,
+                is_warning_suppressed,
+            )
+
+            # Normalized to match `resolve_prompt_cache_policy`, which lowers
+            # the provider before matching. `get_base_url` does exact-key
+            # lookups against lowercase keys, so an unnormalized
+            # `Anthropic:claude-opus-5` would report no custom endpoint and
+            # price a gateway user at official-API rates.
+            provider = model_spec.split(":", 1)[0].strip().lower()
+            config = ModelConfig.load()
+            _, _, model_name = model_spec.partition(":")
+            configured_params = config.get_effective_kwargs(
+                provider,
+                model_name=model_name,
+                overrides=self._model_params_override,
+            )
+            # Test doubles and third-party config implementations created
+            # before `get_effective_kwargs` existed may not implement it.
+            # Retain the old endpoint-only behavior for those objects while
+            # production `ModelConfig` always supplies the complete mapping.
+            current_params = (
+                configured_params if isinstance(configured_params, dict) else {}
+            )
+            if not current_params:
+                current_params = dict(self._model_params_override or {})
+                fallback_base_url = config.get_base_url(provider)
+                if isinstance(fallback_base_url, str):
+                    current_params["base_url"] = fallback_base_url
+            # Endpoint changes have their own normalized identity. Keeping
+            # `base_url` out of this mapping avoids treating the same endpoint
+            # as two independent identity changes.
+            params_for_policy = {
+                key: value for key, value in current_params.items() if key != "base_url"
+            } or None
+            resolved_base_url = current_params.get("base_url")
+            base_url = resolved_base_url if isinstance(resolved_base_url, str) else None
+            endpoint = endpoint_cache_identity(base_url)
+            policy = resolve_prompt_cache_policy(
+                model_spec,
+                params_for_policy,
+                base_url=base_url,
+                # Only consulted for a custom endpoint: with no `base_url`,
+                # `_official_endpoint` short-circuits to `True` and the trust
+                # set is provably unused. Loading it eagerly would re-read and
+                # re-parse `config.toml` from disk on every turn of the common
+                # official-API path, which is the very cost the comment below
+                # is about.
+                trusted_endpoints=load_trusted_cache_endpoints() if base_url else None,
+            )
+            # Resolved before the suppression lookup so the common
+            # no-policy case skips re-reading and re-parsing config.toml.
+            if policy is None and not debug_forced:
+                logger.debug(
+                    "Skipping cold-cache warning: no documented cache policy "
+                    "for %s (custom base URL: %s)",
+                    model_spec,
+                    base_url is not None,
+                )
+                return None
+            # `debug_forced` bypasses persistent suppression too, so the env
+            # var stays a true override rather than silently no-opping for
+            # anyone who once chose "Send and never warn again".
+            if not debug_forced and is_warning_suppressed(COLD_CACHE_WARNING_KEY):
+                return None
+            if debug_forced:
+                if policy is None:
+                    policy = debug_stand_in_policy()
+                tokens = max(context_tokens, policy.minimum_tokens)
+                estimate = estimate_rewarm_cost(tokens, model_spec, policy)
+                if estimate is None:
+                    estimate = RewarmEstimate(
+                        cold_cost_usd=0.0,
+                        incremental_cost_usd=0.0,
+                    )
+                return ColdCacheWarning(
+                    policy=policy,
+                    estimate=estimate,
+                    context_tokens=tokens,
+                    age_seconds=float(policy.window_seconds) + 60,
+                    reason="idle",
+                )
+            if policy is None:
+                return None
+            if context_tokens < policy.minimum_tokens:
+                logger.debug(
+                    "Skipping cold-cache warning: %d context tokens is below "
+                    "%s's %d-token cache minimum",
+                    context_tokens,
+                    policy.provider_name,
+                    policy.minimum_tokens,
+                )
+                return None
+
+            # An unusable request time means the age cannot be computed, not
+            # that the cache is warm. Treat it as cold, matching how an
+            # unreadable model spec is treated as a model change -- both are
+            # "checkpoint state we cannot trust", and assuming warm is the one
+            # assumption that silently bills the user. This is the normal state
+            # for a thread checkpointed before cold-cache tracking existed; it
+            # self-heals once any model call re-checkpoints a fresh timestamp.
+            timestamp = parse_cache_timestamp(timestamp_value)
+            age_seconds: float | None = None
+            elapsed = (
+                None
+                if timestamp is None
+                else (datetime.now(UTC) - timestamp).total_seconds()
+            )
+            if timestamp is None:
+                reason: ColdCacheReason = "age_unknown"
+                logger.debug(
+                    "Cold-cache warning: no usable model-request time (%s); "
+                    "treating the cache as cold",
+                    type(timestamp_value).__name__,
+                )
+            elif elapsed is not None and elapsed < 0:
+                # A request time in the future (clock correction, a thread
+                # synced from a skewed machine) is as untrustworthy as an
+                # unparseable one. Clamping it to zero instead would read as
+                # maximally warm and suppress the warning outright, which is
+                # the one reading that silently bills the user.
+                reason = "age_unknown"
+                logger.warning(
+                    "Checkpointed model-request time is %.0fs in the future "
+                    "(clock skew?); treating the cache age as unknown",
+                    -elapsed,
+                )
+            else:
+                age_seconds = max(elapsed or 0.0, 0.0)
+                if (
+                    model_spec != last_spec
+                    # Only cache-participating params are compared: `/effort`
+                    # and friends rewrite `model_params` without touching the
+                    # prefix, and must not read as a cache identity change.
+                    or cache_identity_params(current_params)
+                    != cache_identity_params(last_params)
+                    # `None` means no endpoint was ever recorded -- e.g. a
+                    # thread checkpointed before this field existed, or one
+                    # whose stored value was unreadable and discarded on load.
+                    # Treating "unrecorded" as "changed" would fire a spurious
+                    # warning on the first turn of each such thread, so only a
+                    # recorded value that actually differs counts.
+                    or (last_endpoint is not None and endpoint != last_endpoint)
+                ):
+                    reason = "identity_changed"
+                elif age_seconds > policy.window_seconds:
+                    reason = "idle"
+                else:
+                    return None
+            estimate = estimate_rewarm_cost(context_tokens, model_spec, policy)
+            if estimate is None:
+                logger.debug(
+                    "Skipping cold-cache warning: no price available for %s",
+                    model_spec,
+                )
+                return None
+            if estimate.incremental_cost_usd <= 0 < estimate.cold_cost_usd:
+                # A priced cold request with a zero delta means the catalog
+                # published no cache-read rate, so `estimate_cost` left those
+                # tokens in the ordinary input total and warm == cold. That is
+                # missing pricing data, not a genuinely free re-warm -- report
+                # it as such instead of letting it read as "below threshold".
+                logger.warning(
+                    "Skipping cold-cache warning: %s has no cache-read rate in "
+                    "the pricing catalog, so the warm/cold delta cannot be "
+                    "computed",
+                    model_spec,
+                )
+                return None
+            if estimate.incremental_cost_usd < threshold:
+                logger.debug(
+                    "Skipping cold-cache warning: re-warm delta %.4f is below "
+                    "the %.4f threshold",
+                    estimate.incremental_cost_usd,
+                    threshold,
+                )
+                return None
+            return ColdCacheWarning(
+                policy=policy,
+                estimate=estimate,
+                context_tokens=context_tokens,
+                age_seconds=age_seconds,
+                reason=reason,
+            )
+
+        try:
+            return await asyncio.to_thread(_evaluate)
+        except Exception:
+            logger.warning(
+                "Could not evaluate the cold prompt-cache warning; sending normally",
+                exc_info=True,
+            )
+            # A failure here sends at full cold-cache price without asking, so
+            # it cannot stay in the log alone: the person paying is the one who
+            # needs to know the protection stopped working. Once per session,
+            # because a persistent cause (a corrupt config file, say) would
+            # otherwise toast on every single send.
+            self._notify_cold_cache_degraded_once()
+            return None
+
+    def _notify_cold_cache_degraded_once(self) -> None:
+        """Warn once per session that cold-cache checks are failing open."""
+        if self._cold_cache_degraded_notified:
+            return
+        self._cold_cache_degraded_notified = True
+        self.notify(
+            "Cold prompt-cache cost warnings are unavailable this session; "
+            "messages will send without a cost check. See the log for details.",
+            severity="warning",
+            timeout=8,
+            markup=False,
+        )
+
+    def _restore_cold_cache_draft(self, text: str) -> None:
+        """Restore a canceled cold-cache submission to an empty chat input."""
+        if (
+            self._chat_input
+            and not self._chat_input.value.strip()
+            and self._chat_input.set_value_at_end(text)
+        ):
+            self.call_after_refresh(self._chat_input.focus_input)
+            return
+        self.notify(
+            "Message canceled. Its text could not be restored to the chat "
+            "input, but pressing Up recalls it from history.",
+            severity="warning",
+            timeout=8,
+            markup=False,
+        )
+
+    async def _emit_cold_cache_warning_hook(
+        self,
+        warning: ColdCacheWarning,
+    ) -> None:
+        """Notify Hooks v2 before displaying a cold-cache confirmation.
+
+        The notification describes the potential cost without including the
+        queued prompt, which may contain sensitive user input. A hook may not
+        suppress the confirmation: the modal remains the user's decision.
+
+        Formats with `format_cost_estimate`, matching the modal: the figure is
+        a worst-case estimate, and `format_cost` would render the same number
+        exactly, so a hook consumer and the modal would disagree about one
+        value.
+        """
+        from deepagents_code.hooks.client_lifecycle import ClientHookStopError
+        from deepagents_code.hooks.models.domain import DcodeNotificationKind
+
+        try:
+            await self._hooks.notify(
+                DcodeNotificationKind.COLD_CACHE_WARNING,
+                "Prompt cache may be cold: re-warming this context could add "
+                f"{format_cost_estimate(warning.estimate.incremental_cost_usd)}.",
+                title="Warning: cache may be cold",
+            )
+        except ClientHookStopError:
+            logger.info("Cold-cache warning notification was stopped by a hook")
+
+    async def _confirm_cold_cache_message(
+        self,
+        message: QueuedMessage,
+        warning: ColdCacheWarning,
+        thread_id: str | None,
+    ) -> None:
+        """Resolve a detached cold-cache confirmation and continue safely.
+
+        Raises:
+            asyncio.CancelledError: When app shutdown cancels the continuation.
+        """
+        from deepagents_code.tui.modals.cold_cache import (
+            SEND_CHOICES,
+            ColdCacheChoice,
+            ColdCacheWarningScreen,
+        )
+
+        screen = ColdCacheWarningScreen(warning)
+        try:
+            # Watchdog-bounded like every other confirmation modal: this
+            # continuation holds the single `_schedule_off_message_pump` slot,
+            # so an await that never resolves (compose crash, programmatic
+            # teardown that skips the dismiss callback) would leave
+            # `_modal_command_running()` true forever and stop the pending
+            # queue from draining for the rest of the session.
+            choice = await asyncio.wait_for(
+                self._push_screen_wait(screen),
+                timeout=_MODAL_WATCHDOG_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            # Fail closed, matching the modal's documented contract: an
+            # abandoned confirmation must not become an affirmative
+            # authorization to spend.
+            logger.warning(
+                "Cold prompt-cache confirmation timed out; treating as cancel",
+            )
+            self._dismiss_orphaned_screen(screen)
+            self.notify(
+                "The cold prompt-cache prompt timed out, so the message was "
+                "not sent. Press Up to recall it.",
+                severity="warning",
+                timeout=8,
+                markup=False,
+            )
+            choice = ColdCacheChoice.CANCEL
+        except Exception:
+            # Same fail-closed contract for a modal that could not be shown at
+            # all. The draft is restored below, so nothing is dropped.
+            logger.exception("Failed to show the cold prompt-cache warning")
+            self._dismiss_orphaned_screen(screen)
+            self.notify(
+                "Could not show the cold prompt-cache warning, so the message "
+                "was not sent. Your draft has been restored.",
+                severity="warning",
+                timeout=8,
+                markup=False,
+            )
+            choice = ColdCacheChoice.CANCEL
+
+        if self._exiting:
+            # Intentionally dropped: there is nowhere to restore a draft to
+            # mid-shutdown. Logged so "my last message vanished when I quit"
+            # has an explanation.
+            logger.debug(
+                "Dropping a cold-cache-gated message because the app is exiting",
+            )
+            return
+        if self._lc_thread_id != thread_id:
+            # The draft is deliberately not restored: it belongs to the thread
+            # the user left, and dropping it into a different thread's input is
+            # its own surprise. Say so plainly -- "canceled" alone reads as
+            # deferred rather than discarded -- and point at history, where
+            # `ChatInput` recorded the text at submit time.
+            self.notify(
+                "Canceled a pending send because the active thread changed. "
+                "The message was not sent; press Up to recall its text.",
+                severity="warning",
+                timeout=8,
+                markup=False,
+            )
+            return
+        # `_schedule_off_message_pump` runs this outside the caller's
+        # `try/except`, so the dispatch below must mount its own failure
+        # message. Without it a post-authorization failure would reach only
+        # `_log_task_exception`, and a user who deliberately approved the spend
+        # would watch the message vanish with no error anywhere in the UI.
+        try:
+            # `None` (programmatic pop) is not a member, so it fails closed
+            # into the restore branch. Membership lives on the enum so a new
+            # variant does not silently become a send.
+            if choice in SEND_CHOICES:
+                if choice is ColdCacheChoice.SEND_SUPPRESS_SESSION:
+                    self._cold_cache_suppressed_for_session = True
+                elif choice is ColdCacheChoice.SEND_SUPPRESS_ALWAYS:
+                    await self._suppress_cold_cache_warning()
+                await self._process_message(message.text, message.mode)
+            else:
+                self._restore_cold_cache_draft(message.text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Cold-cache continuation failed after choice %r",
+                choice,
+            )
+            await self._mount_message(
+                ErrorMessage(f"Failed to process queued message: {message.text[:60]}"),
+            )
+
+    async def _suppress_cold_cache_warning(self) -> None:
+        """Persistently suppress the cold-cache warning in `config.toml`.
+
+        Used by the warning modal's "Send and never warn again" choice. The
+        setting can be reverted from the `/notifications` settings screen.
+        """
+        from deepagents_code.cold_cache import COLD_CACHE_WARNING_KEY
+        from deepagents_code.model_config import suppress_warning_reason
+
+        # Guarded like the `/notifications` settings persistence: this runs in
+        # a detached continuation ahead of `_process_message`, so an
+        # unexpected raise here would silently drop the submitted message.
+        try:
+            reason = await asyncio.to_thread(
+                suppress_warning_reason, COLD_CACHE_WARNING_KEY
+            )
+        except Exception:
+            logger.warning("Failed to persist cold-cache suppression", exc_info=True)
+            reason = "the config file could not be written"
+        if reason is None:
+            self.notify(
+                "Won't warn about cold prompt caches again. "
+                "Re-enable from /notifications.",
+                severity="information",
+                timeout=6,
+                markup=False,
+            )
+        else:
+            # Names the actual cause: a malformed `[warnings]` table and an
+            # unwritable file need different fixes, and a generic "check
+            # permissions" sends the first case to `chmod` a file that was
+            # never the problem.
+            self.notify(
+                f"Could not save notification preference: {reason}.",
+                severity="warning",
+                timeout=8,
+                markup=False,
+            )
+
+    async def _dispatch_queued_message(self, message: QueuedMessage) -> None:
+        """Dispatch one queue-head message, interposing an advisory warning."""
+        warning = await self._cold_cache_warning_for(message)
+        if warning is None:
+            await self._process_message(message.text, message.mode)
+            return
+        await self._emit_cold_cache_warning_hook(warning)
+        task = self._schedule_off_message_pump(
+            self._confirm_cold_cache_message(
+                message,
+                warning,
+                self._lc_thread_id,
+            ),
+            context="cold-cache:confirm",
+        )
+        if task is None:
+            # Admission failed because another continuation owns the modal
+            # slot, and `_schedule_off_message_pump` has already told the user
+            # to answer that prompt first. Sending anyway would bill the turn
+            # the warning exists to gate while that toast claims the action was
+            # blocked, so keep the draft and let them resend.
+            self._restore_cold_cache_draft(message.text)
 
     async def _submit_input(
         self,
@@ -10089,6 +11452,7 @@ class DeepAgentsApp(App):
         mode: InputMode,
         *,
         force_bypass: bool = False,
+        origin: SubmissionOrigin = "interactive",
     ) -> None:
         """Submit input, fast-pathing always-immediate commands.
 
@@ -10103,6 +11467,7 @@ class DeepAgentsApp(App):
                 immediately. External callers use this to mirror the
                 `ALWAYS_IMMEDIATE` fast path for commands they classify as
                 urgent.
+            origin: Submission source used by advisory warning policy.
         """
         if self._exiting:
             return
@@ -10129,6 +11494,13 @@ class DeepAgentsApp(App):
             await self._process_message(value, mode)
             return
 
+        # A second `/reload` must reach `_schedule_reload` immediately so it
+        # can coalesce with the in-flight reload instead of waiting in the
+        # normal queue and starting another destructive refresh afterward.
+        if mode == "command" and normalized == "/reload" and self._reloading:
+            await self._process_message(value, mode)
+            return
+
         # Prevent message handling while a thread switch is in-flight.
         if self._thread_switching:
             self.notify(
@@ -10149,6 +11521,7 @@ class DeepAgentsApp(App):
             or self._goal_state_mutating
             or self._shell_running
             or self._modal_command_running()
+            or self._reloading
             or self._connecting
             or self._startup_sequence_running
             or self._server_startup_error is not None
@@ -10156,7 +11529,9 @@ class DeepAgentsApp(App):
             if mode == "command" and self._can_bypass_queue(value.lower().strip()):
                 await self._process_message(value, mode)
                 return
-            self._pending_messages.append(QueuedMessage(text=value, mode=mode))
+            self._pending_messages.append(
+                QueuedMessage(text=value, mode=mode, origin=origin)
+            )
             queued_widget = QueuedUserMessage(value)
             self._queued_widgets.append(queued_widget)
             await self._mount_message(queued_widget)
@@ -10165,7 +11540,9 @@ class DeepAgentsApp(App):
                 self._reveal_connection_status()
             return
 
-        await self._process_message(value, mode)
+        await self._dispatch_queued_message(
+            QueuedMessage(text=value, mode=mode, origin=origin)
+        )
 
     async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         """Handle submitted input from ChatInput widget."""
@@ -10187,16 +11564,61 @@ class DeepAgentsApp(App):
 
         await self._submit_input(value, mode)
 
+    async def _restore_startup_tip_after_resume_fallback(self) -> None:
+        """Mount a startup tip when resume resolution starts a fresh session.
+
+        `compose` skips the tip whenever `-r` was passed, so a resume that falls
+        back to a fresh thread has to mount it after the fact. Every fallback
+        branch of `_resolve_resume_thread` clears `_initial_resume_requested`
+        before the `finally` block calls this, so a flag that is still set means
+        the resume succeeded and no tip is wanted.
+
+        An initial submission owns the fresh session's startup flow and
+        dismisses the tip before it is sent, so do not remount the tip while
+        that submission is pending.
+        """
+        if (
+            self._initial_resume_requested
+            or self._startup_tip_dismissed
+            or self._has_initial_submission()
+            or not show_startup_tip()
+            or self.query(StartupTip)
+        ):
+            return
+
+        # Only the lookups can raise `NoMatches`, and both widgets are composed
+        # unconditionally — a miss means the bottom chrome was restructured, not
+        # an expected transient state, so log it rather than vanishing silently.
+        try:
+            bottom = self.query_one("#bottom-app-container", _BottomChrome)
+            goal = self.query_one("#goal-status-panel", GoalStatusPanel)
+        except NoMatches:
+            logger.warning(
+                "Bottom chrome or goal panel missing; skipping startup tip restore"
+            )
+            return
+
+        # `mount` registers the widget synchronously before it suspends, so a
+        # dismissal landing during this await finds the tip and removes it
+        # itself — no post-mount re-check is needed.
+        await bottom.mount(StartupTip(id="startup-tip"), before=goal)
+
     async def _dismiss_startup_tip(self) -> None:
-        """Remove the startup tip once the first prompt is submitted.
+        """End the startup tip's lifetime: remove it, and block any remount.
 
         Called from both submission entry points: `_submit_input` (the shared
         interactive/external path) and `_submit_initial_submission` (the
         `-m`/`--skill`/`--goal` startup path, which submits without going
-        through `_submit_input`). Every submission path therefore dismisses
-        the tip. Subsequent calls are no-ops: the widget is already gone and
-        `query_one` raises `NoMatches`.
+        through `_submit_input`), plus `_show_initial_prompt_as_queued` when it
+        mounts the `-m` placeholder ahead of the real submission.
+
+        Latching `_startup_tip_dismissed` matters even when no tip is mounted:
+        under `-r` the tip is skipped in `compose`, and the flag is what stops
+        `_restore_startup_tip_after_resume_fallback` from mounting one after a
+        fallback. Repeat calls are idempotent — the flag is already set and
+        `query_one` raises `NoMatches` for the missing widget.
         """
+        self._startup_tip_dismissed = True
         with suppress(NoMatches):
             await self.query_one("#startup-tip", StartupTip).remove()
 
@@ -10217,7 +11639,12 @@ class DeepAgentsApp(App):
 
         mode: InputMode = "command" if external.kind == "command" else "normal"
         force_bypass = external.bypass is not BypassTier.QUEUED
-        await self._submit_input(external.payload, mode, force_bypass=force_bypass)
+        await self._submit_input(
+            external.payload,
+            mode,
+            force_bypass=force_bypass,
+            origin="external",
+        )
 
     async def _handle_external_signal(self, payload: str) -> None:
         """Dispatch an external signal payload to the corresponding action.
@@ -10374,7 +11801,7 @@ class DeepAgentsApp(App):
                         AppMessage(f"```text\n{output}\n```", markdown=True),
                     )
                 else:
-                    msg = AssistantMessage(f"```text\n{output}\n```")
+                    msg = AssistantMessage(f"```text\n{output}\n```", local_only=True)
                     await self._mount_message(msg)
                     await msg.write_initial_content()
             else:
@@ -10617,6 +12044,20 @@ class DeepAgentsApp(App):
         await self._mount_message(UserMessage(command))
         link = Content.styled(url, TStyle(dim=True, italic=True, link=url))
         await self._mount_message(AppMessage(link))
+
+    @staticmethod
+    def _thread_links_configured() -> bool:
+        """Return whether LangSmith thread links can be resolved."""
+        from deepagents_code.config import get_langsmith_project_name
+
+        try:
+            return get_langsmith_project_name() is not None
+        except Exception:
+            logger.debug(
+                "Could not determine whether LangSmith thread links are configured",
+                exc_info=True,
+            )
+            return False
 
     @staticmethod
     async def _build_thread_message(
@@ -11207,7 +12648,18 @@ class DeepAgentsApp(App):
             latest = latest_goal_state_notice(messages)
             latest_candidate = latest_goal_state_message_index(messages)
             fingerprint = goal_state_fingerprint(desired_state)
-            cutoff = _summarization_cutoff(state_values.get("_summarization_event"))
+            event = state_values.get("_summarization_event")
+            validated_cutoff = _validated_summarization_cutoff(
+                event,
+                message_count=len(messages),
+            )
+            if event is not None and validated_cutoff is None:
+                # Collapsing to 0 makes the `latest[0] >= cutoff` test below
+                # trivially true, so a stale notice counts as visible and the
+                # durable write is skipped. Silent here and loud in the middleware
+                # would make the two sides disagree for no visible reason.
+                _log_malformed_summarization_event(event, len(messages))
+            cutoff = validated_cutoff or 0
             if (
                 latest is not None
                 and latest[0] == latest_candidate
@@ -11495,12 +12947,27 @@ class DeepAgentsApp(App):
             context_tokens,
             model_spec,
             model_params,
+            cache_state=(
+                {
+                    "_last_model_request_at": state_values["_last_model_request_at"],
+                    "_last_cache_model_spec": state_values.get(
+                        "_last_cache_model_spec"
+                    ),
+                    "_last_cache_endpoint": state_values.get("_last_cache_endpoint"),
+                    "_last_cache_params": state_values.get("_last_cache_params"),
+                    "_model_spec": model_spec,
+                    "_model_params": model_params,
+                }
+                if "_last_model_request_at" in state_values
+                else None
+            ),
             session_cost_usd=session_cost_usd,
             rubric=_as_str(state_values.get("rubric")),
             sticky_rubric=_as_str(state_values.get("_sticky_rubric")),
             sticky_rubric_recorded="_sticky_rubric" in state_values,
             goal_objective=_as_str(state_values.get("_goal_objective")),
             goal_status=coerce_goal_status(state_values.get("_goal_status")),
+            goal_status_recorded="_goal_status" in state_values,
             goal_rubric=_as_str(state_values.get("_goal_rubric")),
             goal_status_note=_as_str(state_values.get("_goal_status_note")),
             pending_goal_completion_note=_as_str(
@@ -11529,7 +12996,7 @@ class DeepAgentsApp(App):
             ),
         )
 
-    def _restore_goal_rubric_state(
+    async def _restore_goal_rubric_state(
         self,
         payload: _ThreadHistoryPayload,
         *,
@@ -11549,7 +13016,25 @@ class DeepAgentsApp(App):
         # Wiring a persisted "satisfied" status into restore would reintroduce
         # stale auto-completion on resume/thread-switch.
         self._active_goal = payload.goal_objective
-        self._goal_status = payload.goal_status
+        status_unrecognized = (
+            payload.goal_objective is not None
+            and payload.goal_status is None
+            and payload.goal_status_recorded
+        )
+        if status_unrecognized:
+            # `coerce_goal_status` discarded a corrupt or forward-version status,
+            # leaving the objective without a usable status. Without a value the
+            # goal is stuck: the notice projects `paused` (so the model will not
+            # work it), but `_resume_goal` requires exactly `"paused"` to resume,
+            # so neither side can move it. Restore the same recoverable `paused`
+            # the notice shows, and persist it so the checkpoint itself becomes
+            # resumable and the two reads stop disagreeing. A checkpoint with no
+            # `_goal_status` channel at all is legacy, not corrupt: it keeps its
+            # implicit pre-status `active` (matching the notice) instead of
+            # being silently paused.
+            self._goal_status = "paused"
+        else:
+            self._goal_status = payload.goal_status
         self._goal_status_note = payload.goal_status_note
         self._pending_goal_completion_note = payload.pending_goal_completion_note
         if payload.goal_rubric:
@@ -11575,6 +13060,43 @@ class DeepAgentsApp(App):
             self._pending_goal_kind = "create"
         self._next_rubric = None
         self._sync_status_rubric()
+        if status_unrecognized:
+            # Write the coerced `paused` back so the raw value is replaced
+            # everywhere it is read from; on failure the in-memory status still
+            # makes `/goal resume` usable for this session, and the next restore
+            # retries the normalization.
+            await self._persist_goal_rubric_state()
+
+    def _active_goal_state_size_error(self) -> str | None:
+        """Return why restored active state cannot fit a safe model notice.
+
+        Returns:
+            A user-facing validation error, or `None` when active state is safe.
+        """
+        error = goal_notice_size_error(self._goal_state_update())
+        return str(error) if error is not None else None
+
+    def _next_rubric_size_error(self, criteria: str) -> str | None:
+        """Return why a one-shot rubric cannot fit the turn's notice budget.
+
+        The per-rubric limit alone is not sufficient: the turn notice embeds the
+        rubric alongside the actionable goal's objective and status note, and
+        `validate_goal_notice_text` rejects the combined text. Without this
+        check, `/rubric next` would accept criteria that the notice then drops,
+        silently disabling the promised one-shot grade.
+
+        Args:
+            criteria: Candidate next-turn rubric text.
+
+        Returns:
+            A user-facing validation error, or `None` when the combined notice
+            text is safe.
+        """
+        error = goal_notice_size_error(
+            self._goal_state_update(),
+            criteria_override=criteria,
+        )
+        return str(error) if error is not None else None
 
     async def _announce_goal_status_transition(
         self, previous_status: str | None
@@ -11923,7 +13445,7 @@ class DeepAgentsApp(App):
             # instead of re-listing all of them.
             payload = replace(payload, rubric=self._last_consumed_next_previous_rubric)
         previous_status = self._goal_status
-        self._restore_goal_rubric_state(
+        await self._restore_goal_rubric_state(
             payload,
             preserve_queued_application=True,
         )
@@ -12158,6 +13680,11 @@ class DeepAgentsApp(App):
 
         objective = remainder
         await self._mount_message(UserMessage(command))
+        try:
+            validate_goal_objective(objective)
+        except GoalStateSizeError as exc:
+            await self._mount_message(ErrorMessage(str(exc)))
+            return
         await self._start_goal_proposal(
             lambda: self._propose_goal_rubric(objective),
             cleanup_context="goal replacement cleanup",
@@ -12266,7 +13793,10 @@ class DeepAgentsApp(App):
             "Use /goal when you have a plain-language objective; dcode will "
             "draft a checklist for it. Once applied, the goal stays active for "
             "this thread until paused, completed, blocked, or cleared. "
-            "Follow-up prompts continue working toward that goal."
+            "Follow-up prompts continue working toward that goal.\n"
+            f"Objectives are limited to {GOAL_OBJECTIVE_CHAR_LIMIT:,} characters, "
+            f"and an objective plus its criteria to "
+            f"{GOAL_APPLICATION_CHAR_LIMIT:,}."
         )
 
     async def _show_goal_state(
@@ -12386,6 +13916,11 @@ class DeepAgentsApp(App):
                 )
             )
             return
+        try:
+            validate_goal_application(base_objective, base_criteria)
+        except GoalStateSizeError as exc:
+            await self._mount_message(ErrorMessage(str(exc)))
+            return
         await self._run_goal_criteria_request(
             {
                 "request_id": uuid.uuid4().hex,
@@ -12412,6 +13947,17 @@ class DeepAgentsApp(App):
         """
         if not objective.strip():
             await self._mount_message(AppMessage("Usage: /goal <objective>"))
+            return
+        try:
+            validate_goal_objective(objective)
+            # The criteria model counts raw characters, not escaped ones, and
+            # escaping can expand text fivefold. An objective whose escaped form
+            # already fills the notice leaves no criteria the model could return
+            # that acceptance would not reject, so refuse before spending the
+            # generation request.
+            validate_goal_objective_rendered(objective)
+        except GoalStateSizeError as exc:
+            await self._mount_message(ErrorMessage(str(exc)))
             return
         request: GoalCreateRequest = {
             "request_id": uuid.uuid4().hex,
@@ -12762,6 +14308,11 @@ class DeepAgentsApp(App):
         if not rubric:
             await self._mount_message(AppMessage("Cannot accept empty goal criteria."))
             return False
+        try:
+            validate_goal_application(objective, rubric)
+        except GoalStateSizeError as exc:
+            await self._mount_message(ErrorMessage(str(exc)))
+            return False
         kind = self._pending_goal_kind or "create"
         if kind == "amend" and (
             not self._active_goal or self._goal_status == "complete"
@@ -12911,6 +14462,7 @@ class DeepAgentsApp(App):
             elif not is_amendment and not self._agent_running:
                 await self._continue_created_goal_work(
                     application.objective,
+                    application.rubric,
                     persisted=persisted,
                 )
         return result
@@ -12918,6 +14470,7 @@ class DeepAgentsApp(App):
     async def _continue_created_goal_work(
         self,
         objective: str,
+        criteria: str | None,
         *,
         persisted: bool,
     ) -> None:
@@ -12928,6 +14481,7 @@ class DeepAgentsApp(App):
             await self._continue_goal_work(
                 "created",
                 unsaved_objective=objective,
+                unsaved_criteria=criteria,
             )
 
     async def _continue_goal_work(
@@ -12935,11 +14489,13 @@ class DeepAgentsApp(App):
         transition: Literal["amended", "resumed", "created"],
         *,
         unsaved_objective: str | None = None,
+        unsaved_criteria: str | None = None,
     ) -> None:
         """Send one hidden command that resumes work after a goal transition."""
         continuation = build_goal_continuation(
             transition,
             unsaved_objective=unsaved_objective,
+            unsaved_criteria=unsaved_criteria,
         )
         await self._send_to_agent(
             cast("str", continuation.content),
@@ -13008,6 +14564,25 @@ class DeepAgentsApp(App):
             await self._mount_message(
                 AppMessage(
                     "Goal is not paused. Use `/goal show` to inspect its current state."
+                )
+            )
+            return
+        try:
+            # Deliberately not routed through `notice_text_sections`, unlike its
+            # two siblings. The goal is still `paused` here, so projecting it would
+            # withhold the objective and status note — exactly the text the notice
+            # will embed once the resume lands. This validates the state as it will
+            # be *after* the transition, so the fields are read directly.
+            validate_goal_notice_text(
+                objective=self._active_goal,
+                criteria=self._active_rubric,
+                status_note=self._goal_status_note,
+            )
+        except GoalStateSizeError as exc:
+            await self._mount_message(
+                ErrorMessage(
+                    "This saved goal is too large to resume safely. Clear and "
+                    f"recreate it with a shorter objective and criteria. {exc}"
                 )
             )
             return
@@ -13118,6 +14693,11 @@ class DeepAgentsApp(App):
             if not arg:
                 await self._mount_message(AppMessage(self._rubric_set_usage_text()))
                 return
+            try:
+                validate_rubric(arg)
+            except GoalStateSizeError as exc:
+                await self._mount_message(ErrorMessage(str(exc)))
+                return
             async with self._goal_state_mutation_boundary():
                 previous_state = self._goal_state_update()
                 self._reset_goal_tracking()
@@ -13136,6 +14716,21 @@ class DeepAgentsApp(App):
             await self._mount_message(UserMessage(command))
             if not arg:
                 await self._mount_message(AppMessage(self._rubric_next_usage_text()))
+                return
+            try:
+                validate_rubric(arg)
+            except GoalStateSizeError as exc:
+                await self._mount_message(ErrorMessage(str(exc)))
+                return
+            size_error = self._next_rubric_size_error(arg)
+            if size_error is not None:
+                await self._mount_message(
+                    ErrorMessage(
+                        "This rubric cannot be applied to the next turn alongside "
+                        "the active goal. Shorten it, or clear the goal first. "
+                        f"{size_error}"
+                    )
+                )
                 return
             self._next_rubric = arg
             self._sync_status_rubric()
@@ -13196,6 +14791,7 @@ class DeepAgentsApp(App):
             "  /rubric max-iterations <N|clear>\n\n"
             "Use /rubric next for a one-turn quality gate. Use /rubric set "
             "when you want explicit acceptance criteria to persist across turns.\n"
+            f"Criteria are limited to {RUBRIC_CHAR_LIMIT:,} characters.\n"
             "Example: /rubric set tests pass; keep the diff minimal"
         )
 
@@ -13224,6 +14820,7 @@ class DeepAgentsApp(App):
         return (
             "Usage: /rubric file <path>\n\n"
             "Load acceptance criteria from a file (same as /rubric set).\n"
+            f"The file must hold at most {RUBRIC_CHAR_LIMIT:,} characters.\n"
             "Example: /rubric file ./rubric.md"
         )
 
@@ -13325,6 +14922,11 @@ class DeepAgentsApp(App):
                 ErrorMessage(f"Rubric file {str(path)!r} is empty.")
             )
             return
+        try:
+            validate_rubric(rubric)
+        except GoalStateSizeError as exc:
+            await self._mount_message(ErrorMessage(str(exc)))
+            return
         async with self._goal_state_mutation_boundary():
             previous_state = self._goal_state_update()
             self._reset_goal_tracking()
@@ -13399,6 +15001,11 @@ class DeepAgentsApp(App):
             cli_profile_override=self._profile_override,
             title=title,
             description=description,
+            # Grader models have no persistent config key yet, so there is
+            # nothing for Ctrl+S to own here. `None` disables it; the main-model
+            # scope would persist `[models].default` and retarget the model the
+            # agent itself runs on.
+            default_scope=None,
         )
         self.push_screen(screen, handle_result)
 
@@ -13456,7 +15063,7 @@ class DeepAgentsApp(App):
             self._server_proc.update_env(
                 **{env_key: env_value},
             )
-            restarted = await self._respawn_server(
+            restart_result = await self._respawn_server(
                 log_message=("Server restart failed while changing max iterations"),
                 mcp_failure_log=(
                     "MCP metadata preload after max-iterations change failed"
@@ -13465,7 +15072,7 @@ class DeepAgentsApp(App):
                     "MCP tool metadata could not be refreshed. Use /mcp to check."
                 ),
             )
-            if not restarted:
+            if not restart_result.restarted:
                 self._rubric_max_iterations = previous
                 if self._server_kwargs is not None:
                     self._server_kwargs["rubric_max_iterations"] = previous
@@ -13582,7 +15189,7 @@ class DeepAgentsApp(App):
             self._server_proc.update_env(
                 **{env_key: env_value},
             )
-            restarted = await self._respawn_server(
+            restart_result = await self._respawn_server(
                 log_message=(
                     f"Server restart failed while changing {label.lower()} model"
                 ),
@@ -13593,7 +15200,7 @@ class DeepAgentsApp(App):
                     "MCP tool metadata could not be refreshed. Use /mcp to check."
                 ),
             )
-            if not restarted:
+            if not restart_result.restarted:
                 self._rubric_model = previous
                 if self._server_kwargs is not None:
                     self._server_kwargs["rubric_model"] = previous
@@ -13632,17 +15239,24 @@ class DeepAgentsApp(App):
         elif cmd == "/help":
             await self._mount_message(UserMessage(command))
             from deepagents_code.command_registry import get_slash_commands
+            from deepagents_code.editor import editor_display_name
 
             command_names = ", ".join(
                 f"{entry.name} {entry.argument_hint}".rstrip()
                 for entry in get_slash_commands()
+            )
+            editor = editor_display_name()
+            editor_help = (
+                f"Open prompt in {editor}"
+                if editor is not None
+                else "Open prompt in external editor"
             )
             help_body = (
                 f"Commands: {command_names}, /skill:<name>\n\n"
                 "Interactive Features:\n"
                 "  Enter           Submit your message\n"
                 f"  {newline_shortcut():<15} Insert newline\n"
-                "  Ctrl+X          Open prompt in external editor\n"
+                f"  Ctrl+X          {editor_help}\n"
                 "  Ctrl+N          Review pending notifications\n"
                 "  Ctrl+\\          Toggle the debug console\n"
                 "  Shift+Tab       Toggle auto-approve mode\n"
@@ -13666,7 +15280,9 @@ class DeepAgentsApp(App):
             await self._handle_version_command()
         elif cmd == "/agents":
             await self._show_agent_selector()
-        elif cmd in {"/manual", "/auto", "/yolo"}:
+        elif cmd == "/auto" or cmd.startswith("/auto "):
+            await self._handle_auto_command(command)
+        elif cmd in {"/manual", "/yolo"}:
             from deepagents_code.approval_mode import ApprovalMode
 
             await self._handle_approval_mode_command(ApprovalMode(cmd.lstrip("/")))
@@ -13684,7 +15300,13 @@ class DeepAgentsApp(App):
 
             if cmd == "/force-clear":
                 self._force_interrupt_active_work()
-            await self._hooks.on_session_end(SessionEndCause.CLEAR)
+            # Sample before `_clear_messages` below empties the store: this
+            # describes the thread being left, not the fresh one. See
+            # `_store_has_server_output`.
+            outgoing_had_agent_output = self._store_has_server_output()
+            await _wait_for_session_end(
+                self._hooks.on_session_end(SessionEndCause.CLEAR)
+            )
             self._pending_messages.clear()
             self._queued_widgets.clear()
             self._sync_status_queued()
@@ -13716,15 +15338,23 @@ class DeepAgentsApp(App):
                     logger.debug(
                         "Screen stack empty during thread reset", exc_info=True
                     )
-                thread_msg_widget = AppMessage(f"Started new thread: {new_thread_id}")
-                await self._mount_message(thread_msg_widget)
-                self._schedule_thread_message_link(
-                    thread_msg_widget,
-                    prefix="Started new thread",
-                    thread_id=new_thread_id,
+                thread_links_configured = self._thread_links_configured()
+                started_message = (
+                    f"Started new thread: {new_thread_id}"
+                    if thread_links_configured
+                    else "Started new thread"
                 )
+                thread_msg_widget = AppMessage(started_message)
+                await self._mount_message(thread_msg_widget)
+                if thread_links_configured:
+                    self._schedule_thread_message_link(
+                        thread_msg_widget,
+                        prefix="Started new thread",
+                        thread_id=new_thread_id,
+                    )
                 await self._mount_previous_thread_hint(
-                    self._session_state.previous_thread_id
+                    self._session_state.previous_thread_id,
+                    had_agent_output=outgoing_had_agent_output,
                 )
                 await self._reload_hooks()
                 if not await self._run_session_start_hook(SessionStartCause.CLEAR):
@@ -13763,7 +15393,7 @@ class DeepAgentsApp(App):
             success, error = copy_text_to_clipboard(self, content)
             if success:
                 await self._mount_message(
-                    AppMessage("Copied latest assistant message to clipboard."),
+                    AppMessage("Copied latest response to clipboard."),
                 )
             else:
                 fail_msg = (
@@ -13776,7 +15406,15 @@ class DeepAgentsApp(App):
             await self.action_open_editor()
         elif cmd in {"/offload", "/compact"}:
             await self._mount_message(UserMessage(command))
-            await self._handle_offload()
+            self._set_agent_running(True)
+            try:
+                self._offload_worker = self.run_worker(
+                    self._run_offload_task(),
+                    exclusive=False,
+                )
+            except Exception:
+                self._set_agent_running(False)
+                raise
         elif cmd == "/threads" or cmd.startswith("/threads "):
             await self._handle_threads_command(command)
         elif cmd == "/trace":
@@ -13804,6 +15442,36 @@ class DeepAgentsApp(App):
                 severity="information",
                 timeout=5,
                 markup=False,
+            )
+        elif cmd == "/line-numbers":
+            await self._toggle_diff_line_numbers()
+            label = "shown" if self._show_diff_line_numbers else "hidden"
+            self.notify(
+                f"Line numbers {label} for new diffs.",
+                severity="information",
+                timeout=5,
+                markup=False,
+            )
+        elif cmd == "/context":
+            context_tokens, conversation_tokens = await self._get_context_usage_counts()
+            if context_tokens is None and not self._tokens_approximate:
+                context_tokens = self._context_tokens or None
+            approximate = context_tokens is None and bool(
+                conversation_tokens or self._context_tokens
+            )
+            if approximate:
+                conversation_tokens = conversation_tokens or self._context_tokens
+            elif context_tokens is None:
+                context_tokens = 0
+            self.push_screen(
+                ContextUsageScreen(
+                    context_tokens=context_tokens,
+                    conversation_tokens=conversation_tokens,
+                    context_limit=settings.model_context_limit,
+                    model_spec=self._effective_model_spec() or settings.model_name,
+                    approximate=approximate,
+                ),
+                lambda _result: self._focus_chat_input_after_refresh(),
             )
         elif cmd == "/tokens":
             await self._mount_message(UserMessage(command))
@@ -13841,17 +15509,7 @@ class DeepAgentsApp(App):
                     msg += f"\n\n{self._format_cost_summary()}"
                 await self._mount_message(AppMessage(msg))
             else:
-                model_name = settings.model_name
-                context_limit = settings.model_context_limit
-
-                parts: list[str] = ["No token usage yet"]
-                if context_limit is not None:
-                    limit_str = format_token_count(context_limit)
-                    parts.append(f"{limit_str} token context window")
-                if model_name:
-                    parts.append(model_name)
-
-                msg = " · ".join(parts)
+                msg = "No token usage yet - send a message to get started"
                 if self._displayed_cost_usd > 0:
                     msg += f"\n\n{self._format_cost_summary()}"
                 await self._mount_message(AppMessage(msg))
@@ -13897,7 +15555,7 @@ class DeepAgentsApp(App):
         elif cmd == "/theme":
             await self._show_theme_selector()
         elif cmd == "/notifications":
-            await self._show_notification_settings()
+            self._open_notification_center()
         elif cmd == "/effort" or cmd.startswith("/effort "):
             await self._handle_effort_command(command)
         elif cmd == "/model" or cmd.startswith("/model "):
@@ -13947,210 +15605,7 @@ class DeepAgentsApp(App):
                 await self._show_model_selector(extra_kwargs=extra_kwargs)
         elif cmd == "/reload":
             await self._mount_message(UserMessage(command))
-
-            # Snapshot pre-reload skill names so the report can show diff.
-            old_skill_names = {s["name"] for s in self._discovered_skills}
-
-            try:
-                changes = settings.reload_from_environment()
-
-                from deepagents_code.model_config import clear_caches
-
-                clear_caches()
-                self._sync_status_model()
-            except (OSError, ValueError):
-                logger.exception("Failed to reload configuration")
-                await self._mount_message(
-                    AppMessage(
-                        "Failed to reload configuration. Check your .env "
-                        "file and environment variables for syntax errors, "
-                        "then try again.",
-                    ),
-                )
-                return
-
-            # Reload user themes from config.toml and re-register with Textual
-            theme_reload_ok = True
-            try:
-                theme.reload_registry()
-                self._register_custom_themes()
-            except Exception:
-                theme_reload_ok = False
-                logger.warning("Failed to reload user themes", exc_info=True)
-
-            # Re-resolve and apply the theme preference so a per-terminal or
-            # global default saved by another session is picked up. This
-            # re-syncs to on-disk config using the same resolution as startup
-            # (env -> [ui.terminal_themes][TERM_PROGRAM] -> [ui].theme ->
-            # default), which intentionally overrides an unsaved in-session
-            # `/theme` choice. Guarded on the registry reload succeeding since
-            # the target theme must be registered before it can be applied.
-            theme_switched_to: str | None = None
-            if theme_reload_ok:
-                try:
-                    new_theme = _load_theme_preference()
-                    if new_theme != self.theme and new_theme in theme.get_registry():
-                        self.theme = new_theme
-                        self.sync_terminal_background()
-                        self.refresh_css(animate=False)
-                        theme_switched_to = new_theme
-                except Exception:
-                    logger.warning(
-                        "Failed to re-apply theme preference on reload",
-                        exc_info=True,
-                    )
-
-            # Re-discover skills so autocomplete reflects any new/removed
-            # skills. Run via the same exclusive-group worker used at
-            # startup so any in-flight startup discovery is cancelled
-            # rather than racing this one, then await its completion so
-            # the report can include the diff.
-            skill_worker = self.run_worker(
-                self._discover_skills(),
-                exclusive=True,
-                group="startup-skill-discovery",
-            )
-            await skill_worker.wait()
-            discovery_ok = skill_worker.result is True
-            new_skill_names = {s["name"] for s in self._discovered_skills}
-            added_skills = sorted(new_skill_names - old_skill_names)
-            removed_skills = sorted(old_skill_names - new_skill_names)
-
-            if changes:
-                report = "Configuration reloaded. Changes:\n" + "\n".join(
-                    f"  - {change}" for change in changes
-                )
-            else:
-                report = "Configuration reloaded. No changes detected."
-            report += "\nModel config caches cleared."
-            if theme_reload_ok:
-                report += "\nTheme registry reloaded."
-                if theme_switched_to is not None:
-                    entry = theme.get_registry().get(theme_switched_to)
-                    label = entry.label if entry is not None else theme_switched_to
-                    report += f"\nSwitched theme to {label}."
-            else:
-                report += (
-                    "\nTheme registry reload failed. Check config.toml for errors."
-                )
-            if not discovery_ok:
-                # Diff is meaningless when discovery failed: prior cache
-                # was preserved, so old vs. new is identical and
-                # `Skills reloaded. No changes detected.` would be a lie.
-                report += (
-                    "\nSkill re-discovery failed; existing /skill: list left as-is."
-                )
-            elif added_skills or removed_skills:
-                skill_lines = []
-                if added_skills:
-                    skill_lines.append(f"  - Added: {', '.join(added_skills)}")
-                if removed_skills:
-                    skill_lines.append(f"  - Removed: {', '.join(removed_skills)}")
-                report += "\nSkills updated:\n" + "\n".join(skill_lines)
-
-            # Rediscover plugins and restart the owned server so plugin MCP config
-            # is picked up without a separate slash command.
-            from deepagents_code.plugins.adapters.hooks import plugin_hook_event_names
-            from deepagents_code.plugins.adapters.mcp import plugin_mcp_configs
-
-            try:
-                plugin_result, new_plugin_fingerprints = await asyncio.to_thread(
-                    self._discover_plugins_with_fingerprints
-                )
-            except Exception:
-                # User and project hooks still reload when plugin discovery fails.
-                await self._reload_hooks(plugins=())
-                logger.exception("Failed to discover plugins during /reload")
-                report += "\nCouldn't read plugin state; run /reload to be safe."
-            else:
-                # Server-owned events are fixed when the server starts, so refresh
-                # hooks from this same plugin snapshot before any restart.
-                plugins = plugin_result.plugins
-                await self._reload_hooks(plugins=plugins)
-                old_plugin_fingerprints = self._plugin_fingerprints
-                self._plugin_fingerprints = new_plugin_fingerprints
-                discovered_plugin_ids = frozenset(
-                    plugin.plugin_id for plugin in plugins
-                )
-                plugin_count = len(plugins)
-                mcp_configs = plugin_mcp_configs(plugins)
-                mcp_count = sum(
-                    len(servers)
-                    for config in mcp_configs
-                    if isinstance((servers := config.get("mcpServers")), dict)
-                )
-                plugin_skill_count = sum(1 for name in new_skill_names if ":" in name)
-                hook_count = sum(map(len, map(plugin_hook_event_names, plugins)))
-                report += (
-                    f"\nPlugins: {plugin_count} plugin"
-                    f"{'s' if plugin_count != 1 else ''} · "
-                    f"{plugin_skill_count} skill"
-                    f"{'s' if plugin_skill_count != 1 else ''} · "
-                    f"{mcp_count} plugin MCP server"
-                    f"{'s' if mcp_count != 1 else ''} · "
-                    f"{hook_count} hook{'s' if hook_count != 1 else ''}"
-                )
-                if old_plugin_fingerprints is not None:
-                    old_ids = set(old_plugin_fingerprints)
-                    new_ids = set(new_plugin_fingerprints)
-                    added_count = len(new_ids - old_ids)
-                    removed_count = len(old_ids - new_ids)
-                    changed_count = sum(
-                        self._plugin_fingerprint_changed(
-                            old_plugin_fingerprints[plugin_id],
-                            new_plugin_fingerprints[plugin_id],
-                        )
-                        for plugin_id in old_ids & new_ids
-                    )
-                    change_parts = []
-                    for count, label in (
-                        (added_count, "added"),
-                        (removed_count, "removed"),
-                        (changed_count, "changed"),
-                    ):
-                        if count:
-                            noun = "plugin" if count == 1 else "plugins"
-                            change_parts.append(f"{count} {noun} {label}")
-                    if change_parts:
-                        report += "\nPlugin changes: " + ", ".join(change_parts) + "."
-                    else:
-                        report += "\nPlugin changes: no changes detected."
-                    # Reads each added plugin's MCP config from disk; keep it
-                    # off the UI thread like the discovery scan above.
-                    login_labels = await asyncio.to_thread(
-                        self._plugin_login_labels,
-                        plugins,
-                        new_ids - old_ids,
-                    )
-                    for label in login_labels:
-                        report += f"\nSign in to {label} via `/mcp`."
-                if plugin_result.warnings:
-                    report += (
-                        f"\n{len(plugin_result.warnings)} plugin warning(s) "
-                        "during load."
-                    )
-
-                restarted = False
-                if self._server_proc is not None and self._server_kwargs is not None:
-                    if self._agent_running and self._agent_worker:
-                        self._cancel_worker(self._agent_worker)
-                        # Via `_set_agent_running` so the quiescence event is
-                        # released with the flag; a bare assignment leaves
-                        # `_agent_quiescent` cleared.
-                        self._set_agent_running(False)
-                    else:
-                        self._discard_queue()
-                    restarted = await self._restart_server_manual()
-                    if restarted:
-                        self._session_plugin_ids = discovered_plugin_ids
-                        report += "\nAgent server restarted for plugin MCP."
-                    else:
-                        report += (
-                            "\nAgent server was not restarted; plugin MCP may be stale."
-                        )
-
-            await self._mount_message(AppMessage(report))
-            await self._maybe_start_deferred_server_from_default()
+            self._schedule_reload()
         elif cmd.startswith("/skill:"):
             await self._handle_skill_command(command)
         # -- Debug commands (not in COMMANDS / autocomplete) ------------------
@@ -14460,6 +15915,359 @@ class DeepAgentsApp(App):
             )
         return content
 
+    def _schedule_reload(self) -> asyncio.Task[None]:
+        """Run `/reload` off the Textual message pump.
+
+        The reload body awaits workers and `asyncio.to_thread` calls (config,
+        theme, skill, plugin, and hook refreshes, plus a possible server
+        restart), so awaiting it inline in `_handle_command` blocks key events
+        from reaching the chat input for its whole duration. Detaching lets
+        the pump keep routing keys while `_reloading` queues submissions for
+        the entire refresh, before and during any server restart.
+
+        `_schedule_off_message_pump` is deliberately not used: its single
+        global slot is for modal-opening continuations, `/reload` opens no
+        modal, and the "answer the pending prompt first" rejection that slot
+        can produce would be a lie here.
+
+        Returns:
+            The reload task, so tests can await completion.
+        """
+        reload_task = self._reload_task
+        if self._reloading and reload_task is not None and not reload_task.done():
+            self.notify("Reload already in progress.", severity="information")
+            return reload_task
+
+        # Set the guard before scheduling: `create_task` does not run the
+        # coroutine inline, so otherwise a prompt or second reload can enter
+        # in the gap before `_run_reload` starts.
+        self._reloading = True
+        task = asyncio.create_task(self._run_reload_sequence(), name="reload")
+        task.add_done_callback(_log_task_exception)
+        task.add_done_callback(self._finish_reload)
+        self._reload_task = task
+        return task
+
+    def _finish_reload(self, task: asyncio.Task[None]) -> None:
+        """Release the reload guard and resume prompts queued during reload.
+
+        Args:
+            task: The completed reload task.
+        """
+        if task is not self._reload_task:
+            return
+        self._reloading = False
+        if (
+            self._pending_messages
+            and not self._agent_running
+            and self._agent is not None
+        ):
+            self.call_after_refresh(
+                lambda: asyncio.create_task(self._process_next_from_queue()),
+            )
+
+    async def _run_reload_sequence(self) -> None:
+        """Run reload work, then honor restart requests it did not satisfy.
+
+        Raises:
+            asyncio.CancelledError: If app teardown cancels the active reload.
+        """
+        try:
+            await self._run_reload()
+        except asyncio.CancelledError:
+            self._restart_requested_during_reload = False
+            raise
+
+        if self._exiting:
+            self._restart_requested_during_reload = False
+            return
+        while self._restart_requested_during_reload:
+            self._restart_requested_during_reload = False
+            await self._run_restart_command(preserve_queue=True)
+
+    async def _run_reload(self) -> None:
+        """Refresh config, themes, skills, plugins, and hooks, then report.
+
+        Runs detached from the message pump (scheduled by `_schedule_reload`),
+        so it mounts its own failure message — the `_handle_command`
+        `try/except` no longer wraps it.
+        """
+        from deepagents_code.config import settings
+
+        try:
+            # Snapshot pre-reload state so the report can show diffs.
+            old_skill_names = {s["name"] for s in self._discovered_skills}
+            old_mcp_server_info = self._mcp_server_info
+
+            try:
+                changes = settings.reload_from_environment()
+
+                from deepagents_code.model_config import clear_caches
+
+                clear_caches()
+                self._sync_status_model()
+            except (OSError, ValueError):
+                logger.exception("Failed to reload configuration")
+                await self._mount_message(
+                    AppMessage(
+                        "Failed to reload configuration. Check your .env "
+                        "file and environment variables for syntax errors, "
+                        "then try again.",
+                    ),
+                )
+                return
+
+            # Reload user themes from config.toml and re-register with Textual
+            theme_reload_ok = True
+            try:
+                theme.reload_registry()
+                self._register_custom_themes()
+            except Exception:
+                theme_reload_ok = False
+                logger.warning("Failed to reload user themes", exc_info=True)
+
+            # Re-resolve and apply the theme preference so a per-terminal or
+            # global default saved by another session is picked up. This
+            # re-syncs to on-disk config using the same resolution as startup
+            # (env -> [ui.terminal_themes][TERM_PROGRAM] -> [ui].theme ->
+            # default), which intentionally overrides an unsaved in-session
+            # `/theme` choice. Guarded on the registry reload succeeding since
+            # the target theme must be registered before it can be applied.
+            theme_switched_to: str | None = None
+            if theme_reload_ok:
+                try:
+                    new_theme = _load_theme_preference()
+                    if new_theme != self.theme and new_theme in theme.get_registry():
+                        self.theme = new_theme
+                        self.sync_terminal_background()
+                        self.refresh_css(animate=False)
+                        theme_switched_to = new_theme
+                except Exception:
+                    logger.warning(
+                        "Failed to re-apply theme preference on reload",
+                        exc_info=True,
+                    )
+
+            # Re-discover skills so autocomplete reflects any new/removed
+            # skills. Run via the same exclusive-group worker used at
+            # startup so any in-flight startup discovery is cancelled
+            # rather than racing this one, then await its completion so
+            # the report can include the diff.
+            skill_worker = self.run_worker(
+                self._discover_skills(),
+                exclusive=True,
+                group="startup-skill-discovery",
+            )
+            await skill_worker.wait()
+            discovery_ok = skill_worker.result is True
+            new_skill_names = {s["name"] for s in self._discovered_skills}
+            added_skills = sorted(new_skill_names - old_skill_names)
+            removed_skills = sorted(old_skill_names - new_skill_names)
+
+            if changes:
+                report = "Configuration reloaded. Changes:\n" + "\n".join(
+                    f"  - {change}" for change in changes
+                )
+            else:
+                report = "Configuration reloaded. No changes detected."
+            report += "\nModel config caches cleared."
+            if theme_reload_ok:
+                report += "\nTheme registry reloaded."
+                if theme_switched_to is not None:
+                    entry = theme.get_registry().get(theme_switched_to)
+                    label = entry.label if entry is not None else theme_switched_to
+                    report += f"\nSwitched theme to {label}."
+            else:
+                report += (
+                    "\nTheme registry reload failed. Check config.toml for errors."
+                )
+            if not discovery_ok:
+                # Diff is meaningless when discovery failed: prior cache
+                # was preserved, so old vs. new is identical and
+                # `Skills reloaded. No changes detected.` would be a lie.
+                report += (
+                    "\nSkill re-discovery failed; existing /skill: list left as-is."
+                )
+            elif added_skills or removed_skills:
+                skill_lines = []
+                if added_skills:
+                    skill_lines.append(f"  - Added: {', '.join(added_skills)}")
+                if removed_skills:
+                    skill_lines.append(f"  - Removed: {', '.join(removed_skills)}")
+                report += "\nSkills updated:\n" + "\n".join(skill_lines)
+
+            # Rediscover plugins and restart the owned server so plugin MCP config
+            # is picked up without a separate slash command.
+            from deepagents_code.plugins.adapters.hooks import plugin_hook_event_names
+            from deepagents_code.plugins.adapters.mcp import plugin_mcp_configs
+
+            try:
+                plugin_result, new_plugin_fingerprints = await asyncio.to_thread(
+                    self._discover_plugins_with_fingerprints
+                )
+            except Exception:
+                # User and project hooks still reload when plugin discovery fails.
+                await self._reload_hooks(plugins=())
+                logger.exception("Failed to discover plugins during /reload")
+                report += "\nCouldn't read plugin state; run /reload to be safe."
+            else:
+                # Server-owned events are fixed when the server starts, so refresh
+                # hooks from this same plugin snapshot before any restart.
+                plugins = plugin_result.plugins
+                await self._reload_hooks(plugins=plugins)
+                old_plugin_fingerprints = self._plugin_fingerprints
+                self._plugin_fingerprints = new_plugin_fingerprints
+                discovered_plugin_ids = frozenset(
+                    plugin.plugin_id for plugin in plugins
+                )
+                plugin_count = len(plugins)
+                mcp_configs = plugin_mcp_configs(plugins)
+                mcp_count = sum(
+                    len(servers)
+                    for config in mcp_configs
+                    if isinstance((servers := config.get("mcpServers")), dict)
+                )
+                plugin_skill_count = sum(1 for name in new_skill_names if ":" in name)
+                hook_count = sum(map(len, map(plugin_hook_event_names, plugins)))
+                report += (
+                    f"\nPlugins: {plugin_count} plugin"
+                    f"{'s' if plugin_count != 1 else ''} · "
+                    f"{plugin_skill_count} skill"
+                    f"{'s' if plugin_skill_count != 1 else ''} · "
+                    f"{mcp_count} plugin MCP server"
+                    f"{'s' if mcp_count != 1 else ''} · "
+                    f"{hook_count} hook{'s' if hook_count != 1 else ''}"
+                )
+                if old_plugin_fingerprints is not None:
+                    old_ids = set(old_plugin_fingerprints)
+                    new_ids = set(new_plugin_fingerprints)
+                    added_count = len(new_ids - old_ids)
+                    removed_count = len(old_ids - new_ids)
+                    changed_count = sum(
+                        self._plugin_fingerprint_changed(
+                            old_plugin_fingerprints[plugin_id],
+                            new_plugin_fingerprints[plugin_id],
+                        )
+                        for plugin_id in old_ids & new_ids
+                    )
+                    change_parts = []
+                    for count, label in (
+                        (added_count, "added"),
+                        (removed_count, "removed"),
+                        (changed_count, "changed"),
+                    ):
+                        if count:
+                            noun = "plugin" if count == 1 else "plugins"
+                            change_parts.append(f"{count} {noun} {label}")
+                    if change_parts:
+                        report += "\nPlugin changes: " + ", ".join(change_parts) + "."
+                    else:
+                        report += "\nPlugin changes: no changes detected."
+                    # Reads each added plugin's MCP config from disk; keep it
+                    # off the UI thread like the discovery scan above.
+                    login_labels = await asyncio.to_thread(
+                        self._plugin_login_labels,
+                        plugins,
+                        new_ids - old_ids,
+                    )
+                    for label in login_labels:
+                        report += f"\nSign in to {label} via `/mcp`."
+                if plugin_result.warnings:
+                    report += (
+                        f"\n{len(plugin_result.warnings)} plugin warning(s) "
+                        "during load."
+                    )
+
+                if self._server_proc is not None and self._server_kwargs is not None:
+                    if self._agent_running and self._agent_worker:
+                        # `/reload` runs detached, so submissions can queue
+                        # while discovery is in progress. `_cancel_worker()`
+                        # clears the queue, but these messages belong to the
+                        # reload rather than the cancelled agent turn.
+                        preserved = list(self._pending_messages)
+                        self._cancel_worker(self._agent_worker)
+                        # Via `_set_agent_running` so the quiescence event is
+                        # released with the flag; a bare assignment leaves
+                        # `_agent_quiescent` cleared.
+                        self._set_agent_running(False)
+                    else:
+                        # `/reload` now runs detached, so the user may have
+                        # submitted messages that queued while the reload was
+                        # busy. The restart's `_discard_queue()` would silently
+                        # drop them; snapshot and restore them instead. Only the
+                        # idle path reaches `_discard_queue()` directly; the
+                        # running-agent path snapshots before its cancellation.
+                        preserved = list(self._pending_messages)
+                        self._discard_queue()
+                    try:
+                        restart_result = await self._restart_server_manual_result()
+                    finally:
+                        self._restart_requested_during_reload = False
+                        if preserved:
+                            self._pending_messages.extendleft(reversed(preserved))
+                            self._sync_status_queued()
+                    if restart_result.restarted:
+                        self._session_plugin_ids = discovered_plugin_ids
+                        report += "\nAgent server restarted for plugin MCP."
+                        if restart_result.mcp_status == "disabled":
+                            # `--no-mcp`: there is nothing to refresh, so an
+                            # empty diff is the truth rather than an unknown.
+                            # Says *why* rather than "no changes detected" —
+                            # the plugin count printed above mentions MCP
+                            # servers, and a bare no-changes line next to it
+                            # reads as though they were loaded.
+                            report += (
+                                "\nMCP is disabled for this session (--no-mcp); "
+                                "no servers were loaded."
+                            )
+                        else:
+                            report += "\n" + _format_mcp_server_changes(
+                                old_mcp_server_info,
+                                restart_result.mcp_server_info,
+                                restart_result.mcp_error,
+                            )
+                    else:
+                        report += (
+                            "\nAgent server was not restarted; plugin MCP may be stale."
+                        )
+                elif self._server_kwargs is None:
+                    # Attached to an externally managed server: this session
+                    # cannot respawn it, so MCP config was never re-read. The
+                    # plugin line above still counts plugin MCP servers, which
+                    # would otherwise imply the reload picked them up.
+                    report += (
+                        "\nMCP servers unchanged; this session uses a remote "
+                        "server and cannot reload MCP config."
+                    )
+                # Deferred local startup (app-owned kwargs, no process yet):
+                # not a remote session, so don't claim it is one — the
+                # deferred start below may boot the server from the config
+                # this reload just read, which would contradict the report.
+                # Keyed on the session's `no_mcp` kwarg rather than absent
+                # preload kwargs so the reason matches how `_respawn_server`
+                # derives the same status.
+                elif self._server_kwargs.get("no_mcp"):
+                    # Mirrors the `--no-mcp` line in the restart branch.
+                    report += (
+                        "\nMCP is disabled for this session (--no-mcp); "
+                        "no servers were loaded."
+                    )
+                else:
+                    report += (
+                        "\nMCP server changes couldn't be determined; the "
+                        "local server hasn't started yet. If startup "
+                        "succeeds, it loads the reloaded config — use /mcp "
+                        "to check."
+                    )
+
+            await self._mount_message(AppMessage(report))
+            await self._maybe_start_deferred_server_from_default()
+        except Exception:
+            logger.exception("Detached /reload failed unexpectedly")
+            await self._mount_message(
+                ErrorMessage("Reload failed unexpectedly. Check the debug log."),
+            )
+
     async def _handle_skill_command(self, command: str) -> None:
         """Handle a `/skill:<name>` command by loading and invoking a skill.
 
@@ -14475,13 +16283,25 @@ class DeepAgentsApp(App):
         """Check whether the current thread has at least one human message.
 
         Returns:
-            `True` if the conversation contains a `HumanMessage`, `False`
+            `True` if the conversation contains a `HumanMessage` or a local user
+                turn is still in flight (its worker has started), `False`
                 otherwise. On transient errors (network, corrupt state) returns
                 `True` so callers do not block or warn based on an unreliable
                 empty-thread check.
         """
         if not self._agent or not self._lc_thread_id:
             return False
+        # `_agent_turn_started` (not just `_agent_running`) is required: a
+        # message that failed to send (agent unavailable) leaves
+        # `_active_user_message` mounted, and a later non-message operation
+        # such as goal-criteria generation also sets `_agent_running`. Only a
+        # turn whose worker actually started means the prompt is in flight.
+        if (
+            self._agent_running
+            and self._agent_turn_started
+            and self._active_user_message is not None
+        ):
+            return True
         try:
             # Use the shared helper so the thread is registered first
             # (`aensure_thread`, remote agents only) in server mode — otherwise
@@ -14500,34 +16320,70 @@ class DeepAgentsApp(App):
             )
             return True
 
+    async def _get_context_usage_counts(self) -> tuple[int | None, int | None]:
+        """Read provider-reported total and estimated conversation usage together.
+
+        Returns:
+            Pair of provider-reported context tokens and approximate effective
+                conversation tokens. Either value is `None` when unavailable.
+        """
+        if not self._agent or not self._lc_thread_id:
+            return None, None
+        try:
+            from langchain_core.messages.utils import count_tokens_approximately
+
+            values = await self._get_thread_state_values(self._lc_thread_id)
+            reported = _persisted_context_tokens(values) or None
+            messages = values.get("messages", [])
+            if not isinstance(messages, list) or not messages:
+                return reported, None
+            effective = _effective_conversation(
+                messages,
+                values.get("_summarization_event"),
+            )
+            return reported, count_tokens_approximately(effective)
+        except Exception:  # best-effort for context-usage displays
+            logger.debug("Failed to retrieve context usage", exc_info=True)
+            return None, None
+
     async def _get_conversation_token_count(self) -> int | None:
         """Return the approximate conversation-only token count.
 
         Returns:
             Token count as an integer, or `None` if state is unavailable.
         """
-        if not self._agent:
-            return None
+        _, conversation = await self._get_context_usage_counts()
+        return conversation
+
+    async def _run_offload_task(self) -> None:
+        """Run a synchronously reserved `/offload` outside the App message pump."""
+        self._offload_task_started = True
         try:
-            from langchain_core.messages.utils import (
-                count_tokens_approximately,
-            )
+            await self._handle_offload(reserved=True)
+        finally:
+            self._offload_task_started = False
+            self._offload_worker = None
+            if not self._startup_sequence_running:
+                await self._process_next_from_queue()
 
-            config: RunnableConfig = {
-                "configurable": {"thread_id": self._lc_thread_id},
-            }
-            state = await self._agent.aget_state(config)
-            if not state or not state.values:
-                return None
-            messages = state.values.get("messages", [])
-            if not messages:
-                return None
-            return count_tokens_approximately(messages)
-        except Exception:  # best-effort for /tokens display
-            logger.debug("Failed to retrieve conversation token count", exc_info=True)
-            return None
+    async def _handle_offload(self, *, reserved: bool = False) -> None:
+        """Run `/offload`, always releasing its busy-state reservation.
 
-    async def _handle_offload(self) -> None:
+        Args:
+            reserved: Whether the caller already reserved the turn synchronously.
+        """
+        if not reserved:
+            self._set_agent_running(True)
+        try:
+            await self._offload_impl()
+        finally:
+            self._set_agent_running(False)
+            try:
+                await self._set_spinner(None)
+            except Exception:  # best-effort spinner cleanup
+                logger.exception("Failed to dismiss spinner after offload")
+
+    async def _offload_impl(self) -> None:
         """Offload older messages to free context window space.
 
         Runs offload SERVER-SIDE by driving the agent's own
@@ -14537,6 +16393,9 @@ class DeepAgentsApp(App):
         via `read_file` in every run mode (server, sandbox, in-process). The
         client only seeds the tool call, approves the resulting HITL interrupt,
         drains the run, and renders the persisted `_summarization_event`.
+
+        Raises:
+            CancelledError: If the offload worker is interrupted.
         """
         from langchain_core.messages.utils import count_tokens_approximately
 
@@ -14545,12 +16404,6 @@ class DeepAgentsApp(App):
         if not self._agent or not self._lc_thread_id:
             await self._mount_message(
                 AppMessage("Nothing to offload \u2014 start a conversation first"),
-            )
-            return
-
-        if self._agent_running:
-            await self._mount_message(
-                AppMessage("Cannot offload while agent is running"),
             )
             return
 
@@ -14568,17 +16421,25 @@ class DeepAgentsApp(App):
             )
             return
 
-        # Prevent concurrent user input while offload modifies state
-        self._set_agent_running(True)
         try:
             await self._set_spinner("Offloading")
 
             prior_event = state_values.get("_summarization_event")
             before_messages = state_values.get("messages", [])
-            prior_cutoff = _summarization_cutoff(prior_event)
-            tokens_before = count_tokens_approximately(
+            # Bounds-checked against the list it indexes, matching
+            # `_effective_conversation` below. Without `message_count`, an
+            # out-of-bounds cutoff is trusted here while that call rejects it, and
+            # the two disagree: `messages_offloaded` inflates, `messages_kept`
+            # collapses to 0, and the report claims a large offload beside roughly
+            # zero token savings.
+            prior_cutoff = _summarization_cutoff(
+                prior_event,
+                message_count=len(before_messages),
+            )
+            conversation_tokens_before = count_tokens_approximately(
                 _effective_conversation(before_messages, prior_event)
             )
+            reported_tokens_before = _persisted_context_tokens(state_values)
 
             # Own the seeded tool-call id here so a failed run can clean up the
             # committed-but-unanswered seed (see `_remove_unanswered_offload_seed`).
@@ -14590,7 +16451,7 @@ class DeepAgentsApp(App):
                 )
             except ClientHookStopError:
                 return
-            except Exception as stream_error:
+            except (asyncio.CancelledError, Exception) as stream_error:
                 # A server graph can checkpoint the tool-node update before a
                 # later stream transport failure reaches this client. Reconcile
                 # the durable event before reporting the operation as failed.
@@ -14611,7 +16472,11 @@ class DeepAgentsApp(App):
                         await self._mount_message(ErrorMessage(_OFFLOAD_WEDGE_WARNING))
                     raise stream_error from state_error
                 reconciled_event = new_state.get("_summarization_event")
-                if _summarization_cutoff(reconciled_event) <= prior_cutoff:
+                reconciled_cutoff = _summarization_cutoff(
+                    reconciled_event,
+                    message_count=len(new_state.get("messages", [])),
+                )
+                if reconciled_cutoff <= prior_cutoff:
                     # Compaction did not commit, so the seeded tool call was
                     # never answered. Remove it before re-raising so a failed
                     # `/offload` cannot wedge the thread with a dangling
@@ -14637,8 +16502,12 @@ class DeepAgentsApp(App):
             # The compaction run's summary model spend is priced and committed by
             # the graph, so the state just read is the complete total.
             self._sync_session_cost_from_state(new_state)
+            self._sync_cache_state_from_state(new_state)
             new_event = new_state.get("_summarization_event")
-            new_cutoff = _summarization_cutoff(new_event)
+            new_cutoff = _summarization_cutoff(
+                new_event,
+                message_count=len(new_state.get("messages", [])),
+            )
 
             if new_event is None or new_cutoff <= prior_cutoff:
                 # A failure and a genuine no-op both leave `_summarization_event`
@@ -14678,41 +16547,103 @@ class DeepAgentsApp(App):
                 if isinstance(new_event, dict)
                 else getattr(new_event, "file_path", None)
             )
-            # Recompute the post-offload size from the ORIGINAL pre-seed
-            # messages plus the new event. `_effective_conversation` yields
-            # `[summary, *before_messages[new_cutoff:]]` — the compacted
-            # conversation without the tool's own machinery (the seeded tool
-            # call, the tool result, and the trailing model turn), all of which
-            # land in `new_state["messages"]` at/after `new_cutoff`. Counting
-            # `before_messages` keeps this token figure consistent with the
-            # message counts below and avoids understating the reduction.
-            #
-            # This is a client-side approximation for the status bar and is
-            # deliberately not the persisted `_context_tokens` (refreshed from
-            # the trailing turn's real provider usage, which includes
-            # system/tool overhead and the machinery messages). The two can
-            # differ, and if the trailing turn failed `_context_tokens` keeps
-            # its pre-offload value.
-            tokens_after = count_tokens_approximately(
+            # Recompute the post-offload conversation from the original pre-seed
+            # messages plus the new event. This excludes the compact tool's own
+            # machinery while preserving the provider-reported system/tool overhead
+            # from the last ordinary turn when that total is available.
+            conversation_tokens_after = count_tokens_approximately(
                 _effective_conversation(before_messages, new_event)
             )
-            # Message counts are likewise derived purely from the absolute
-            # cutoffs, so those same machinery artifacts are never mistaken for
-            # kept conversation.
+            if reported_tokens_before:
+                # Subtract the *delta* from the provider total rather than
+                # rebuilding the total as `overhead + conversation_after`. The two
+                # are algebraically equal, but only this form keeps both figures on
+                # the provider's scale: `count_tokens_approximately` need only
+                # overshoot the provider count by a token for an
+                # `overhead = max(0, reported - conversation_before)` clamp to
+                # collapse the overhead to zero, which would silently report the
+                # whole system prompt and tool schema as freed context.
+                #
+                # The estimator's error appears with opposite signs in the two
+                # conversation counts and largely cancels in the difference, which
+                # is why `before` prints exact and only `after` carries a `~`.
+                tokens_before = reported_tokens_before
+                tokens_after = max(
+                    0,
+                    reported_tokens_before
+                    - (conversation_tokens_before - conversation_tokens_after),
+                )
+                usage_label = "Context"
+                before = format_token_count(tokens_before)
+                after = f"~{format_token_count(tokens_after)}"
+            else:
+                # No usable provider total (never set, or a checkpoint value
+                # `_persisted_context_tokens` rejected), so fall back to a
+                # conversation-only estimate. `usage_label` is what tells the user
+                # which metric they are reading: "Conversation" excludes the
+                # system/tool overhead that "Context" includes, so the two
+                # percentages are not comparable across offloads.
+                tokens_before = conversation_tokens_before
+                tokens_after = conversation_tokens_after
+                usage_label = "Conversation"
+                before = f"~{format_token_count(tokens_before)}"
+                after = f"~{format_token_count(tokens_after)}"
+
+            # Message and turn counts are derived purely from the absolute cutoffs
+            # into the ORIGINAL pre-seed `before_messages`, never from the post-run
+            # `new_state["messages"]`. The compact tool's own machinery (the seeded
+            # tool call, its result, and the trailing model turn) lands at/after
+            # `new_cutoff` in the post-run list, so slicing that list instead would
+            # count those artifacts as kept conversation.
             messages_offloaded = max(0, new_cutoff - prior_cutoff)
             messages_kept = max(0, len(before_messages) - new_cutoff)
+            turns_offloaded = sum(
+                is_human_message(message) and not is_internal_message(message)
+                for message in before_messages[prior_cutoff:new_cutoff]
+            )
+            turns_kept = sum(
+                is_human_message(message) and not is_internal_message(message)
+                for message in before_messages[new_cutoff:]
+            )
+            offloaded_message_label = (
+                "message" if messages_offloaded == 1 else "messages"
+            )
+            kept_message_label = "message" if messages_kept == 1 else "messages"
+            offloaded_turn_label = "turn" if turns_offloaded == 1 else "turns"
+            kept_turn_label = "turn" if turns_kept == 1 else "turns"
+            # Floored at zero: a summary can come out larger than the messages it
+            # replaced, and in the reported branch `tokens_after` mixes an exact
+            # provider total with an estimated delta. Neither should ever render as
+            # a negative "decrease".
             pct = (
-                round((tokens_before - tokens_after) / tokens_before * 100)
+                max(0, round((tokens_before - tokens_after) / tokens_before * 100))
                 if tokens_before > 0
                 else 0
             )
 
-            before = format_token_count(tokens_before)
-            after = format_token_count(tokens_after)
-            stats_line = (
-                f"Context: {before} → {after} tokens "
-                f"({pct}% decrease), {messages_kept} messages kept."
+            offloaded_counts = (
+                f"{messages_offloaded} older {offloaded_message_label} "
+                f"({turns_offloaded} conversation {offloaded_turn_label})"
             )
+            if tokens_after <= tokens_before:
+                stats_line = (
+                    f"{usage_label}: {before} → {after} tokens ({pct}% decrease), "
+                    f"{messages_kept} {kept_message_label} "
+                    f"({turns_kept} conversation {kept_turn_label}) kept."
+                )
+                outcome = (
+                    f"Offloaded {offloaded_counts}, freeing up context window space."
+                )
+            else:
+                stats_line = (
+                    f"{usage_label}: {before} → {after} tokens (increase), "
+                    f"{messages_kept} {kept_message_label} "
+                    f"({turns_kept} conversation {kept_turn_label}) kept."
+                )
+                outcome = (
+                    f"Offloaded {offloaded_counts}, but the summary was larger "
+                    "than the messages it replaced, so context increased."
+                )
             if archive_path:
                 from deepagents_code.offload import offload_storage_is_ephemeral
 
@@ -14729,8 +16660,7 @@ class DeepAgentsApp(App):
                 )
                 await self._mount_message(
                     AppMessage(
-                        f"Offloaded {messages_offloaded} older messages, "
-                        f"freeing up context window space.\n{stats_line}{caveat}",
+                        f"{outcome}\n{stats_line}{caveat}",
                     ),
                 )
             else:
@@ -14740,24 +16670,18 @@ class DeepAgentsApp(App):
                 # separate warning immediately followed by a success line.
                 await self._mount_message(
                     ErrorMessage(
-                        f"Offloaded {messages_offloaded} older messages and "
-                        "freed context, but the conversation history could not "
+                        f"{outcome} The "
+                        "conversation history could not "
                         "be saved to storage, so those messages are not "
                         f"recoverable. Check logs for details.\n{stats_line}",
                     )
                 )
 
-            self._on_tokens_update(tokens_after)
+            self._on_tokens_update(tokens_after, approximate=True)
 
         except Exception as exc:  # surface offload errors to user
             logger.exception("Offload failed")
             await self._mount_message(ErrorMessage(f"Offload failed: {exc}"))
-        finally:
-            self._set_agent_running(False)
-            try:
-                await self._set_spinner(None)
-            except Exception:  # best-effort spinner cleanup
-                logger.exception("Failed to dismiss spinner after offload")
 
     async def _drive_server_side_compaction(
         self, config: RunnableConfig, seed_tool_call_id: str | None = None
@@ -14800,6 +16724,7 @@ class DeepAgentsApp(App):
         from langchain_core.messages import AIMessage
         from langgraph.types import Command
 
+        from deepagents_code._tracing import stream_trace_config
         from deepagents_code.config import settings
         from deepagents_code.hooks.client_lifecycle import ClientHookStopError
         from deepagents_code.hooks.interrupt import is_hook_interrupt_payload
@@ -14856,6 +16781,7 @@ class DeepAgentsApp(App):
             model_params=self._model_params_override or {},
             profile_overrides=self._profile_override or {},
             model_context_limit=settings.model_context_limit,
+            classifier_model=self._auto_classifier_context_value(),
             thread_id=self._lc_thread_id,
             offload_tool_call_id=tool_call_id,
         )
@@ -14940,7 +16866,7 @@ class DeepAgentsApp(App):
                 stream_input,
                 stream_mode=["messages", "updates"],
                 subgraphs=True,
-                config=config,
+                config=stream_trace_config(config, stream_input),
                 context=stream_context,
                 durability="exit",
             ):
@@ -15048,6 +16974,7 @@ class DeepAgentsApp(App):
             self._session_stats.merge(offload_stats)
             if offload_thread_id == self._lc_thread_id:
                 self._thread_stats.merge(offload_stats)
+                self._refresh_cache_display()
 
     async def _remove_offload_artifacts(
         self,
@@ -15160,6 +17087,35 @@ class DeepAgentsApp(App):
             return False
         return True
 
+    def _start_plugin_auto_update(self) -> None:
+        """Start the plugin auto-update worker."""
+        self.run_worker(
+            self._auto_update_plugins(),
+            exclusive=True,
+            group="plugin-auto-update",
+        )
+
+    async def _auto_update_plugins(self) -> None:
+        """Update plugins on disk and notify when `/reload` can apply them."""
+        from deepagents_code.plugins.discovery import auto_update_plugins
+
+        try:
+            updated = await asyncio.to_thread(auto_update_plugins)
+        except Exception:
+            logger.exception("Plugin auto-update failed")
+            return
+        if not updated:
+            return
+
+        names = [plugin_id.rsplit("@", 1)[0] for plugin_id in updated]
+        noun = "Plugin" if len(names) == 1 else "Plugins"
+        display = f"{len(names)} plugins" if names[2:] else " and ".join(names)
+        self.notify(
+            f"{noun} updated: {display}. Run /reload to apply.",
+            timeout=10,
+            markup=False,
+        )
+
     async def _handle_user_message(self, message: str) -> None:
         """Handle a user message to send to the agent.
 
@@ -15220,6 +17176,9 @@ class DeepAgentsApp(App):
 
         # Check if agent is available
         if self._agent and self._ui_adapter and self._session_state:
+            if not self._plugin_auto_update_started:
+                self._plugin_auto_update_started = True
+                self._start_plugin_auto_update()
             self._set_agent_running(True)
             # Fresh turn: no model text or tool call is visible yet, so an Esc
             # interrupt may still return this prompt to the input.
@@ -15259,15 +17218,29 @@ class DeepAgentsApp(App):
                 if self._chat_input:
                     self._chat_input.set_cursor_active(active=False)
 
+                from functools import partial
+
                 # Use run_worker to avoid blocking the main event loop
                 # This allows the UI to remain responsive during agent execution
-                self._agent_worker = self.run_worker(
-                    self._run_agent_task(
-                        message,
-                        message_kwargs=message_kwargs,
-                        goal_notice_current=resuming_blocked,
-                    ),
-                    exclusive=False,
+                #
+                # Passed as a callable rather than a coroutine: a worker
+                # cancelled before its first event-loop step never runs its
+                # work, and an already-built coroutine would then be finalized
+                # unawaited (`RuntimeWarning`, plus an unraisable exception when
+                # the interpreter is far enough into teardown). Building it
+                # inside the worker means nothing exists to strand.
+                turn: Callable[[], Coroutine[None, None, None]] = partial(
+                    self._run_agent_task,
+                    message,
+                    message_kwargs=message_kwargs,
+                    goal_notice_current=resuming_blocked,
+                )
+                # Cast because Textual's `WorkType` alias admits both a
+                # coroutine factory and a plain callable, so the result type
+                # infers as the union rather than the `None` the turn returns.
+                self._agent_worker = cast(
+                    "Worker[None]",
+                    self.run_worker(turn, name="_run_agent_task", exclusive=False),
                 )
                 worker_started = True
             finally:
@@ -15402,6 +17375,7 @@ class DeepAgentsApp(App):
             logger.debug("Screen stack empty during model sync", exc_info=True)
         if self._status_bar is None:
             return
+        self._status_bar.set_context_limit(settings.model_context_limit)
         if not provider or not model:
             logger.warning(
                 "Settings missing model identity at status sync "
@@ -15679,6 +17653,7 @@ class DeepAgentsApp(App):
         self._agent_turn_started = True
 
         from deepagents_code.config import settings
+        from deepagents_code.hooks.client_lifecycle import ClientHookStopError
         from deepagents_code.resume_state import RUBRIC_RESULT_VALUES
         from deepagents_code.tui.textual_adapter import (
             RubricEvaluationEnd,
@@ -15755,10 +17730,8 @@ class DeepAgentsApp(App):
             self._inflight_turn_start = time.monotonic()
             self._inflight_thread_id = self._lc_thread_id
 
-            # Arm the subagent fan-out panel for this turn, seeding the session
-            # model that labels each row. The panel persists across turns and only
-            # clears when this turn's first subagent actually starts, so a turn that
-            # spawns none leaves the previous workflow's results on screen.
+            # Clear the previous turn's subagent fan-out and seed the session
+            # model that labels rows if this turn starts a new workflow.
             panel = self._get_subagent_panel()
             if panel is not None:
                 spec = self._effective_model_spec()
@@ -15784,6 +17757,26 @@ class DeepAgentsApp(App):
                     if goal_notice_ready:
                         self._last_consumed_next_rubric = None
                         self._last_consumed_next_previous_rubric = None
+                if self._next_rubric is not None:
+                    # `/rubric next` validated this against the goal state as it
+                    # stood when the command was typed, but that state is mutable:
+                    # a `/goal amend` or a blocker note recorded via `update_goal`
+                    # since then can push the combined notice over budget. Without
+                    # re-checking, the notice degrades and silently disables the
+                    # one-shot grade the command promised. Dropping it here, ahead
+                    # of the selection below, lets the normal active-rubric
+                    # fallback apply instead of duplicating that choice.
+                    size_error = self._next_rubric_size_error(self._next_rubric)
+                    if size_error is not None:
+                        self._next_rubric = None
+                        self._sync_status_rubric()
+                        await self._mount_message(
+                            ErrorMessage(
+                                "The next-turn rubric no longer fits alongside "
+                                "the current goal state, so it was dropped "
+                                f"instead of grading this turn. {size_error}"
+                            )
+                        )
                 rubric = self._next_rubric
                 if rubric is None and not (
                     self._active_goal and self._goal_status in {"paused", "complete"}
@@ -15843,6 +17836,7 @@ class DeepAgentsApp(App):
                     model_params=self._model_params_override or {},
                     profile_overrides=self._profile_override or {},
                     model_context_limit=settings.model_context_limit,
+                    classifier_model=self._auto_classifier_context_value(),
                 ),
                 turn_stats=turn_stats,
             )
@@ -15858,6 +17852,11 @@ class DeepAgentsApp(App):
             except Exception:
                 logger.exception("Failed to close/regroup tool group at turn end")
             task_succeeded = True
+        except ClientHookStopError as exc:
+            with suppress(Exception):
+                await self._mount_message(
+                    AppMessage(f"Operation stopped by hook: {exc}")
+                )
         except Exception as e:  # Resilient tool rendering
             if not streaming_started:
                 # Nothing was ever sent to the agent, so this is a local TUI or
@@ -15903,9 +17902,22 @@ class DeepAgentsApp(App):
             # the raw exception text to a generic message, so surface a
             # self-contained, actionable message here rather than relying on it.
             if graph_input is not None and graph_input.get("goal_criteria_request"):
+                # A size rejection is the one failure here the user can act on,
+                # so keep its text: it names the budget and the excess. The
+                # overflow usually comes from the model-authored criteria (the
+                # objective is validated before this worker starts), and
+                # criteria drafting is non-deterministic, so a plain retry can
+                # succeed and shortening the objective buys headroom for both.
+                # A remote deployment redacts the raw text, so the generic
+                # message is still the fallback there.
                 body = (
-                    "Could not generate acceptance criteria for this goal. "
-                    "Run `/goal` again to retry."
+                    f"{e} Retry with `/goal`, or shorten the objective to leave "
+                    "room for the generated criteria."
+                    if isinstance(e, GoalStateSizeError)
+                    else (
+                        "Could not generate acceptance criteria for this goal. "
+                        "Run `/goal` again to retry."
+                    )
                 )
             try:
                 await self._mount_message(ErrorMessage(body))
@@ -15947,12 +17959,21 @@ class DeepAgentsApp(App):
                     self._thread_stats.merge(turn_stats)
                 self._inflight_turn_stats = None
                 self._inflight_thread_id = None
+                self._refresh_cache_display()
             # Settle the display on the committed total. Only a completed turn
             # is read back: `durability="exit"` may drop an aborted turn's
             # writes, and the streamed totals already seen are closer to what
             # was actually spent than that turn's stale checkpoint.
             if turn_completed and self._lc_thread_id is not None:
                 await self._sync_session_cost_from_checkpoint()
+            elif turn_stats.request_count > 0:
+                # An interrupted turn never reads the checkpoint back (its
+                # writes may have been dropped), but the model *was* reached,
+                # and the checkpoint read is the only other thing that advances
+                # the in-memory request time. Leaving it stale would make the
+                # very next send report "no record of when this thread last
+                # reached the model" seconds after a turn that plainly did.
+                self._stamp_cache_identity_locally()
             # Finalize any subagent rows left "running" — an interrupt cancels
             # the worker before the bridge emits terminal events (a cancel is a
             # BaseException, which the bridge's `except Exception` skips), so the
@@ -15989,11 +18010,15 @@ class DeepAgentsApp(App):
         """
         if (
             self._processing_pending
+            or self._agent_running
+            or self._agent_reconciling
             or self._goal_state_mutating
+            or self._shell_running
             or self._modal_command_running()
             or not self._pending_messages
             or self._exit
             or self._exiting
+            or self._reloading
             or self._connecting
         ):
             return
@@ -16008,7 +18033,7 @@ class DeepAgentsApp(App):
                 widget = self._queued_widgets.popleft()
                 await widget.remove()
 
-            await self._process_message(msg.text, msg.mode)
+            await self._dispatch_queued_message(msg)
         except Exception:
             logger.exception("Failed to process queued message")
             await self._mount_message(
@@ -16026,6 +18051,7 @@ class DeepAgentsApp(App):
             or self._goal_state_mutating
             or self._shell_running
             or self._modal_command_running()
+            or self._reloading
         )
         if not busy and self._pending_messages:
             await self._process_next_from_queue()
@@ -16124,6 +18150,7 @@ class DeepAgentsApp(App):
                     # once the apply succeeds.
                     try:
                         queued_objective = application.objective
+                        queued_criteria = application.rubric
                         queued_result = await self._apply_goal_application(
                             application,
                             continue_work=False,
@@ -16134,6 +18161,7 @@ class DeepAgentsApp(App):
                             "Failed to apply queued goal update during agent cleanup"
                         )
                         queued_objective = None
+                        queued_criteria = None
                         queued_result = None
                         with suppress(Exception):
                             await self._mount_message(
@@ -16162,6 +18190,7 @@ class DeepAgentsApp(App):
                 if unsaved_creation and queued_objective is not None:
                     await self._continue_created_goal_work(
                         queued_objective,
+                        queued_criteria,
                         persisted=False,
                     )
                 else:
@@ -16176,6 +18205,7 @@ class DeepAgentsApp(App):
                 elif queued_objective is not None:
                     await self._continue_created_goal_work(
                         queued_objective,
+                        queued_criteria,
                         persisted=queued_result.persisted,
                     )
 
@@ -16209,6 +18239,8 @@ class DeepAgentsApp(App):
             Ordered list of `MessageData` ready for `MessageStore.bulk_load`.
         """
         from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+        from deepagents_code.file_ops import compute_unified_diff, format_display_path
 
         result: list[MessageData] = []
         # Maps tool_call_id -> index into result list
@@ -16287,6 +18319,39 @@ class DeepAgentsApp(App):
                     )
                     if status == "success":
                         data.tool_status = ToolStatus.SUCCESS
+                        if (
+                            data.tool_name == "edit_file"
+                            and data.tool_args
+                            and not data.tool_args.get("replace_all")
+                            and not content.startswith("Error:")
+                        ):
+                            before = str(data.tool_args.get("old_string", ""))
+                            after = str(data.tool_args.get("new_string", ""))
+                            path = format_display_path(
+                                str(data.tool_args.get("file_path", ""))
+                            )
+                            diff, stats = compute_unified_diff(
+                                before,
+                                after,
+                                path,
+                                max_lines=100,
+                                context_lines=0,
+                            )
+                            if diff:
+                                data.tool_diff_superseded = True
+                                result.append(
+                                    MessageData(
+                                        type=MessageType.DIFF,
+                                        content=diff,
+                                        diff_file_path=path,
+                                        diff_tool_name="edit_file",
+                                        diff_stats=stats,
+                                        # Rebuilt from `old_string`/`new_string`
+                                        # fragments, not the file: hunk numbers
+                                        # start at 1 and are not file-relative.
+                                        diff_show_numbers=False,
+                                    )
+                                )
                     else:
                         data.tool_status = ToolStatus.ERROR
                     data.tool_output = content
@@ -16307,7 +18372,29 @@ class DeepAgentsApp(App):
         for idx in pending_tool_indices.values():
             result[idx].tool_status = ToolStatus.REJECTED
 
-        return result
+        collapsed: list[MessageData] = []
+        for groupable, rows in groupby(
+            result,
+            key=lambda message: (
+                message.type == MessageType.TOOL
+                and message.tool_status == ToolStatus.SUCCESS
+                and message.tool_name not in _TOOL_GROUP_EXCLUSIONS
+                and not message.tool_display_caveat
+            ),
+        ):
+            group = list(rows)
+            if groupable:
+                collapsed.append(
+                    MessageData(
+                        type=MessageType.TOOL_GROUP,
+                        content="",
+                        timestamp=group[0].timestamp,
+                        tool_group_messages=group,
+                    )
+                )
+            else:
+                collapsed.extend(group)
+        return collapsed
 
     async def _get_thread_state_values(self, thread_id: str) -> dict[str, Any]:
         """Fetch thread state values for a thread.
@@ -16352,10 +18439,7 @@ class DeepAgentsApp(App):
             context-token count, and the persisted model spec (if any).
         """
         state_values = await self._get_thread_state_values(thread_id)
-        raw_tokens = state_values.get("_context_tokens")
-        context_tokens = (
-            raw_tokens if isinstance(raw_tokens, int) and raw_tokens >= 0 else 0
-        )
+        context_tokens = _persisted_context_tokens(state_values)
         raw_spec = state_values.get("_model_spec")
         model_spec = raw_spec if isinstance(raw_spec, str) else ""
         raw_params = state_values.get("_model_params")
@@ -16501,16 +18585,49 @@ class DeepAgentsApp(App):
             exclusive=False,
         )
 
-    async def _mount_previous_thread_hint(self, previous_thread_id: str | None) -> bool:
+    def _store_has_server_output(self) -> bool:
+        """Return whether the live message store holds server-backed output.
+
+        Feeds `_mount_previous_thread_hint`'s `had_agent_output` gate; see
+        `_SERVER_OUTPUT_MESSAGE_TYPES` for why `USER` rows do not count.
+        `assistant_local_only` rows are excluded too: non-incognito `!` shell
+        output borrows `AssistantMessage` to render, so the row type alone
+        would let a thread that only ran a shell command look like agent work.
+
+        Callers must read this *before* `_clear_messages` empties the store —
+        it describes the thread being left, not the one being loaded. Every
+        current caller snapshots it into a local at the top of its handler for
+        that reason; moving the read down next to its use would make the gate
+        permanently `False`.
+
+        Returns:
+            `True` when the store holds at least one message type implying the
+            user did conversational work in this thread.
+        """
+        return any(
+            msg.type in _SERVER_OUTPUT_MESSAGE_TYPES and not msg.assistant_local_only
+            for msg in self._message_store.get_all_messages()
+        )
+
+    async def _mount_previous_thread_hint(
+        self,
+        previous_thread_id: str | None,
+        *,
+        had_agent_output: bool,
+    ) -> bool:
         """Point the user back at the thread the session just left.
 
         Shared by every path that moves the session off a thread: `/clear`,
         `/force-clear`, a mid-session thread switch, and both agent swaps.
 
-        The hint is suppressed wherever `/threads -r` would dead-end: threads
-        with no checkpoint row (`-r` can't resume them), threads whose owning
-        agent can't be determined, and cross-agent threads on remote-server
-        sessions, which cannot perform the agent restart `-r` would need. The
+        The hint is suppressed in two situations. First, where `/threads -r`
+        would dead-end: threads with no checkpoint row (`-r` can't resume
+        them), threads whose owning agent can't be determined, and cross-agent
+        threads on remote-server sessions, which cannot perform the agent
+        restart `-r` would need. Second, where the thread holds no
+        conversational work to return to (`had_agent_output`) — a checkpoint
+        row alone is too weak a signal, since `/clear` plus a server-mode
+        thread registration produces one for a thread the user never used. The
         return value lets callers fall back to a heavier remedy — the agent
         swap offers a relaunch command — when `-r` can't reach the thread.
 
@@ -16518,12 +18635,30 @@ class DeepAgentsApp(App):
             previous_thread_id: The thread the session left. Tolerates `None`
                 by mounting nothing, since the underlying field is nullable
                 before the first reset; all current callers pass a real id.
+            had_agent_output: Whether that thread saw server-backed output,
+                from `_store_has_server_output` read before the store was
+                cleared. Keyword-only and required so a new caller has to
+                decide when to sample it rather than inherit a wrong default.
 
         Returns:
             `True` when a hint was mounted, `False` when it was suppressed or
             could not be rendered.
         """
         if not previous_thread_id:
+            return False
+
+        if not had_agent_output:
+            # `info`, not `debug`, for the same reason as the store-failure
+            # branch below: the always-on ring buffer behind the Debug Console
+            # captures INFO and above, and at `debug` a vanished hint leaves no
+            # trace. Deliberately does not report a store count — by the time
+            # `_resume_thread` reaches here the store holds the *incoming*
+            # thread's history, so any count would describe the wrong thread.
+            logger.info(
+                "Suppressing previous-thread hint for %s: no server-backed "
+                "output was recorded in it",
+                previous_thread_id,
+            )
             return False
 
         import sqlite3
@@ -16560,10 +18695,14 @@ class DeepAgentsApp(App):
         if not owner or (owner != active_agent and self._server_kwargs is None):
             return False
 
+        thread_links_configured = self._thread_links_configured()
         resume_hint = " (Resume with /threads -r)"
-        previous_msg_widget = AppMessage(
+        previous_message = (
             f"Previous thread: {previous_thread_id}{resume_hint}"
+            if thread_links_configured
+            else "Resume previous thread with /threads -r"
         )
+        previous_msg_widget = AppMessage(previous_message)
         # The hint is cosmetic, so a mount fault must not escape into the
         # caller's error handling. Two callers wrap this in a rollback: a raise
         # from `_resume_thread` would undo an already-completed switch and
@@ -16572,12 +18711,13 @@ class DeepAgentsApp(App):
         # server came up healthy. Both would misreport success as failure.
         try:
             await self._mount_message(previous_msg_widget)
-            self._schedule_thread_message_link(
-                previous_msg_widget,
-                prefix="Previous thread",
-                thread_id=previous_thread_id,
-                suffix=resume_hint,
-            )
+            if thread_links_configured:
+                self._schedule_thread_message_link(
+                    previous_msg_widget,
+                    prefix="Previous thread",
+                    thread_id=previous_thread_id,
+                    suffix=resume_hint,
+                )
         except Exception:
             logger.warning(
                 "Could not mount previous-thread hint for %s",
@@ -16600,8 +18740,8 @@ class DeepAgentsApp(App):
         this reuses that data. Otherwise, it fetches checkpoint state from the
         agent and converts stored messages into lightweight `MessageData`
         objects. The method then bulk-loads into the `MessageStore` and mounts
-        only the last `WINDOW_SIZE` widgets to reduce DOM operations on large
-        threads.
+        only the initial tail window synchronously, then warms toward the soft
+        window size in small post-refresh batches.
 
         Args:
             thread_id: Optional explicit thread ID to load.
@@ -16623,6 +18763,15 @@ class DeepAgentsApp(App):
             )
             return
 
+        # Mounted from the `finally` block, so it survives every early return
+        # and the resilient `except` below. Oversized saved state disables goal
+        # work and grading until the user clears or shortens it, and
+        # `_restore_goal_rubric_state` has already made it live by then, so a
+        # path that bails out silently would leave the user with a
+        # non-functional goal and no explanation. Mounting last also keeps it
+        # below the restored transcript.
+        size_warning: ErrorMessage | None = None
+
         try:
             # Fetch + convert, or reuse preloaded payload on thread switch.
             payload = (
@@ -16630,7 +18779,18 @@ class DeepAgentsApp(App):
                 if preloaded_payload is not None
                 else await self._fetch_thread_history_data(history_thread_id)
             )
-            self._restore_goal_rubric_state(payload)
+            await self._restore_goal_rubric_state(payload)
+            size_error = self._active_goal_state_size_error()
+            size_warning = (
+                ErrorMessage(
+                    "Saved goal/rubric state is too large to use safely, so "
+                    "goal work and grading are disabled. Clear and recreate "
+                    "the goal, or replace/clear the rubric. "
+                    f"{size_error}"
+                )
+                if size_error is not None
+                else None
+            )
             self._hooks.record_messages(
                 payload.transcript_messages,
                 thread_id=history_thread_id,
@@ -16656,6 +18816,12 @@ class DeepAgentsApp(App):
                 payload.session_cost_usd,
                 has_restored_model_usage=payload.has_model_usage,
             )
+            if payload.cache_state is not None:
+                # Raw values on purpose: `_sync_cache_state_from_state` is the
+                # single validator, so a malformed checkpoint logs the same
+                # discard warning here as it does on the live-sync path. Runs
+                # after `_reset_thread_usage`, which clears these fields.
+                self._sync_cache_state_from_state(payload.cache_state)
             if payload.context_tokens > 0:
                 self._on_tokens_update(payload.context_tokens)
 
@@ -16668,6 +18834,10 @@ class DeepAgentsApp(App):
             try:
                 messages_container = self.query_one("#messages", Container)
             except NoMatches:
+                logger.warning(
+                    "Skipping transcript render for %s: no #messages container",
+                    history_thread_id,
+                )
                 return
             await self._ensure_transcript_spacers(messages_container)
 
@@ -16710,7 +18880,7 @@ class DeepAgentsApp(App):
             # Bulk load into store (sets visible window over the deduped set).
             _archived, visible = self._message_store.bulk_load(deduped)
 
-            # 6-7. Create and mount the visible widgets (max WINDOW_SIZE),
+            # 6-7. Create and mount the initial visible widget window,
             # skipping any whose ID is already mounted (guard (b) above).
             # `existing_ids` includes footer node IDs, which never collide with
             # the `msg-`/`asst-` message IDs checked here.
@@ -16728,12 +18898,9 @@ class DeepAgentsApp(App):
                     )
                     continue
                 existing_ids.add(msg_data.id)
-                widget = msg_data.to_widget()
+                widget, footer = self._build_message_with_timestamp_footer(msg_data)
                 mounted.append((widget, msg_data))
                 nodes.append(widget)
-                footer = self._build_message_timestamp_footer(
-                    msg_data, visible=self._message_timestamps_visible
-                )
                 if footer is not None:
                     nodes.append(footer)
             if nodes:
@@ -16757,8 +18924,9 @@ class DeepAgentsApp(App):
                             history_thread_id,
                             error,
                         )
-            for _widget, msg_data in mounted:
-                self._schedule_message_height_measurement(msg_data.id)
+            self._schedule_message_height_measurements(
+                [msg_data.id for _widget, msg_data in mounted]
+            )
             self._sync_transcript_spacers(messages_container)
 
             # 9. Add footer immediately and resolve link asynchronously
@@ -16769,14 +18937,17 @@ class DeepAgentsApp(App):
                 prefix="Resumed thread",
                 thread_id=history_thread_id,
             )
-
-            # 10. Scroll once to bottom after history loads
-            def scroll_to_end() -> None:
-                with suppress(NoMatches):
-                    chat = self.query_one("#chat", VerticalScroll)
-                    chat.scroll_end(animate=False, immediate=True)
-
-            self.set_timer(0.1, scroll_to_end)
+            # 10. Scroll once to bottom after history loads. Leave `immediate`
+            # at its default: `scroll_end()` defers via `call_after_refresh` so
+            # `max_scroll_y` is read once layout has settled. With
+            # `immediate=True` it reads bounds computed before the just-mounted
+            # history is laid out and strands the view short of the newest
+            # message. Validated against Textual 8.2.8; guarded by
+            # `TestResumeScrollPosition`.
+            with suppress(NoMatches):
+                chat = self.query_one("#chat", VerticalScroll)
+                chat.scroll_end(animate=False)
+            self.call_after_refresh(self._start_history_prefetch)
 
         except Exception as e:  # Resilient history loading
             logger.exception(
@@ -16785,11 +18956,71 @@ class DeepAgentsApp(App):
             )
             await self._mount_message(AppMessage(f"Could not load history: {e}"))
         finally:
+            if size_warning is not None:
+                try:
+                    await self._mount_message(size_warning)
+                except Exception:
+                    # This message is the only explanation the user gets for a
+                    # non-functional goal, so losing it silently is the outcome
+                    # the `finally` exists to prevent.
+                    logger.exception(
+                        "Failed to surface oversized goal-state warning for %s",
+                        history_thread_id,
+                    )
             if resolve_pending_goal:
                 try:
                     await self._remount_pending_goal_rubric_review()
                 except Exception:
                     logger.exception("Failed to restore pending goal review")
+
+    def _build_message_with_timestamp_footer(
+        self, data: MessageData
+    ) -> tuple[Widget, Static | None]:
+        """Recreate one stored message with its linked timestamp footer.
+
+        Args:
+            data: Message row to recreate.
+
+        Returns:
+            Message widget and optional timestamp footer.
+        """
+        widget = data.to_widget(
+            tool_group_detail_builder=self._build_message_with_timestamp_footer
+        )
+        footer = self._build_message_timestamp_footer(
+            data, visible=self._message_timestamps_visible
+        )
+        self._link_message_timestamp_footer(widget, footer)
+        return widget, footer
+
+    def _build_hydration_entry(
+        self, data: MessageData
+    ) -> tuple[Widget, MessageData, Static | None]:
+        """Build one stored row, substituting a visible placeholder on failure.
+
+        Args:
+            data: Stored row to rebuild.
+
+        Returns:
+            Widget, source data, and optional timestamp footer for batch mounting.
+        """
+        try:
+            widget, footer = self._build_message_with_timestamp_footer(data)
+        except Exception:
+            logger.warning(
+                "Failed to hydrate message %s; showing placeholder",
+                data.id,
+                exc_info=True,
+            )
+            self._notify_hydration_failure()
+            widget = ErrorMessage(
+                "This message could not be restored. See the debug log for details.",
+                id=data.id,
+            )
+            footer = self._build_message_timestamp_footer(
+                data, visible=self._message_timestamps_visible
+            )
+        return widget, data, footer
 
     @staticmethod
     def _build_message_timestamp_footer(
@@ -16822,6 +19053,16 @@ class DeepAgentsApp(App):
             id=_message_timestamp_footer_id(data.id),
             classes=classes,
         )
+
+    @staticmethod
+    def _link_message_timestamp_footer(widget: Widget, footer: Static | None) -> None:
+        """Make a tool footer follow its owning row's visibility.
+
+        A no-op when there is no footer or the row is not a `ToolCallMessage`,
+        which is why most call sites can invoke it unconditionally.
+        """
+        if footer is not None and isinstance(widget, ToolCallMessage):
+            widget._register_visibility_accessories(footer)
 
     def _sync_message_timestamps_display(self) -> None:
         """Apply the current visibility to every mounted timestamp footer.
@@ -16891,6 +19132,40 @@ class DeepAgentsApp(App):
         else:
             chat.styles.scrollbar_size_vertical = 0
 
+    async def _toggle_diff_line_numbers(self) -> None:
+        """Toggle diff-hunk line numbers and persist the preference.
+
+        Applies to diffs mounted after the toggle; already-mounted diff
+        widgets keep the numbers they were rendered with because the flag is
+        captured per widget at construction.
+        """
+        self._show_diff_line_numbers = not self._show_diff_line_numbers
+        if self._ui_adapter is not None:
+            self._ui_adapter._show_diff_line_numbers = self._show_diff_line_numbers
+        try:
+            status = await asyncio.to_thread(
+                _save_show_diff_line_numbers_result,
+                self._show_diff_line_numbers,
+            )
+            if status.message is not None:
+                self.notify(
+                    status.message,
+                    severity=status.severity,
+                    timeout=6,
+                    markup=False,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to persist diff line-number preference",
+                exc_info=True,
+            )
+            self.notify(
+                "Diff line numbers toggled for this session but could not be saved.",
+                severity="error",
+                timeout=6,
+                markup=False,
+            )
+
     async def _toggle_scrollbar(self) -> None:
         """Toggle chat scrollbar visibility and persist the preference."""
         self._show_scrollbar = not self._show_scrollbar
@@ -16922,7 +19197,7 @@ class DeepAgentsApp(App):
     async def _mount_message(
         self,
         widget: Static | AssistantMessage | ToolCallMessage | SkillMessage,
-    ) -> None:
+    ) -> bool:
         """Mount a message widget to the messages area.
 
         This method also stores the message data and handles pruning
@@ -16934,17 +19209,23 @@ class DeepAgentsApp(App):
 
         Args:
             widget: The message widget to mount
+
+        Returns:
+            Whether the widget reached the screen. Callers that treat a mounted
+            widget as having delivered something the user must see — a display
+            caveat, in particular — have to distinguish this from the silent
+            teardown skips, or they credit a surface that never rendered.
         """
         try:
             messages = self.query_one("#messages", Container)
         except NoMatches:
-            return
+            return False
 
         # During shutdown (e.g. Ctrl+D mid-stream) the container may still
         # be in the DOM tree but already detached, so mount() would raise
         # MountError. Bail out silently — the app is exiting anyway.
         if not messages.is_attached:
-            return
+            return False
 
         if isinstance(widget, QueuedUserMessage):
             # Queued placeholders mount at the bottom and stay out of the
@@ -16955,7 +19236,7 @@ class DeepAgentsApp(App):
                 input_container.scroll_visible()
             except NoMatches:
                 pass
-            return
+            return True
 
         await self._ensure_transcript_spacers(messages)
         await self._hydrate_all_messages_below()
@@ -16983,6 +19264,7 @@ class DeepAgentsApp(App):
         footer = self._build_message_timestamp_footer(
             message_data, visible=self._message_timestamps_visible
         )
+        self._link_message_timestamp_footer(widget, footer)
 
         # Coalesce the whole mount-and-fold sequence into a single repaint.
         # Otherwise mounting a groupable tool paints it at full height, then
@@ -17019,11 +19301,11 @@ class DeepAgentsApp(App):
                 elif is_groupable_diff:
                     self._active_tool_group.add_collapsible(widget, *accessories)
 
-        self._schedule_message_height_measurement(message_data.id)
+        self._schedule_message_height_measurements([message_data.id])
         self._sync_transcript_spacers(messages)
 
-        # Prune old widgets if window exceeded
-        await self._prune_old_messages()
+        # Keep appends cheap; trim the old edge only after transcript activity settles.
+        self._schedule_transcript_prune("above")
 
         # Scroll to keep input bar visible
         try:
@@ -17032,58 +19314,82 @@ class DeepAgentsApp(App):
         except NoMatches:
             pass
 
+        return True
+
     async def _hydrate_all_messages_below(self) -> None:
         """Mount any hidden tail before appending fresh transcript output."""
         while self._message_store.has_messages_below:
             before = self._message_store.get_visible_range()[1]
-            await self._hydrate_messages_below()
+            await self._hydrate_messages("below")
             after = self._message_store.get_visible_range()[1]
             if after == before:
                 break
 
-    async def _prune_old_messages(self) -> None:
-        """Prune oldest message widgets if we exceed the window size.
+    async def _prune_messages(
+        self,
+        direction: Literal["above", "below"],
+        messages_container: Container | None = None,
+        *,
+        count: int | None = None,
+    ) -> int:
+        """Prune a bounded batch from one mounted-window edge.
 
-        This removes widgets from the DOM but keeps data in MessageStore
-        for potential re-hydration when scrolling up.
+        Args:
+            direction: Edge to remove messages from.
+            messages_container: Cached transcript container, when available.
+            count: Maximum messages to remove; defaults to the soft-limit excess.
+
+        Returns:
+            Number of messages removed.
         """
-        if not self._message_store.window_exceeded():
-            return
-
-        try:
-            messages_container = self.query_one("#messages", Container)
-        except NoMatches:
-            logger.debug("Skipping pruning: #messages container not found")
-            return
-
-        to_prune = self._message_store.get_messages_to_prune()
+        generation = self._transcript_generation
+        below = direction == "below"
+        to_prune = (
+            self._message_store.get_messages_to_prune_below(count)
+            if below
+            else self._message_store.get_messages_to_prune(count)
+        )
         if not to_prune:
-            return
+            return 0
+        if messages_container is None:
+            try:
+                messages_container = self.query_one("#messages", Container)
+            except NoMatches:
+                return 0
 
         pruned_ids: list[str] = []
-        for msg_data in to_prune:
+        for data in to_prune:
+            if generation != self._transcript_generation:
+                return 0
+            footer_id = _message_timestamp_footer_id(data.id)
             try:
-                widget = messages_container.query_one(f"#{msg_data.id}")
-                footer_id = _message_timestamp_footer_id(msg_data.id)
-                with suppress(NoMatches):
-                    footer = messages_container.query_one(f"#{footer_id}")
-                    await footer.remove()
-                await widget.remove()
-                pruned_ids.append(msg_data.id)
+                widget = messages_container.query_one(f"#{data.id}")
             except NoMatches:
-                # Widget not found -- do NOT mark as pruned to avoid
-                # desyncing the store from the actual DOM state
-                logger.debug(
-                    "Widget %s not found during pruning, skipping",
-                    msg_data.id,
+                logger.warning(
+                    "Widget %s missing during %s pruning; reconciling store window",
+                    data.id,
+                    direction,
                 )
+                widget = None
+            if isinstance(widget, LazyToolGroupSummary):
+                widget._snapshot_detail_state()
+            with suppress(NoMatches):
+                footer = messages_container.query_one(f"#{footer_id}")
+                await footer.remove()
+            if generation != self._transcript_generation:
+                return 0
+            if widget is not None:
+                await widget.remove()
+                if generation != self._transcript_generation:
+                    return 0
+            pruned_ids.append(data.id)
 
-        if pruned_ids:
+        if below:
+            self._message_store.mark_pruned_below(pruned_ids)
+        else:
             self._message_store.mark_pruned(pruned_ids)
-            self._sync_transcript_spacers(messages_container)
-            # Drop any group summaries whose members were all pruned away so a
-            # stray collapsed line never lingers above the window. Only reachable
-            # when something was actually pruned this pass.
+        self._sync_transcript_spacers(messages_container)
+        if not below:
             for summary in list(self.query(ToolGroupSummary)):
                 if not summary.has_attached_members:
                     try:
@@ -17093,39 +19399,7 @@ class DeepAgentsApp(App):
                             "Failed to remove orphaned tool group summary",
                             exc_info=True,
                         )
-
-    async def _prune_messages_below_window(
-        self, messages_container: Container | None = None
-    ) -> None:
-        """Prune newest mounted widgets when scrolling into older history."""
-        to_prune = self._message_store.get_messages_to_prune_below()
-        if not to_prune:
-            return
-        if messages_container is None:
-            try:
-                messages_container = self.query_one("#messages", Container)
-            except NoMatches:
-                return
-
-        pruned_ids: list[str] = []
-        for msg_data in to_prune:
-            try:
-                widget = messages_container.query_one(f"#{msg_data.id}")
-                footer_id = _message_timestamp_footer_id(msg_data.id)
-                with suppress(NoMatches):
-                    footer = messages_container.query_one(f"#{footer_id}")
-                    await footer.remove()
-                await widget.remove()
-                pruned_ids.append(msg_data.id)
-            except NoMatches:
-                logger.debug(
-                    "Widget %s not found during bottom pruning, skipping",
-                    msg_data.id,
-                )
-
-        if pruned_ids:
-            self._message_store.mark_pruned_below(pruned_ids)
-            self._sync_transcript_spacers(messages_container)
+        return len(pruned_ids)
 
     def _reveal_pending_tool_calls(self) -> None:
         """Surface grouped tool calls before asking for approval."""
@@ -17217,6 +19491,13 @@ class DeepAgentsApp(App):
                     groupable = (
                         child.tool_name not in _TOOL_GROUP_EXCLUSIONS
                         and child.is_success
+                        # A caveat is carried in the row's own output and the
+                        # summary line is built from tool names, so folding one
+                        # would summarize away the only statement that the
+                        # change could not be shown. The live path evicts these
+                        # (`_evict_unfoldable`); a rehydrated transcript has to
+                        # not fold them in the first place.
+                        and not child.has_display_caveat
                         and not child.has_class("-grouped")
                     )
                     if not groupable:
@@ -17337,6 +19618,14 @@ class DeepAgentsApp(App):
             tool_duration=data.tool_duration,
             tool_expanded=data.tool_expanded,
             tool_reject_reason=data.tool_reject_reason,
+            # Set after the row is first stored, when its diff mounts. Without
+            # it the store keeps the mount-time `False` and rehydration
+            # resurrects the row next to the diff that replaced it.
+            tool_diff_superseded=data.tool_diff_superseded,
+            # The display caveat can arrive after the initial mount when a
+            # file change cannot be rendered. Keep it through virtualization
+            # so hydration does not fold away the warning.
+            tool_display_caveat=data.tool_display_caveat,
         )
         if data.tool_status in {ToolStatus.PENDING, ToolStatus.RUNNING}:
             self._message_store.protect_message(widget.id)
@@ -17345,6 +19634,20 @@ class DeepAgentsApp(App):
             # unrecognized status serializes to None; unprotecting then could
             # let a still-live row be virtualized mid-run.
             self._message_store.unprotect_message(widget.id)
+            if self._message_store.window_exceeded():
+                self._schedule_transcript_prune(self._transcript_prune_direction)
+
+    def on_lazy_tool_group_summary_expansion_changed(
+        self,
+        event: LazyToolGroupSummary.ExpansionChanged,
+    ) -> None:
+        """Keep lazy tool-group expansion state across virtualization."""
+        if event.widget.id:
+            self._message_store.update_message(
+                event.widget.id,
+                tool_group_expanded=event.expanded,
+            )
+            self._schedule_message_height_measurements([event.widget.id])
 
     def on_rubric_result_message_expansion_changed(
         self,
@@ -17356,7 +19659,7 @@ class DeepAgentsApp(App):
                 event.widget.id,
                 rubric_expanded=event.expanded,
             )
-            self._schedule_message_height_measurement(event.widget.id)
+            self._schedule_message_height_measurements([event.widget.id])
 
     def on_user_message_expansion_changed(
         self,
@@ -17373,13 +19676,19 @@ class DeepAgentsApp(App):
                 event.widget.id,
                 user_expanded=event.expanded,
             )
-            self._schedule_message_height_measurement(event.widget.id)
+            self._schedule_message_height_measurements([event.widget.id])
 
     async def _clear_messages(self) -> None:
         """Clear the messages area and message store."""
+        self._transcript_generation += 1
         # Drop buffered `!` shell output so it never leaks across a thread
         # reset, switch, or resume.
         self._pending_shell_messages.clear()
+        self._hydration_requests.clear()
+        self._history_prefetch_active = False
+        if self._transcript_prune_timer is not None:
+            self._transcript_prune_timer.stop()
+            self._transcript_prune_timer = None
         # Clear the message store first
         self._message_store.clear()
         # Drop the open tool group; its widget is about to leave the DOM.
@@ -17456,8 +19765,14 @@ class DeepAgentsApp(App):
         submission) only when the input holds no draft, so typed text is never
         clobbered. Unlike the queued-message pop, this path does not consume
         the message — the interrupted `UserMessage` stays visible in the
-        transcript, dimmed via `set_cancelled()` — so when it does not restore
-        it stays silent rather than reporting a "discarded" outcome.
+        transcript, dimmed via `set_cancelled()`.
+
+        A successful restore is deliberately silent: the text reappearing in
+        the chat input is its own confirmation, so a toast would only cover the
+        transcript (worse in a tiled terminal) to report something already on
+        screen. The paths that decline to restore are silent for a different
+        reason — nothing was consumed, so unlike the queued-message pop there is
+        no "discarded" outcome to report; the prompt is still in the transcript.
 
         Restore is also skipped once model text or a tool call is visible for
         the turn (`_active_turn_visible_output_started`). Returning the prompt
@@ -17486,7 +19801,6 @@ class DeepAgentsApp(App):
         snapshot = message.media_snapshot
         if snapshot is not None:
             self._image_tracker.restore(snapshot)
-        self.notify("Message restored to input", timeout=2)
 
     def _cleanup_external_event_source_sync(self) -> None:
         """Synchronously close the external event listener and unlink its socket.
@@ -17674,11 +19988,22 @@ class DeepAgentsApp(App):
         `_agent_turn_started` rather than the worker's own state. See
         `_agent_turn_started` for what goes wrong when nothing releases the turn.
 
+        The offload worker needs the same recovery because command dispatch
+        reserves `_agent_running` before scheduling it. A cancellation before
+        its first step must release that reservation and clear the worker
+        reference because `_run_offload_task` never reaches its `finally`.
+
         Args:
             worker: The worker that was just cancelled. Callers may pass any
                 worker — `_cancel_worker` also handles the shell worker —
-                so anything that is not the current `_agent_worker` is ignored.
+                so anything that is not the current `_agent_worker` or
+                `_offload_worker` is ignored.
         """
+        if worker is self._offload_worker and not self._offload_task_started:
+            self._offload_worker = None
+            self._set_agent_running(False)
+            return
+
         if worker is not self._agent_worker or self._agent_turn_started:
             return
 
@@ -17908,10 +20233,11 @@ class DeepAgentsApp(App):
         5. If approval menu is active, reject it
         6. If ask-user menu is active, cancel it
         7. If queued messages exist, pop the last one (LIFO)
-        8. If agent is running, interrupt it (restoring the interrupted prompt
+        8. If offload is running, interrupt it
+        9. If agent is running, interrupt it (restoring the interrupted prompt
            to the chat input when it is empty and no user-visible model output
            — text or a tool call — has appeared yet for the turn)
-        9. Otherwise, a second Esc clears the chat input draft (undoable)
+        10. Otherwise, a second Esc clears the chat input draft (undoable)
         """
         from deepagents_code.tui.widgets.thread_selector import ThreadSelectorScreen
 
@@ -17980,6 +20306,10 @@ class DeepAgentsApp(App):
         # one at a time; once the queue is empty the next ESC will interrupt.
         if self._pending_messages:
             self._pop_last_queued_message()
+            return
+
+        if self._offload_worker is not None:
+            self._cancel_worker(self._offload_worker)
             return
 
         # If agent is running, interrupt it and discard queued messages
@@ -18246,6 +20576,13 @@ class DeepAgentsApp(App):
         restart_task = self._restart_respawn_task
         if restart_task is not None and not restart_task.done():
             restart_tasks.add(restart_task)
+        # `/reload` runs in a detached task and may itself respawn the owned
+        # server. Treat it like other restart-capable work: cancel and settle
+        # it before stopping the server so it cannot rebuild the agent after
+        # teardown begins.
+        reload_task = self._reload_task
+        if reload_task is not None and not reload_task.done():
+            restart_tasks.add(reload_task)
         should_wait_for_restart = bool(restart_tasks)
         # Already cancelled above; awaited in the bounded teardown phase below so
         # a continuation's cancellation handler (which may be killing a `uv`
@@ -18336,7 +20673,11 @@ class DeepAgentsApp(App):
                     from deepagents_code.hooks.models.domain import SessionEndCause
 
                     client_session_end_task = asyncio.ensure_future(
-                        self._hooks.on_session_end(SessionEndCause.PROMPT_INPUT_EXIT)
+                        _wait_for_session_end(
+                            self._hooks.on_session_end(
+                                SessionEndCause.PROMPT_INPUT_EXIT
+                            )
+                        )
                     )
 
                 async def _drain_hooks() -> None:
@@ -18634,12 +20975,14 @@ class DeepAgentsApp(App):
             panel.on_subagent_event(event)
 
     async def _on_auto_mode_event(self, event: dict[str, Any]) -> None:
-        """Render one compact sanitized Auto event in the transcript.
+        """Render one compact sanitized Auto control-state notice.
 
         Args:
             event: Validated custom-stream event from the server middleware.
         """
         kind = event.get("event")
+        if kind not in {"fallback", "warning"}:
+            return
         reason = str(event.get("reason") or "")
         if kind == "fallback":
             if event.get("mode") == "manual":
@@ -18647,23 +20990,30 @@ class DeepAgentsApp(App):
 
                 persisted = await self._write_live_approval_mode(ApprovalMode.MANUAL)
                 self._on_approval_mode_fallback(ApprovalMode.MANUAL.value)
+                # A stored `[startup].recent = "auto"` would otherwise put the
+                # next launch straight back into the mode the server just
+                # refused, discarding this safety decision at the session
+                # boundary. The user is told about the fallback below, so the
+                # startup preference has to follow it.
+                await self._persist_startup_approval_mode(ApprovalMode.MANUAL)
                 if not persisted:
                     logger.warning("Could not persist server-requested Manual fallback")
                 text = f"Auto fell back to Manual: {reason}"
                 self.notify(text, severity="warning", timeout=10, markup=False)
             else:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Auto human fallback reason=%s consecutive_denials=%s "
+                        "consecutive_unavailable=%s total_denials=%s",
+                        reason,
+                        event.get("consecutive_denials", 0),
+                        event.get("consecutive_unavailable", 0),
+                        event.get("total_denials", 0),
+                    )
                 text = (
-                    "Auto fallback: human approval required "
-                    f"(denials {event.get('consecutive_denials', 0)}, "
-                    f"unavailable {event.get('consecutive_unavailable', 0)}, "
-                    f"total {event.get('total_denials', 0)})."
+                    "Auto couldn't confidently approve this action, so it needs your "
+                    "review. Auto will continue afterward."
                 )
-        elif kind == "denial":
-            text = f"Auto denied [{event.get('category', 'policy')}]: {reason}"
-        elif kind == "unavailable":
-            # Reason is a short cause fragment from the server; keep the UI
-            # line outcome-focused so fail-closed denial is obvious.
-            text = f"Auto classifier unavailable: {reason} — tool not executed"
         else:
             text = f"Auto warning: {reason}"
         await self._mount_message(AppMessage(text))
@@ -18685,40 +21035,34 @@ class DeepAgentsApp(App):
         from deepagents_code.tui.modals.plugin_manager import PluginManagerScreen
         from deepagents_code.tui.widgets.agent_selector import AgentSelectorScreen
         from deepagents_code.tui.widgets.auth import AuthManagerScreen, AuthPromptScreen
+        from deepagents_code.tui.widgets.effort_selector import EffortSelectorScreen
+        from deepagents_code.tui.widgets.launch_init import (
+            LaunchGoalCriteriaPreferenceScreen,
+        )
         from deepagents_code.tui.widgets.mcp_viewer import MCPViewerScreen
-        from deepagents_code.tui.widgets.notification_center import (
-            NotificationCenterScreen,
-        )
-        from deepagents_code.tui.widgets.notification_detail import (
-            NotificationDetailScreen,
-        )
-        from deepagents_code.tui.widgets.notification_settings import (
-            NotificationSettingsScreen,
-        )
         from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
         from deepagents_code.tui.widgets.thread_selector import ThreadSelectorScreen
-        from deepagents_code.tui.widgets.update_available import UpdateAvailableScreen
 
         if isinstance(self.screen, ThreadSelectorScreen):
             self.screen.action_focus_previous_filter()
             return
         if isinstance(
             self.screen,
-            (ThemeSelectorScreen, AgentSelectorScreen, AuthManagerScreen),
+            (
+                ThemeSelectorScreen,
+                AgentSelectorScreen,
+                AuthManagerScreen,
+                EffortSelectorScreen,
+                LaunchGoalCriteriaPreferenceScreen,
+            ),
         ):
             self.screen.action_cursor_up()
             return
-        if isinstance(self.screen, (AuthPromptScreen, NotificationSettingsScreen)):
-            # These modals hold multiple focusable inputs; reuse shift+tab to
+        if isinstance(self.screen, AuthPromptScreen):
+            # This modal holds multiple focusable inputs; reuse shift+tab to
             # step focus backward (the Screen's own app.focus_previous binding
             # never fires because this priority binding consumes the key first).
             self.screen.focus_previous()
-            return
-        if isinstance(
-            self.screen,
-            (UpdateAvailableScreen, NotificationCenterScreen, NotificationDetailScreen),
-        ):
-            self.screen.action_move_up()
             return
         if isinstance(self.screen, MCPViewerScreen):
             self.screen.action_jump_up()
@@ -18726,8 +21070,36 @@ class DeepAgentsApp(App):
         if isinstance(self.screen, PluginManagerScreen):
             self.screen.action_previous_tab()
             return
-        # shift+tab is reused for navigation inside modal screens (e.g.
-        # ModelSelectorScreen); skip the toggle so it doesn't fire through.
+        from deepagents_code.tui.widgets.notification_center import (
+            NotificationCenterScreen,
+        )
+
+        if (
+            isinstance(self.screen, NotificationCenterScreen)
+            and self.screen.settings_expanded
+            and self.screen.settings_checkbox_focused
+        ):
+            # Expanded settings hand key focus to real checkboxes, so
+            # shift+tab must step focus backward between them rather than
+            # move the row cursor via `_SupportsReverseNav` below (which
+            # would leave focus stranded on the first checkbox).
+            self.screen.action_focus_previous()
+            return
+        if isinstance(self.screen, _SupportsReverseNav):
+            # Membership is by `action_move_up` presence, not an enumerated
+            # list: this catches the cursor-style modals (update-available,
+            # cold-cache, notification center/detail, model selector) whose
+            # rows have no focusable children, and picks up new ones
+            # automatically. Without this branch a screen's own priority
+            # `shift+tab -> move_up` binding would never fire, because this
+            # app-level priority binding wins dispatch.
+            #
+            # Screens wanting shift+tab to do something else, or nothing, need
+            # an explicit branch *above* this one.
+            self.screen.action_move_up()
+            return
+        # Any remaining modal swallows the key rather than letting the approval
+        # toggle fire behind it.
         if isinstance(self.screen, ModalScreen):
             return
         # Delegate shift+tab to ask_user navigation when interview is active.
@@ -18736,6 +21108,7 @@ class DeepAgentsApp(App):
             return
         from deepagents_code.approval_mode import (
             ApprovalMode,
+            has_auto_mode_notice,
             has_yolo_acknowledgement,
             next_approval_mode,
         )
@@ -18757,6 +21130,11 @@ class DeepAgentsApp(App):
             )
             return
 
+        # Gate the first Auto switch on the education confirmation.
+        if target is ApprovalMode.AUTO and not has_auto_mode_notice():
+            self._prompt_auto_mode_confirmation()
+            return
+
         # Gate the first YOLO switcher entry on the same policy acknowledgement
         # as `--yolo`. Do not activate YOLO until the user continues.
         if target is ApprovalMode.YOLO and not has_yolo_acknowledgement():
@@ -18767,6 +21145,11 @@ class DeepAgentsApp(App):
 
     async def _set_approval_mode(self, target: ApprovalMode) -> bool:
         """Apply an approval-mode change after optional live Store acknowledgement.
+
+        On success this also records Manual or Auto as the startup preference
+        for the next launch, and can warn that the record could not be written.
+        YOLO is never recorded. A rejected live write returns early, so nothing
+        durable is written for a mode the session did not enter.
 
         Args:
             target: Mode to select.
@@ -18811,20 +21194,411 @@ class DeepAgentsApp(App):
         if self._status_bar:
             self._status_bar.set_approval_mode(target.value)
         if target is ApprovalMode.AUTO:
-            self._notify_auto_mode_enabled_once()
-            if should_persist_live:
-                await self._auto_accept_pending_goal_rubric()
+            self._notify_auto_classifier_active()
         elif target is ApprovalMode.YOLO:
-            # Warn before the await below. State is already committed above,
+            # Warn before the awaits below. State is already committed above,
             # so if goal-rubric auto-accept raises, YOLO is active and the "no
             # review" warning has already been attempted. AUTO notifies before
-            # its await for the same reason. Both can legitimately no-op — the
+            # its awaits for the same reason. Both can legitimately no-op — the
             # YOLO toast when suppressed, the AUTO notice after its first run —
             # so this ordering guarantees the attempt, not the delivery.
             self._warn_yolo_active(timeout=8)
-            if should_persist_live:
-                await self._auto_accept_pending_goal_rubric()
+        # Persist after the live-write gate and the notices, but before the
+        # goal-rubric await: that helper is cancellable and can raise, which
+        # would otherwise commit the mode for this session while leaving
+        # `[startup].recent` on the previous one, so the next bare launch would
+        # revert a selection that succeeded. `_on_auto_approve_enabled` orders
+        # these the same way.
+        await self._persist_startup_approval_mode(target)
+        if should_persist_live and target in {
+            ApprovalMode.AUTO,
+            ApprovalMode.YOLO,
+        }:
+            await self._auto_accept_pending_goal_rubric()
         return True
+
+    def _auto_classifier_display_spec(self) -> str | None:
+        """Return the configured classifier spec for display, or `None` to inherit.
+
+        `--auto-classifier-model ""` stores `INHERIT_CLASSIFIER_MODEL` here so the
+        server resolves inherit over an env / `config.toml` classifier; that
+        sentinel is not a real spec and must never surface as one.
+        """
+        if (
+            not self._auto_classifier_model
+            or self._auto_classifier_model == INHERIT_CLASSIFIER_MODEL
+        ):
+            return None
+        return self._auto_classifier_model
+
+    def _auto_classifier_model_label(self) -> str:
+        """Return how the Auto classifier model should be described to the user."""
+        if display := self._auto_classifier_display_spec():
+            return display
+        return self._effective_model_spec() or "the main agent model"
+
+    def _auto_classifier_review_model_spec(self) -> str | None:
+        """Return the spec of the model that reviews gated actions, if known.
+
+        Unlike `_auto_classifier_model_label`, this never substitutes prose for a
+        spec: callers that describe the *role* separately need to know whether
+        they have a real model name to show.
+        """
+        return (
+            self._auto_classifier_display_spec() or self._effective_model_spec() or None
+        )
+
+    def _auto_classifier_is_distinct(self) -> bool:
+        """Return whether reviews run on a different model than the coding one.
+
+        Returns:
+            `True` when a configured classifier differs from the effective main
+                model, so user-facing copy can distinguish the two roles.
+        """
+        display = self._auto_classifier_display_spec()
+        if not display:
+            return False
+        return display != self._effective_model_spec()
+
+    def _notify_auto_classifier_active(self) -> None:
+        """Disclose a distinct authorization classifier on Auto activation."""
+        # Truthiness, not `is None`: every other reader of this attribute treats
+        # a blank spec as "inherit", and disagreeing here announced a distinct
+        # reviewer when there was none.
+        if not self._auto_classifier_model:
+            return
+        if self._auto_classifier_model == self._effective_model_spec():
+            return
+        self.notify(
+            f"Auto reviews actions with {self._auto_classifier_model_label()}.",
+            severity="information",
+            markup=False,
+        )
+
+    def _auto_classifier_context_value(self) -> str | None:
+        """Return the per-run `classifier_model` value for the graph context.
+
+        `None` leaves the classifier the server resolved at startup in place;
+        `INHERIT_CLASSIFIER_MODEL` is the explicit "review with the main agent
+        model" instruction `/auto model clear` needs, which a bare `None` cannot
+        express.
+        """
+        display = self._auto_classifier_display_spec()
+        if display:
+            return display
+        if self._auto_classifier_model_cleared:
+            return INHERIT_CLASSIFIER_MODEL
+        return None
+
+    def _auto_usage_text(self) -> str:
+        """Return usage text for `/auto` and its `model` subcommand."""
+        return (
+            "Usage:\n"
+            "  /auto                      Switch to Auto approval mode\n"
+            "  /auto model                Pick the Auto classifier model\n"
+            "  /auto model <provider:model>\n"
+            "  /auto model clear          Reuse the main agent model\n\n"
+            "Auto reviews gated actions with a classifier model. It currently "
+            f"uses {self._auto_classifier_model_label()}. A weaker model makes "
+            "that review weaker; actions it cannot review are denied, and "
+            "repeated review failures fall back to your approval.\n\n"
+            "Changes here apply to this session only. For a persistent choice, "
+            "press Ctrl+S in the `/auto model` picker or set "
+            "`[models].auto_classifier` in config.toml."
+        )
+
+    async def _handle_auto_command(self, command: str) -> None:
+        """Handle `/auto`, including the `model` subcommand.
+
+        Bare `/auto` keeps switching approval mode (quiet, toast-only, like the
+        Shift+Tab switcher); `model` manages the classifier the Auto policy
+        reviews gated actions with.
+        """
+        from deepagents_code.approval_mode import ApprovalMode
+
+        remainder = command.strip()[len("/auto") :].strip()
+        if not remainder:
+            await self._handle_approval_mode_command(ApprovalMode.AUTO)
+            return
+
+        subcommand, _, arg = remainder.partition(" ")
+        await self._mount_message(UserMessage(command))
+        if subcommand.lower() != "model":
+            await self._mount_message(AppMessage(self._auto_usage_text()))
+            return
+
+        arg = arg.strip()
+        if not arg:
+            await self._show_auto_classifier_model_selector()
+        elif arg.lower() == "clear":
+            await self._set_auto_classifier_model(None)
+        else:
+            await self._set_auto_classifier_model(arg)
+
+    async def _show_auto_classifier_model_selector(self) -> None:
+        """Open the model selector for choosing the Auto classifier model."""
+        from deepagents_code.config import detect_provider, settings
+        from deepagents_code.model_config import ModelSpec
+        from deepagents_code.tui.widgets.model_selector import (
+            AUTO_CLASSIFIER_DEFAULT_SCOPE,
+            ModelSelectorScreen,
+        )
+
+        current_provider = settings.model_provider
+        current_model = settings.model_name
+        if display := self._auto_classifier_display_spec():
+            parsed = ModelSpec.try_parse(display)
+            if parsed:
+                current_provider = parsed.provider
+                current_model = parsed.model
+            else:
+                provider = detect_provider(display)
+                if provider:
+                    current_provider = provider
+                    current_model = display
+
+        current_spec = (
+            f"{current_provider}:{current_model}"
+            if current_provider and current_model
+            else self._auto_classifier_model_label()
+        )
+
+        def handle_result(result: tuple[str, str] | None) -> None:
+            model_spec = result[0] if result is not None else None
+            extra = screen.pending_install_extra if result is not None else None
+            persisted_as_default = model_spec is not None and screen.is_stored_default(
+                model_spec
+            )
+
+            async def apply_selection() -> None:
+                if model_spec is None:
+                    await self._mount_message(
+                        AppMessage(
+                            f"Model not changed. Continuing to use {current_spec}"
+                        )
+                    )
+                    return
+                if extra and not await self._install_extra(extra, auto_restart=True):
+                    return
+                await self._set_auto_classifier_model(
+                    model_spec, persisted_as_default=persisted_as_default
+                )
+
+            def start_selection_worker() -> None:
+                # The coroutine is built here, not above, so a callback dropped
+                # at app teardown cannot strand an un-awaited coroutine.
+                self.run_worker(
+                    apply_selection(),
+                    exclusive=False,
+                    group="auto-classifier-model",
+                )
+                if self._chat_input:
+                    self._chat_input.focus_input()
+
+            # The selector has not unwound inside its own dismiss callback, so
+            # mounting messages, starting the worker (which may open the install
+            # flow), and refocusing the chat input all wait for the refresh that
+            # removes the modal.
+            self.call_after_refresh(start_selection_worker)
+
+        tail = ""
+        if self._auto_classifier_display_spec() is not None:
+            # The picker lists only recommended classifiers, so it offers no
+            # entry that reverts to the main agent model. `_auto_usage_text`
+            # carries the hint, but it is mounted only for an unrecognized
+            # `/auto` subcommand, so no path that opens this modal shows it.
+            tail = " Clear it with `/auto model clear`."
+
+        # Every branch hands the screen a `Content`: the description reaches a
+        # `Static`, which parses a plain `str` as markup. The branches naming a
+        # spec use `from_markup` with `$spec` per `AGENTS.md`, because the spec
+        # is user-supplied: `/auto model <spec>` validates, but the startup seed
+        # from `--auto-classifier-model` / `config.toml` does not. Interpolated
+        # into a plain `str` instead,
+        # a spec containing `[dim]` would render a truncated, dimmed name that is
+        # not the model reviewing actions, and one containing `[/]` would raise
+        # `MarkupError` when the modal opens. The first branch names no spec, so
+        # the plain `Content` constructor — which parses nothing — suffices.
+        active = self._auto_classifier_review_model_spec()
+        if active is None:
+            description = Content(
+                "Auto currently reviews with the main agent model." + tail
+            )
+        elif not self._auto_classifier_is_distinct():
+            # Not `display_spec() is None`: that asks where the spec came from,
+            # but the sentence claims the spec *is* the main agent model. They
+            # diverge when a configured classifier matches the main model, which
+            # `_notify_auto_classifier_active` also treats as "not distinct".
+            description = Content.from_markup(
+                "Auto currently reviews with $spec, the main agent model." + tail,
+                spec=active,
+            )
+        else:
+            description = Content.from_markup(
+                "Auto currently reviews with $spec." + tail, spec=active
+            )
+
+        screen = ModelSelectorScreen(
+            current_model=current_model,
+            current_provider=current_provider,
+            cli_profile_override=self._profile_override,
+            recommended_models=_AUTO_CLASSIFIER_RECOMMENDED_MODELS,
+            include_recent_models=False,
+            title="Choose the Auto classifier model",
+            description=description,
+            default_scope=AUTO_CLASSIFIER_DEFAULT_SCOPE,
+        )
+        self.push_screen(screen, handle_result)
+
+    async def _set_auto_classifier_model(
+        self,
+        model_spec: str | None,
+        *,
+        persisted_as_default: bool = False,
+    ) -> None:
+        """Set the model the Auto approval classifier reviews actions with.
+
+        The value rides on the per-run graph context, so it applies from the
+        next turn without restarting the agent server. A spec that cannot be
+        resolved here is rejected outright rather than staged, because a
+        classifier the server cannot build denies every action it is asked to
+        review — those deterministic policy could not already clear — and only
+        escalates to approval once failures repeat.
+
+        Args:
+            model_spec: `provider:model` spec, or `None` to reuse the main model.
+            persisted_as_default: Whether the selector already stored this spec.
+        """
+        from deepagents_code.config import detect_provider
+        from deepagents_code.model_config import ModelSpec, get_provider_auth_status
+
+        display: str | None = None
+        unchanged = False
+        if model_spec is not None:
+            model_spec = model_spec.removeprefix(":")
+            if not model_spec:
+                await self._mount_message(
+                    ErrorMessage(
+                        "Auto classifier model must not be empty. Use `/auto model "
+                        "clear` to review with the main agent model."
+                    )
+                )
+                return
+            parsed = ModelSpec.try_parse(model_spec)
+            provider = parsed.provider if parsed else detect_provider(model_spec)
+            model_name = parsed.model if parsed else model_spec
+            display = (
+                model_spec if parsed or not provider else f"{provider}:{model_name}"
+            )
+            # Deliberately no early return when the spec is unchanged: re-issuing
+            # the same spec is how a user retries after fixing credentials, and
+            # short-circuiting made that a no-op that reported success. The
+            # checks below re-run, so they get a real answer either way.
+            unchanged = display == self._auto_classifier_model
+            auth_status = get_provider_auth_status(provider) if provider else None
+            if auth_status is not None and auth_status.blocks_start:
+                await self._mount_message(
+                    ErrorMessage(
+                        f"Missing credentials: {auth_status.missing_detail()}\n\n"
+                        f"Run `/auth` for the '{auth_status.provider}' provider, "
+                        "then set the Auto classifier model again.",
+                    ),
+                )
+                return
+            try:
+                # No profile overrides: `--profile-override` describes the main
+                # model, and the server resolves the classifier without them, so
+                # validating with them would test a different model than the one
+                # Auto will actually build.
+                result = await asyncio.to_thread(
+                    _create_model_with_deepagents_import_lock,
+                    display,
+                )
+            except Exception as exc:
+                logger.exception("Failed to resolve Auto classifier model %s", display)
+                # This check runs in the client; the classifier is built in the
+                # agent server, which may be a separate process or a remote
+                # deployment with different credentials and provider packages. Say
+                # so rather than asserting the model is broken everywhere.
+                await self._mount_message(
+                    ErrorMessage(
+                        f"{_build_model_switch_error_body(exc)}\n\n"
+                        "This check ran in the client. If the agent server has "
+                        "credentials or provider packages this machine lacks, set "
+                        "`[models].auto_classifier` in config.toml instead."
+                    )
+                )
+                return
+            # Profiles are incomplete, and the classifier already fails closed
+            # at runtime, so an unsupported-looking model warns instead of being
+            # blocked.
+            profile = getattr(result.model, "profile", None)
+            if isinstance(profile, dict) and profile.get("structured_output") is False:
+                await self._mount_message(
+                    AppMessage(
+                        f"{display} does not advertise structured output. Auto "
+                        "asks the classifier for a structured verdict, so "
+                        "reviews may fail — those actions are denied, and "
+                        "repeated failures fall back to your approval."
+                    )
+                )
+        elif (
+            self._auto_classifier_model is None and self._auto_classifier_model_cleared
+        ):
+            # Only a previous clear proves reviews already use the main agent
+            # model. Otherwise the server may still hold a startup classifier
+            # from env / `config.toml` that this clear has to override.
+            await self._mount_message(
+                AppMessage("Auto classifier model already uses the main agent model.")
+            )
+            return
+
+        self._auto_classifier_model = display
+        self._auto_classifier_model_cleared = display is None
+        if self._server_kwargs is not None:
+            self._server_kwargs["auto_classifier_model"] = display
+
+        if display:
+            revalidated = " (revalidated)" if unchanged else ""
+            if persisted_as_default:
+                # "Stored" rather than "the default for future sessions" when a
+                # launch override is present: the resolver consults the export
+                # (and `--auto-classifier-model`) before `[models].auto_classifier`,
+                # so the stored spec would not actually run on the next launch.
+                # Presence, not truthiness — the resolver treats a blank export
+                # as an explicit (rejected) value that still outranks config.
+                from deepagents_code import _env_vars
+
+                if _env_vars.AUTO_CLASSIFIER_MODEL in os.environ:
+                    message = (
+                        f"Auto classifier model set to {display}{revalidated}; it "
+                        "reviews gated actions from the next turn in this session. "
+                        "Saved as the default classifier model. "
+                        f"{_env_vars.AUTO_CLASSIFIER_MODEL} is currently set; if it "
+                        "remains set, it overrides the new default at next launch."
+                    )
+                else:
+                    message = (
+                        f"Auto classifier model set to {display}{revalidated}; it "
+                        "reviews gated actions from the next turn."
+                    )
+            else:
+                message = (
+                    f"Auto classifier model set to {display}{revalidated}; it "
+                    "reviews gated actions from the next turn, for this session. "
+                    "Press Ctrl+S in the `/auto model` picker, or set "
+                    "`[models].auto_classifier` in config.toml, to make it the "
+                    "default."
+                )
+            await self._mount_message(AppMessage(message))
+        else:
+            await self._mount_message(
+                AppMessage(
+                    "Auto classifier model cleared for this session; reviews use "
+                    "the main agent model again. A classifier in config.toml or "
+                    "the environment applies again next launch."
+                )
+            )
 
     async def _handle_approval_mode_command(self, target: ApprovalMode) -> None:
         """Switch approval mode from a slash command (`/manual`, `/auto`, `/yolo`).
@@ -18840,13 +21614,17 @@ class DeepAgentsApp(App):
         """
         from deepagents_code.approval_mode import (
             ApprovalMode,
+            has_auto_mode_notice,
             has_yolo_acknowledgement,
         )
         from deepagents_code.config import is_yolo_switcher_enabled
 
         if self._approval_mode is target:
+            message = f"Already in {target.value.capitalize()} mode."
+            if target is ApprovalMode.AUTO:
+                message += "\nUse /auto model to switch classifier models."
             self.notify(
-                f"Already in {target.value.capitalize()} mode.",
+                message,
                 severity="information",
                 markup=False,
             )
@@ -18856,6 +21634,11 @@ class DeepAgentsApp(App):
             self._warn_live_approval_mode_unavailable(
                 "Auto is unavailable with a sandbox."
             )
+            return
+
+        # Gate the first Auto switch on the education confirmation.
+        if target is ApprovalMode.AUTO and not has_auto_mode_notice():
+            self._prompt_auto_mode_confirmation()
             return
 
         if target is ApprovalMode.YOLO:
@@ -18936,6 +21719,58 @@ class DeepAgentsApp(App):
         # suppress a later try for the whole session.
         self._yolo_mode_notice_pending = True
 
+    def _prompt_auto_mode_confirmation(self) -> None:
+        """Show the first-enable Auto confirmation before switching.
+
+        Auto stays inactive until Enter persists the notice and the follow-up
+        mode write succeeds. Esc leaves the current mode untouched and does
+        not store the notice.
+        """
+        from deepagents_code.approval_mode import (
+            ApprovalMode,
+            save_auto_mode_notice,
+        )
+        from deepagents_code.tui.widgets.auto_mode_notice import AutoModeNoticeScreen
+
+        if getattr(self, "_auto_mode_notice_pending", False):
+            return
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        self._auto_mode_confirmation_future = future
+
+        def handle_result(accepted: bool | None) -> None:
+            self._auto_mode_notice_pending = False
+            if not future.done():
+                future.set_result(accepted is True)
+            if accepted is not True:
+                return
+            if not save_auto_mode_notice():
+                self._warn_live_approval_mode_unavailable(
+                    "Auto notice could not be saved; staying in the current mode."
+                )
+                return
+            task = asyncio.create_task(self._set_approval_mode(ApprovalMode.AUTO))
+            task.add_done_callback(_log_task_exception)
+
+        try:
+            self.push_screen(
+                AutoModeNoticeScreen(
+                    model_label=self._auto_classifier_review_model_spec(),
+                    distinct_from_main_model=self._auto_classifier_is_distinct(),
+                ),
+                handle_result,
+            )
+        except Exception:
+            logger.warning("Could not show Auto confirmation", exc_info=True)
+            self._auto_mode_confirmation_future = None
+            self._warn_live_approval_mode_unavailable(
+                "Could not open the Auto confirmation; approval mode unchanged."
+            )
+            return
+
+        self._auto_mode_notice_pending = True
+
     def action_toggle_tool_output(self) -> None:
         """Toggle the most recent collapsible transcript unit."""
         # Pending ask_user takes precedence so Ctrl+O toggles the question card.
@@ -18962,7 +21797,7 @@ class DeepAgentsApp(App):
             if isinstance(child, RubricResultMessage) and child._details:
                 child.toggle_details()
                 return
-            if isinstance(child, ToolGroupSummary):
+            if isinstance(child, LazyToolGroupSummary | ToolGroupSummary):
                 child.toggle()
                 return
             if isinstance(child, SkillMessage) and child._stripped_body.strip():
@@ -19056,6 +21891,19 @@ class DeepAgentsApp(App):
         """Handle the semantic reject key in the approval menu."""
         if self._pending_approval_widget:
             self._pending_approval_widget.action_select_reject()
+
+    def action_approval_reject_with_reason(self) -> None:
+        """Handle Tab in the approval menu - open the free-text reject field.
+
+        The approval footer advertises Tab unconditionally, so it needs the same
+        App-level mirror as the other advertised keys above; without one, Tab
+        falls through to `Screen.focus_next` (or chat-input completion) and does
+        nothing whenever the menu is not the focused widget. Focus-gated like
+        `approval_up`/`down`/`select`, since Tab belongs to the input's own
+        completion handling while the user is typing a prompt.
+        """
+        if self._pending_approval_widget and not self._is_input_focused():
+            self._pending_approval_widget.action_reject_with_reason()
 
     def action_approval_escape(self) -> None:
         """Handle escape in approval menu - reject."""
@@ -19240,9 +22088,16 @@ class DeepAgentsApp(App):
     def on_app_blur(self) -> None:
         """Pause the chat input cursor blink when the terminal loses OS focus.
 
-        `TextArea` pauses its own blink when its `has_focus` flips, but
-        `AppBlur` does not change widget focus, so we toggle `cursor_blink`
-        manually.
+        Textual's own `AppBlur` handling already drops screen focus, which stops
+        the blink via `has_focus`, so this is belt-and-braces: `Screen.set_focus`
+        does not gate on `app_focus`, so anything that refocuses the input while
+        the app stays blurred would restart the blink.
+
+        Either way this only runs when the terminal reports focus changes. tmux
+        withholds them from its panes unless `focus-events` is on, so an
+        unfocused pane keeps showing a blinking cursor until the user sets
+        `set -g focus-events on`; the workaround is
+        `DEEPAGENTS_CODE_CURSOR_BLINK=0` or `[ui].cursor_blink = false`.
         """
         if self._chat_input is None:
             return
@@ -19305,6 +22160,25 @@ class DeepAgentsApp(App):
     # Model Switching
     # =========================================================================
 
+    async def action_open_model_selector(self) -> None:
+        """Open the model selector via `/model`.
+
+        Routed through `_submit_input` rather than calling `_show_model_selector`
+        directly, so the gesture gets the same pre-queue guards as the typed
+        command: no selector while exiting or mid thread-switch, and the startup
+        tip is dismissed. The bare form is `IMMEDIATE_UI`, so it still bypasses
+        the queue and opens while the agent is busy.
+        """
+        await self._submit_input("/model", "command")
+
+    async def action_open_effort_selector(self) -> None:
+        """Open the reasoning effort picker via `/effort`.
+
+        `/effort` is `QUEUED`, so it must go through `_submit_input` to keep its
+        place behind any pending input instead of jumping an in-flight turn.
+        """
+        await self._submit_input("/effort", "command")
+
     def _build_model_selector_screen(
         self,
         *,
@@ -19321,7 +22195,10 @@ class DeepAgentsApp(App):
             Configured model selector modal.
         """
         from deepagents_code.config import settings
-        from deepagents_code.tui.widgets.model_selector import ModelSelectorScreen
+        from deepagents_code.tui.widgets.model_selector import (
+            MAIN_MODEL_DEFAULT_SCOPE,
+            ModelSelectorScreen,
+        )
 
         return ModelSelectorScreen(
             current_model=settings.model_name,
@@ -19337,6 +22214,11 @@ class DeepAgentsApp(App):
                 if curated
                 else None
             ),
+            # Onboarding advertises no Ctrl+S hint, so give it no scope either:
+            # the binding is unconditional and `action_set_default` has no
+            # curated guard, so a scope here would let Ctrl+S silently write
+            # `[models].default` with nothing on screen saying it did.
+            default_scope=None if curated else MAIN_MODEL_DEFAULT_SCOPE,
             result_callback=result_callback,
         )
 
@@ -20123,20 +23005,9 @@ class DeepAgentsApp(App):
             self._session_state.approval_mode_key if self._session_state else None
         )
         # Only offer a resume hint if the previous thread produced agent-side
-        # output. `USER` alone is not enough: local-only flows (`/update`,
-        # `!shell`, most slash commands) mount a `UserMessage` widget without
-        # ever invoking the server, so no checkpoint exists and `-r <thread>`
-        # would fail. `ASSISTANT` / `TOOL` / `SKILL` entries only land in the
-        # store after a server round-trip, which implies a checkpoint row.
-        checkpoint_signal_types = {
-            MessageType.ASSISTANT,
-            MessageType.TOOL,
-            MessageType.SKILL,
-        }
-        previous_thread_has_agent_output = any(
-            msg.type in checkpoint_signal_types
-            for msg in self._message_store.get_all_messages()
-        )
+        # output; see `_SERVER_OUTPUT_MESSAGE_TYPES`. Sampled here, before the
+        # Phase 1 teardown below clears the store.
+        previous_thread_has_agent_output = self._store_has_server_output()
         server_proc = self._server_proc
         if server_proc is None:
             # Guarded in _switch_agent, but the worker runs in the next tick
@@ -20218,9 +23089,11 @@ class DeepAgentsApp(App):
                         if resume_thread_id is not None
                         else SessionEndCause.OTHER
                     )
-                    await self._hooks.on_session_end(
-                        end_cause,
-                        thread_id=previous_thread_id,
+                    await _wait_for_session_end(
+                        self._hooks.on_session_end(
+                            end_cause,
+                            thread_id=previous_thread_id,
+                        )
                     )
                     if resume_thread_id is None:
                         next_thread_id = self._session_state.reset_thread()
@@ -20442,7 +23315,10 @@ class DeepAgentsApp(App):
             # `from_markup` so a thread ID with stray brackets can't corrupt
             # rendering. See checkpoint-gating rationale on
             # `previous_thread_has_agent_output` above.
-            hinted = await self._mount_previous_thread_hint(previous_thread_id)
+            hinted = await self._mount_previous_thread_hint(
+                previous_thread_id,
+                had_agent_output=previous_thread_has_agent_output,
+            )
             if not hinted and previous_thread_id and previous_thread_has_agent_output:
                 resume_hint = Content.from_markup(
                     "[dim]Relaunch with[/dim] $command -r $thread "
@@ -20451,6 +23327,9 @@ class DeepAgentsApp(App):
                     thread=previous_thread_id,
                 )
                 await self._mount_message(AppMessage(resume_hint))
+
+            if resume_thread_id is not None:
+                await self._maybe_compact_after_resume()
 
             # Drain any messages the user typed after we cleared the queue
             # but before the new server was ready.
@@ -20471,36 +23350,6 @@ class DeepAgentsApp(App):
                     await self._remount_pending_goal_rubric_review()
                 except Exception:
                     logger.exception("Failed to restore pending goal review")
-
-    async def _show_notification_settings(self) -> None:
-        """Show notification settings modal."""
-        from deepagents_code.model_config import is_warning_suppressed
-        from deepagents_code.tui.widgets.notification_settings import (
-            WARNING_TOGGLES,
-            NotificationSettingsScreen,
-        )
-
-        suppressed: set[str] = set()
-        try:
-            for key, _ in WARNING_TOGGLES:
-                if await asyncio.to_thread(is_warning_suppressed, key):
-                    suppressed.add(key)
-        except Exception:
-            logger.warning("Failed to read notification settings", exc_info=True)
-            suppressed = set()
-            self.notify(
-                "Could not read notification preferences. Showing defaults.",
-                severity="warning",
-                timeout=6,
-                markup=False,
-            )
-
-        def handle_result(_result: None) -> None:
-            if self._chat_input:
-                self._chat_input.focus_input()
-
-        screen = NotificationSettingsScreen(suppressed=suppressed)
-        self.push_screen(screen, handle_result)
 
     def _notify_actionable(
         self,
@@ -20608,12 +23457,20 @@ class DeepAgentsApp(App):
         - `toggle_auto_approve` (`shift+tab`): `DebugConsoleScreen` has no
             binding for the key; stepping aside lets it fall through to the
             console's `key_shift_tab` reverse-focus traversal. Without this the
-            binding fires `action_toggle_auto_approve`, which no-ops under a
-            `ModalScreen` that lacks dedicated `shift+tab` handling (as
-            `DebugConsoleScreen` does), so the key would be silently swallowed.
-            Note this keys on the action, and `toggle_auto_approve` is
-            also bound to `ctrl+t`, so that (harmless, already a no-op
-            under modals) binding is stepped aside too while the console is open.
+            binding fires `action_toggle_auto_approve`, which routes
+            cursor-style modals via `_SupportsReverseNav` and otherwise no-ops
+            under a `ModalScreen` that lacks dedicated `shift+tab` handling
+            (as `DebugConsoleScreen` does), so the key would be silently
+            swallowed. Note this keys on the action, and `toggle_auto_approve`
+            is also bound to `ctrl+t`, so that (harmless, already a no-op
+            under modals) binding is stepped aside too while the console is
+            open.
+        - `approval_reject_with_reason` (`tab`): unlike the other approval keys
+            this one must be `priority=True` to beat `Screen`'s
+            `tab -> app.focus_next`, which means it would otherwise swallow
+            `tab` app-wide. Stepping aside unless an approval menu is pending
+            and the chat input is unfocused keeps focus traversal and
+            chat-input completion working everywhere else.
 
         Branches on action names, not keys, so this stays correct if a binding is
         ever rebound.
@@ -20633,6 +23490,10 @@ class DeepAgentsApp(App):
 
             if isinstance(self.screen, DebugConsoleScreen):
                 return False
+        if action == "approval_reject_with_reason":
+            return self._pending_approval_widget is not None and (
+                not self._is_input_focused()
+            )
         return True
 
     def action_open_notifications(self) -> None:
@@ -20800,14 +23661,18 @@ class DeepAgentsApp(App):
             )
 
         def _messages() -> str:
-            # The store is cleared on every thread switch/reset, so its count is
+            # The store is cleared on every thread switch/reset, so its counts are
             # scoped to the current thread. Reads in-memory state only, keeping
             # the snapshot free of I/O.
             store = self._message_store
             total = store.total_count
-            if total == 0:
-                return "0"
-            return f"{total} ({store.visible_count} rendered)"
+            turns = store.turn_count
+            message_label = "message" if total == 1 else "messages"
+            turn_label = "turn" if turns == 1 else "turns"
+            return (
+                f"{total} {message_label} "
+                f"({store.visible_count} rendered), {turns} {turn_label}"
+            )
 
         def _log_path() -> str:
             path = installed_debug_log_path()
@@ -20839,7 +23704,7 @@ class DeepAgentsApp(App):
         ]
 
     def _open_notification_center(self) -> None:
-        """Push the notification center modal, or toast when empty."""
+        """Push the shared notification center and settings hub."""
         from deepagents_code.tui.widgets.notification_center import (
             NotificationActionResult,
             NotificationCenterScreen,
@@ -20858,15 +23723,6 @@ class DeepAgentsApp(App):
             return
 
         pending = self._notice_registry.list_all()
-        if not pending:
-            self.notify(
-                "No pending notifications.",
-                severity="information",
-                timeout=2,
-                markup=False,
-            )
-            return
-
         self._dismiss_registered_toasts()
 
         def handle_result(result: NotificationActionResult | None) -> None:
@@ -20944,8 +23800,8 @@ class DeepAgentsApp(App):
 
         The action's follow-up modal (e.g. the API-key prompt) stacks on
         top of the center so Esc returns to it. Once the action resolves,
-        the center is reloaded so any handled entry drops out; reloading an
-        empty list dismisses the center.
+        the center is reloaded so any handled entry drops out while settings
+        remain reachable.
         """
         await self._dispatch_notification_action(key, action_id)
         await self._refresh_open_center()
@@ -21267,6 +24123,7 @@ class DeepAgentsApp(App):
             format_shadowed_dcode_warning,
             mark_update_notified,
             perform_upgrade,
+            update_install_lock,
         )
 
         if action_id == ActionId.INSTALL:
@@ -21283,92 +24140,115 @@ class DeepAgentsApp(App):
 
             from deepagents_code.tui.widgets.update_progress import UpdateProgressScreen
 
-            cmd = payload.upgrade_cmd
-            log_path = create_update_log_path()
-            screen = UpdateProgressScreen(
-                latest=payload.latest,
-                command=cmd,
-                log_path=log_path,
-            )
-            progress_modal_visible = not isinstance(self.screen, ModalScreen)
-            if progress_modal_visible:
-                await self.push_screen(screen)
-            else:
-                self.notify(
-                    f"Updating to v{payload.latest}... Logs: {log_path}",
-                    severity="information",
-                    timeout=8,
-                    markup=False,
-                )
-            self._update_install_running = True
-            try:
-                if os.environ.get(DEBUG_UPDATE):
-                    await self._run_debug_update_install(
-                        entry=entry,
-                        payload=payload,
-                        screen=screen,
-                        log_path=log_path,
-                        show_toast=not progress_modal_visible,
-                    )
-                    return
-                success, output = await perform_upgrade(
-                    progress=screen.append_line,
-                    log_path=log_path,
-                    target_version=payload.latest,
-                )
-                if success:
-                    self._notice_registry.remove(entry.key)
-                    # Same shadowing risk as `/update`: if a stale `dcode` is
-                    # earlier on PATH, the user's next launch will silently
-                    # run the old version. Surface that loudly even when only
-                    # a toast is visible. Keep the modal itself out of the
-                    # success state when relaunching would keep using the old
-                    # binary.
-                    shadow = await asyncio.to_thread(detect_shadowed_dcode_safe)
-                    if shadow is not None:
-                        warning = format_shadowed_dcode_warning(shadow)
-                        if progress_modal_visible:
-                            screen.mark_warning(
-                                warning,
-                                copy_text=format_shadowed_dcode_fix_command(shadow),
-                            )
-                        self.notify(
-                            warning,
-                            severity="warning",
-                            timeout=20,
-                            markup=False,
-                        )
-                        return
-                    screen.mark_success()
-                    if progress_modal_visible:
-                        return
+            # Claimed before any progress UI is shown so a session that loses
+            # the race never opens a modal it would have to abandon.
+            with update_install_lock() as holding_update_lock:
+                if not holding_update_lock:
                     self.notify(
-                        f"Updated to v{payload.latest}. "
-                        "Quit and relaunch dcode to use the new version.",
+                        _CONCURRENT_UPDATE_MESSAGE,
                         severity="information",
-                        timeout=10,
+                        timeout=6,
                         markup=False,
                     )
                     return
-                logger.warning(
-                    "Auto-upgrade failed for v%s. Output:\n%s",
-                    payload.latest,
-                    output,
-                )
-                self._notice_registry.remove(entry.key)
-                screen.mark_failure(cmd)
-                snippet = _truncate(output, limit=160) if output else ""
-                message = f"Auto-update failed. Run manually: {cmd}"
-                if snippet:
-                    message = f"{message}\n{snippet}"
-                self.notify(
-                    message,
-                    severity="warning",
-                    timeout=15,
-                    markup=False,
-                )
-            finally:
-                self._update_install_running = False
+
+                self._update_install_running = True
+                try:
+                    cmd = payload.upgrade_cmd
+                    log_path = create_update_log_path()
+                    screen = UpdateProgressScreen(
+                        latest=payload.latest,
+                        command=cmd,
+                        log_path=log_path,
+                    )
+                    progress_modal_visible = not isinstance(self.screen, ModalScreen)
+                    if progress_modal_visible:
+                        await self.push_screen(screen)
+                    else:
+                        self.notify(
+                            f"Updating to v{payload.latest}... Logs: {log_path}",
+                            severity="information",
+                            timeout=8,
+                            markup=False,
+                        )
+                    if os.environ.get(DEBUG_UPDATE):
+                        await self._run_debug_update_install(
+                            entry=entry,
+                            payload=payload,
+                            screen=screen,
+                            log_path=log_path,
+                            show_toast=not progress_modal_visible,
+                        )
+                        return
+                    success, output, installed = await perform_upgrade(
+                        progress=screen.append_line,
+                        log_path=log_path,
+                        target_version=payload.latest,
+                    )
+                    if success:
+                        self._notice_registry.remove(entry.key)
+                        # Same shadowing risk as `/update`: if a stale `dcode` is
+                        # earlier on PATH, the user's next launch will silently
+                        # run the old version. Surface that loudly even when only
+                        # a toast is visible. Keep the modal itself out of the
+                        # success state when relaunching would keep using the old
+                        # binary.
+                        shadow = await asyncio.to_thread(detect_shadowed_dcode_safe)
+                        if shadow is not None:
+                            warning = format_shadowed_dcode_warning(shadow)
+                            if progress_modal_visible:
+                                screen.mark_warning(
+                                    warning,
+                                    copy_text=format_shadowed_dcode_fix_command(shadow),
+                                )
+                            self.notify(
+                                warning,
+                                severity="warning",
+                                timeout=20,
+                                markup=False,
+                            )
+                            return
+                        # The install command is unpinned, so the installer
+                        # may have resolved a release newer than the one this
+                        # notification advertised (a release published while
+                        # the notice sat open). Report what actually landed on
+                        # disk rather than the stale payload version.
+                        upgraded_to = installed or payload.latest
+                        # After `mark_success`: the modal stays un-dismissable
+                        # until it is marked done, and this worker runs with
+                        # Textual's default `exit_on_error`, so a cosmetic
+                        # repaint must not be able to strand the modal.
+                        screen.mark_success()
+                        self._update_splash_version(upgraded_to)
+                        if progress_modal_visible:
+                            return
+                        self.notify(
+                            f"Updated to v{upgraded_to}. "
+                            "Quit and relaunch dcode to use the new version.",
+                            severity="information",
+                            timeout=10,
+                            markup=False,
+                        )
+                        return
+                    logger.warning(
+                        "Auto-upgrade failed for v%s. Output:\n%s",
+                        payload.latest,
+                        output,
+                    )
+                    self._notice_registry.remove(entry.key)
+                    screen.mark_failure(cmd)
+                    snippet = _truncate(output, limit=160) if output else ""
+                    message = f"Auto-update failed. Run manually: {cmd}"
+                    if snippet:
+                        message = f"{message}\n{snippet}"
+                    self.notify(
+                        message,
+                        severity="warning",
+                        timeout=15,
+                        markup=False,
+                    )
+                finally:
+                    self._update_install_running = False
             return
         if action_id == ActionId.SKIP_VERSION:
             await asyncio.to_thread(mark_update_notified, payload.latest)
@@ -21752,32 +24632,29 @@ class DeepAgentsApp(App):
         self,
         enabled_plugin_ids: frozenset[str],
         plugin_fingerprints: dict[str, _PluginFingerprint],
-    ) -> None:
-        """Offer a reload when plugin state changed while the manager was open.
+    ) -> bool | None:
+        """Check whether plugin state changed while the manager was open.
 
         Args:
             enabled_plugin_ids: Enabled plugin ids from before the manager opened.
             plugin_fingerprints: Plugin fingerprints from before the manager opened.
+
+        Returns:
+            Whether a reload is required, or `None` when state cannot be checked.
         """
         try:
             current_enabled_ids, current_fingerprints = await asyncio.to_thread(
                 self._snapshot_plugin_state
             )
-        except Exception:
-            # Preserve a manual reload path if state discovery fails after the
-            # modal has closed. Pending state is unknown here, so point the user
-            # at /reload without asserting that changes are pending.
-            logger.exception("Failed to check plugin state after manager close")
-            await self._mount_message(AppMessage(_PLUGIN_RELOAD_CHECK_FAILED))
-            return
-
-        if (
-            current_enabled_ids != enabled_plugin_ids
-            or self._plugin_fingerprints_changed(
-                plugin_fingerprints, current_fingerprints
+            return (
+                current_enabled_ids != enabled_plugin_ids
+                or self._plugin_fingerprints_changed(
+                    plugin_fingerprints, current_fingerprints
+                )
             )
-        ):
-            await self._offer_plugin_reload()
+        except Exception:
+            logger.exception("Failed to snapshot plugin state while closing manager")
+            return None
 
     async def _show_plugin_manager(self) -> None:
         """Open the interactive plugin manager."""
@@ -21786,66 +24663,67 @@ class DeepAgentsApp(App):
         try:
             baseline = await asyncio.to_thread(self._snapshot_plugin_state)
         except Exception:
-            # Still open the manager if the pre-open snapshot fails. Without a
-            # baseline, its close handler surfaces the check-failed notice
-            # (_PLUGIN_RELOAD_CHECK_FAILED) rather than the pending reminder.
+            # Still open the manager without a baseline. `check_changes` then
+            # returns None, which the manager reports as "check_failed" and we
+            # surface as _PLUGIN_RELOAD_CHECK_FAILED rather than the pending
+            # reload reminder.
             logger.exception("Failed to snapshot plugin state before opening manager")
             baseline = None
         else:
             if self._plugin_fingerprints is None:
                 self._plugin_fingerprints = baseline[1]
 
-        async def check_changes() -> None:
+        async def check_changes() -> bool | None:
             if baseline is None:
-                await self._mount_message(AppMessage(_PLUGIN_RELOAD_CHECK_FAILED))
-                return
+                return None
             enabled_plugin_ids, plugin_fingerprints = baseline
-            await self._check_plugin_manager_changes(
+            return await self._check_plugin_manager_changes(
                 enabled_plugin_ids, plugin_fingerprints
             )
 
-        def on_close(_result: None) -> None:
+        async def handle_close(action: PluginManagerAction) -> None:
+            if action == "reload":
+                await self._submit_input("/reload", "command")
+            elif action == "later":
+                await self._mount_message(AppMessage(_PLUGIN_RELOAD_REMINDER))
+            elif action == "check_failed":
+                await self._mount_message(AppMessage(_PLUGIN_RELOAD_CHECK_FAILED))
+            else:
+                # Static exhaustiveness guard: a new `PluginManagerAction`
+                # variant trips the type checker here instead of closing the
+                # manager with no visible outcome.
+                assert_never(action)
+
+        def on_close(result: PluginManagerResult) -> None:
+            # Guard identity: a stacked manager closing must not orphan the
+            # handle for one that is still open.
+            if self._active_plugin_manager is screen:
+                self._active_plugin_manager = None
+            if result is None:
+                return
             self.call_after_refresh(
                 lambda: self.run_worker(
-                    check_changes(),
+                    handle_close(result),
                     exclusive=True,
-                    group="plugin-reload-prompt",
+                    group="plugin-manager-close",
                 )
             )
 
-        self.push_screen(
-            PluginManagerScreen(
-                mcp_server_info=self._mcp_server_info or [],
-                loaded_plugin_ids=self._session_plugin_ids,
+        screen = PluginManagerScreen(
+            mcp_server_info=self._mcp_server_info or [],
+            mcp_connecting=self._connecting,
+            loaded_plugin_ids=self._session_plugin_ids,
+            on_auto_update_enabled=(
+                self._start_plugin_auto_update
+                if self._plugin_auto_update_started
+                else None
             ),
-            on_close,
+            check_reload_required=check_changes,
         )
-
-    async def _offer_plugin_reload(self) -> None:
-        """Offer to apply plugin changes after the manager closes."""
-        from deepagents_code.tui.widgets.plugin_reload import (
-            PluginReloadPromptScreen,
-        )
-
-        try:
-            choice = await asyncio.wait_for(
-                self._push_screen_wait(PluginReloadPromptScreen()),
-                timeout=_MODAL_WATCHDOG_TIMEOUT_SECONDS,
-            )
-        except TimeoutError:
-            logger.warning("Plugin reload prompt timed out")
-            await self._mount_message(AppMessage(_PLUGIN_RELOAD_REMINDER))
-            return
-        except Exception:
-            # Modal could not be mounted; fall back to a pending reload reminder.
-            logger.exception("Failed to mount plugin reload prompt")
-            await self._mount_message(AppMessage(_PLUGIN_RELOAD_REMINDER))
-            return
-
-        if choice == "reload":
-            await self._submit_input("/reload", "command")
-        else:
-            await self._mount_message(AppMessage(_PLUGIN_RELOAD_REMINDER))
+        # Tracked so the `ServerReady` / `ServerStartFailed` handlers can push
+        # the settled connection state into a manager opened mid-startup.
+        self._active_plugin_manager = screen
+        self.push_screen(screen, on_close)
 
     async def _handle_mcp_subcommand(self, args: str) -> None:
         """Dispatch `/mcp <subcommand>` strings.
@@ -22011,9 +24889,9 @@ class DeepAgentsApp(App):
     async def _show_mcp_viewer(self) -> None:
         """Show the MCP server/tool viewer as a modal screen.
 
-        The viewer may dismiss with a server name (when the user activates
-        an `unauthenticated` header row to start in-TUI OAuth login) or
-        with `None` (close without action). A plain close after `F2`
+        The viewer may dismiss with a server name when the user activates a
+        header row to start in-TUI OAuth login or re-authentication, or with
+        `None` when closed without action. A plain close after `F2`
         disable/enable toggles offers a reconnect so the changes are not
         left silently unapplied.
         """
@@ -22053,7 +24931,7 @@ class DeepAgentsApp(App):
                 task.add_done_callback(_log_task_exception)
                 return
             if result and self._start_mcp_login(result):
-                # User picked an unauthenticated server and login started.
+                # User picked a server and login or re-authentication started.
                 # Any pending disable toggle rides along on the post-login
                 # reconnect prompt, so this path never prompts twice.
                 return
@@ -22307,6 +25185,9 @@ class DeepAgentsApp(App):
                 markup=False,
             )
             return
+        if detail:
+            self.notify(detail, severity="warning", markup=False)
+            return
 
         had_original = server_name in self._mcp_optimistic_original_server_info
         self._mcp_viewer_disable_toggled = True
@@ -22518,13 +25399,20 @@ class DeepAgentsApp(App):
                 worker.error,
                 exc_info=worker.error,
             )
-            self.call_later(
-                self._mount_message,
-                ErrorMessage(
+            # Defense in depth: the size rejection normally surfaces from the
+            # turn handler, which keeps its limit text. Should one escape to
+            # here, surface the same actionable message rather than a bare
+            # "failed unexpectedly".
+            message = (
+                f"{worker.error} Retry with `/goal`, or shorten the objective "
+                "to leave room for the generated criteria."
+                if isinstance(worker.error, GoalStateSizeError)
+                else (
                     "Drafting acceptance criteria failed unexpectedly. "
                     "Try `/goal <objective>` again."
-                ),
+                )
             )
+            self.call_later(self._mount_message, ErrorMessage(message))
 
     def _start_mcp_login(self, server_name: str) -> bool:
         """Begin in-TUI OAuth login for `server_name`.
@@ -22983,7 +25871,7 @@ class DeepAgentsApp(App):
     def _schedule_off_message_pump(
         self, coro: Coroutine[Any, Any, None], *, context: str
     ) -> asyncio.Task[None] | None:
-        """Run a slash-command continuation that opens a modal off the pump.
+        """Run a continuation that opens a modal off the App message pump.
 
         Slash commands are dispatched from `on_chat_input_submitted`, which is
         awaited inline on the App message pump. Awaiting a confirmation modal
@@ -22992,6 +25880,12 @@ class DeepAgentsApp(App):
         Detaching the continuation lets the command handler return so the pump
         can route keys to the modal — the same reason the post-install restart
         offer is scheduled rather than awaited (see `_schedule_restart_offer`).
+
+        Not limited to slash commands: the cold-cache confirmation
+        (`_confirm_cold_cache_message`) reaches the same pump via ordinary
+        message dispatch. The admission-failure toast still says "Another
+        command is waiting on a prompt", which is the wording a user sees when
+        a cold-cache confirmation holds the slot.
 
         Because the command handler now returns while the modal is still open,
         the continuation participates in the app's busy state until it ends.
@@ -23355,16 +26249,39 @@ class DeepAgentsApp(App):
         server subprocess. Used as a recovery escape hatch when the
         server wedges.
 
-        Cancels any in-flight agent work and drops the queued message
-        backlog before respawning. The streaming HTTP connection to the
-        dying subprocess would otherwise raise into the Textual reactor
+        A direct restart cancels in-flight agent work and drops the queued
+        message backlog before respawning. The streaming HTTP connection to
+        the dying subprocess would otherwise raise into the Textual reactor
         after the new server advertises ready, leaving the UI wedged.
 
         Args:
             command: Raw command string for echoing back to chat.
         """
-        await self._mount_message(UserMessage(command))
+        # Snapshot active reload state before mounting the command echo, which
+        # yields to the reload task. Recording the intent first lets that task
+        # consume or honor it even if it finishes while the message is mounted.
+        reload_task = self._reload_task
+        defer_restart = (
+            self._reloading and reload_task is not None and not reload_task.done()
+        )
+        if defer_restart:
+            self._restart_requested_during_reload = True
 
+        await self._mount_message(UserMessage(command))
+        if defer_restart:
+            await self._mount_message(
+                AppMessage("Reload already in progress; server restart requested.")
+            )
+            return
+
+        await self._run_restart_command()
+
+    async def _run_restart_command(self, *, preserve_queue: bool = False) -> None:
+        """Validate and schedule a restart without echoing another command.
+
+        Args:
+            preserve_queue: Keep prompts submitted during an active reload.
+        """
         # A duplicate `/restart` bypasses the normal input queue while the
         # first detached respawn is still connecting. Reject it before the
         # destructive setup below so prompts queued during that respawn are
@@ -23382,15 +26299,18 @@ class DeepAgentsApp(App):
             )
             return
 
-        # Sever in-flight work bound to the dying subprocess. `_cancel_worker`
-        # discards the queued backlog too — those messages would otherwise
-        # fire against the freshly respawned agent silently. This restart *is*
-        # the reconnect, so suppress the dropped-reconnect warning: the respawn
-        # below reloads every on-disk MCP token regardless.
+        # Sever in-flight work bound to the dying subprocess. A direct restart
+        # drops the queued backlog, but a restart requested during `/reload`
+        # preserves prompts that the reload guard already accepted for later.
+        preserved = None
         if self._agent_running and self._agent_worker:
+            preserved = list(self._pending_messages) if preserve_queue else None
             self._cancel_worker(self._agent_worker, abort_pending_reconnect=False)
-        else:
+        elif not preserve_queue:
             self._discard_queue()
+        if preserved is not None:
+            self._pending_messages.extendleft(reversed(preserved))
+            self._sync_status_queued()
 
         if not await self._reload_configuration_for_restart():
             return
@@ -23520,14 +26440,28 @@ class DeepAgentsApp(App):
             await self._mount_message(AppMessage("Restart complete."))
 
     async def _restart_server_manual(self) -> bool:
-        """Respawn the app-owned LangGraph server for `/restart`.
+        """Respawn the app-owned LangGraph server for a user-initiated restart.
+
+        Backs `/restart` and the post-install and web-search auto-restarts.
 
         Returns:
             Whether the server was restarted successfully.
         """
+        return (await self._restart_server_manual_result()).restarted
+
+    async def _restart_server_manual_result(self) -> _ServerRespawnResult:
+        """Respawn the app-owned server for a user-initiated restart.
+
+        `_restart_server_manual` wraps this for callers that need only the
+        boolean — `/restart` plus the post-install and web-search auto-restarts;
+        `/reload` uses the full result to diff MCP metadata.
+
+        Returns:
+            Restart status and refreshed MCP server metadata.
+        """
         return await self._respawn_server(
-            log_message="Manual /restart of server failed",
-            mcp_failure_log="MCP metadata preload after /restart failed",
+            log_message="User-initiated server restart failed",
+            mcp_failure_log="MCP metadata preload after user-initiated restart failed",
             mcp_failure_toast=(
                 "MCP tool metadata could not be refreshed. Use /mcp to check."
             ),
@@ -23592,11 +26526,13 @@ class DeepAgentsApp(App):
         mcp_failure_log: str,
         mcp_failure_toast: str,
         restart_timeout: float = 30.0,
-    ) -> bool:
+    ) -> _ServerRespawnResult:
         """Stop the app-owned server subprocess and rebuild the agent.
 
-        Used by `_restart_server_manual` (the `/restart` command) and
-        `_restart_server_for_mcp_refresh` (post-OAuth-login refresh).
+        Every path that respawns the app-owned server routes through here —
+        `/restart`, `/reload`, the post-install and web-search auto-restarts,
+        the post-OAuth-login MCP refresh, and goal/rubric model and
+        max-iteration changes.
 
         Args:
             log_message: Error log written when `server_proc.restart()`
@@ -23612,11 +26548,11 @@ class DeepAgentsApp(App):
                 deadlock the handler.
 
         Returns:
-            Whether the server was restarted successfully.
+            Restart status and refreshed MCP server metadata.
         """
         server_proc = self._server_proc
         if self._server_kwargs is None or server_proc is None:
-            return False
+            return _ServerRespawnResult(restarted=False)
 
         try:
             self._connecting = True
@@ -23641,33 +26577,73 @@ class DeepAgentsApp(App):
                 self._sync_status_connection()
                 logger.exception(log_message)
                 self.post_message(self.ServerStartFailed(error=exc))
-                return False
+                return _ServerRespawnResult(restarted=False)
 
             from deepagents_code.client.remote_client import RemoteAgent as _RemoteAgent
             from deepagents_code.main import _preload_session_mcp_server_info
 
             mcp_info = None
-            try:
-                mcp_info = await _preload_session_mcp_server_info(
-                    **self._mcp_preload_kwargs,  # ty: ignore[invalid-argument-type]
+            mcp_error: str | None = None
+            mcp_status: _McpRefreshStatus = "unavailable"
+            if self._mcp_preload_kwargs is None:
+                # MCP is off for this session (`--no-mcp`). Splatting `None`
+                # would raise `TypeError` into the handler below, logging a
+                # traceback and toasting an MCP failure for a session that
+                # never asked for MCP.
+                #
+                # Confirmed against the session's own flag rather than trusting
+                # absent kwargs as a proxy for it: `disabled` makes `/reload`
+                # emit an unconditional all-clear, so a session that somehow has
+                # MCP live but no preload kwargs must degrade to the pessimistic
+                # value instead of fabricating a clean bill of health.
+                mcp_status = (
+                    "disabled" if self._server_kwargs.get("no_mcp") else "unavailable"
                 )
-            except Exception as exc:
-                logger.exception(mcp_failure_log)
-                self.notify(
-                    f"{mcp_failure_toast} ({type(exc).__name__})",
-                    severity="warning",
-                    markup=False,
-                )
+            else:
+                try:
+                    mcp_info = await _preload_session_mcp_server_info(
+                        **self._mcp_preload_kwargs,
+                    )
+                except Exception as exc:
+                    logger.exception(mcp_failure_log)
+                    mcp_error = f"{type(exc).__name__}: {exc}"
+                    self.notify(
+                        f"{mcp_failure_toast} ({mcp_error})",
+                        severity="warning",
+                        markup=False,
+                    )
+                else:
+                    # Keyed off the returned value, not merely off not raising:
+                    # the preload is typed `list[...] | None` and returns `None`
+                    # when its own `no_mcp` is set, which would otherwise pair
+                    # `fresh` with `None` and violate the contract the callers
+                    # rely on. Degrades to the pessimistic value, which reports
+                    # an indeterminate refresh rather than an all-clear.
+                    mcp_status = "fresh" if mcp_info is not None else "unavailable"
 
             def _build_agent(url: str) -> Any:  # noqa: ANN401  # union narrowed elsewhere
                 return _RemoteAgent(url=url, graph_name="agent")
+
+            # A failed refresh must not reach the UI as "zero servers": the
+            # `ServerReady` handler recomputes the status-bar counters and the
+            # `/mcp` viewer from this value, so `None` after a failure blanks
+            # every warning indicator and renders "No MCP servers configured" at
+            # the moment the app knows least — while the report line sends the
+            # user to that very screen. Carry the last-known snapshot forward;
+            # the warning toast above already says it may be stale. The returned
+            # result keeps `mcp_server_info=None` so `/reload` still reports the
+            # refresh as indeterminate rather than diffing a snapshot against
+            # itself and concluding nothing changed.
+            ready_mcp_info = mcp_info
+            if mcp_status == "unavailable":
+                ready_mcp_info = self._mcp_server_info
 
             self._agent = _build_agent(server_proc.url)
             self.post_message(
                 self.ServerReady(
                     agent=self._agent,
                     server_proc=server_proc,
-                    mcp_server_info=mcp_info,
+                    mcp_server_info=ready_mcp_info,
                 ),
             )
         except BaseException:
@@ -23676,7 +26652,12 @@ class DeepAgentsApp(App):
             self._sync_status_connection()
             raise
         else:
-            return True
+            return _ServerRespawnResult(
+                restarted=True,
+                mcp_server_info=mcp_info,
+                mcp_status=mcp_status,
+                mcp_error=mcp_error,
+            )
         finally:
             if self._chat_input:
                 self._chat_input.set_cursor_active(active=not self._agent_running)
@@ -23724,17 +26705,43 @@ class DeepAgentsApp(App):
         if target is None:
             return
 
-        active_agent = self._assistant_id or DEFAULT_ASSISTANT_ID
-        if target.agent_name == active_agent:
-            await self._resume_thread(target.thread_id)
-            return
-
         # This command runs inline on Textual's message pump. Detach before
-        # awaiting the confirmation modal so Enter/Esc can reach it.
+        # awaiting the cwd/compaction modals so Enter/Esc can reach them. Both
+        # continuations mount their own failure messages.
+        active_agent = self._assistant_id or DEFAULT_ASSISTANT_ID
         self._schedule_off_message_pump(
-            self._confirm_then_resume_cross_agent_thread(target),
+            self._resume_same_agent_thread(target.thread_id)
+            if target.agent_name == active_agent
+            else self._confirm_then_resume_cross_agent_thread(target),
             context=f"threads-resume:{target.thread_id}",
         )
+
+    async def _resume_same_agent_thread(self, thread_id: str) -> None:
+        """Resume a thread already owned by the active agent.
+
+        A thin reporting wrapper: `_resume_thread` handles its own failures once
+        the switch is under way, but its pre-switch phase (the cwd prompt, the
+        compaction prompt, and their modal setup) sits outside that boundary.
+        Detached continuations only get logged, so without this a `/threads -r`
+        would end with no visible outcome.
+
+        Args:
+            thread_id: The thread to resume on the current agent.
+
+        Raises:
+            asyncio.CancelledError: If app shutdown cancels the detached flow.
+        """
+        try:
+            await self._resume_thread(thread_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Same-agent resume failed for thread %s", thread_id)
+            await self._mount_message(
+                ErrorMessage(
+                    f"Could not resume thread {thread_id}. Use /threads to try again."
+                )
+            )
 
     async def _resolve_threads_resume_target(
         self, requested_id: str | None
@@ -24447,6 +27454,69 @@ class DeepAgentsApp(App):
             return False
         return bool(changes)
 
+    async def _restore_resumed_context_tokens(self) -> None:
+        """Seed `_context_tokens` from the checkpoint without loading history.
+
+        A launch that resumes *and* carries an initial prompt skips the history
+        load, so nothing would populate the context size — and that path is the
+        one where it matters most, since the prompt is submitted against the
+        full restored context moments later.
+        """
+        if not self._lc_thread_id or not self._agent:
+            return
+        try:
+            state_values = await self._get_thread_state_values(self._lc_thread_id)
+        except Exception:
+            logger.warning(
+                "Could not read the context size for resumed thread %s; "
+                "skipping the compaction suggestion",
+                self._lc_thread_id,
+                exc_info=True,
+            )
+            return
+        tokens = _persisted_context_tokens(state_values)
+        if tokens > 0:
+            self._on_tokens_update(tokens)
+
+    async def _maybe_compact_after_resume(self) -> None:
+        """Offer to compact a just-resumed thread with an oversized context.
+
+        Resuming costs nothing on its own, so the prompt runs once the thread is
+        live and before the user's next turn pays for the restored context.
+        Declining is free: `/compact` remains available for the rest of the
+        session.
+        """
+        from deepagents_code.config_manifest import (
+            COMPACT_ON_RESUME_THRESHOLD_DEFAULT,
+            get_option,
+            load_config_toml,
+            resolve_scalar,
+        )
+
+        threshold = COMPACT_ON_RESUME_THRESHOLD_DEFAULT
+        option = get_option("threads.compact_on_resume_threshold")
+        if option is not None:
+            resolved, _ = resolve_scalar(option, toml_data=load_config_toml())
+            if isinstance(resolved, int):
+                threshold = resolved
+        if threshold <= 0 or self._context_tokens <= threshold:
+            return
+
+        from deepagents_code.tui.modals.resume_compact import ResumeCompactPromptScreen
+
+        try:
+            compact = await self._push_screen_wait(
+                ResumeCompactPromptScreen(
+                    context_tokens=self._context_tokens,
+                    threshold=threshold,
+                )
+            )
+        except Exception:
+            logger.exception("Failed to show the compact-on-resume prompt")
+            return
+        if compact:
+            await self._handle_offload()
+
     async def _offer_thread_cwd_switch(
         self,
         thread_id: str,
@@ -24508,9 +27578,15 @@ class DeepAgentsApp(App):
                             "on the current thread.",
                         )
                     )
+                    return outcome
+                await self._retarget_hooks_after_cwd_switch(reload_manager=False)
                 return outcome
             self._preserve_launch_relative_server_paths(Path(self._cwd))
             self._switch_process_cwd(target)
+            # Cross-agent resumes reload after the outgoing `SessionEnd`.
+            await self._retarget_hooks_after_cwd_switch(
+                reload_manager=abort != "thread_switch"
+            )
             return "continue"
 
         self.notify(
@@ -24559,6 +27635,8 @@ class DeepAgentsApp(App):
                     "rollback",
                     previous_cwd,
                 )
+                return
+            await self._reload_hooks()
             return
 
         try:
@@ -24577,6 +27655,8 @@ class DeepAgentsApp(App):
                 timeout=15,
                 markup=False,
             )
+            return
+        await self._reload_hooks()
 
     async def _resume_thread(self, thread_id: str) -> None:
         """Resume a previously saved thread.
@@ -24625,7 +27705,9 @@ class DeepAgentsApp(App):
                     SessionStartCause,
                 )
 
-                await self._hooks.on_session_end(SessionEndCause.RESUME)
+                await _wait_for_session_end(
+                    self._hooks.on_session_end(SessionEndCause.RESUME)
+                )
                 await self._reload_hooks()
                 if not await self._run_session_start_hook(SessionStartCause.RESUME):
                     return
@@ -24643,6 +27725,11 @@ class DeepAgentsApp(App):
         prev_session_thread = self._session_state.thread_id
         prev_previous_thread = self._session_state.previous_thread_id
         prev_cwd = Path(self._cwd)
+
+        # Not rollback state, unlike the block above: sampled here because
+        # `_clear_messages` further down empties the store, and this has to
+        # describe the outgoing thread. See `_store_has_server_output`.
+        previous_thread_has_agent_output = self._store_has_server_output()
 
         cwd_choice = await self._offer_thread_cwd_switch(
             thread_id,
@@ -24667,9 +27754,11 @@ class DeepAgentsApp(App):
                 SessionStartCause,
             )
 
-            await self._hooks.on_session_end(
-                SessionEndCause.RESUME,
-                thread_id=prev_session_thread,
+            await _wait_for_session_end(
+                self._hooks.on_session_end(
+                    SessionEndCause.RESUME,
+                    thread_id=prev_session_thread,
+                )
             )
             outgoing_ended = True
 
@@ -24727,8 +27816,20 @@ class DeepAgentsApp(App):
             # just left — the same affordance `/clear` offers. Deliberately not
             # described as sitting under the "Resumed thread" note: that note is
             # only mounted on `_load_thread_history`'s happy path, so an empty
-            # or failed load leaves the hint under something else.
-            await self._mount_previous_thread_hint(prev_session_thread)
+            # or failed load leaves the hint under something else. Suppressed
+            # entirely for a thread the user did no work in — chiefly the
+            # `/clear` then bare `/threads -r` round trip, where the thread
+            # being left was created moments ago and never used.
+            await self._mount_previous_thread_hint(
+                prev_session_thread,
+                had_agent_output=previous_thread_has_agent_output,
+            )
+
+            # Landing on a new thread re-arms the same-thread toast, so stepping
+            # back to a thread and re-selecting it announces itself again.
+            self._last_thread_unchanged = None
+            if await self._run_session_start_hook(SessionStartCause.RESUME):
+                await self._maybe_compact_after_resume()
 
             # Deferred above so it lands last, keeping the interactive prompt
             # at the bottom of the transcript. Guarded because this runs inside
@@ -24738,12 +27839,6 @@ class DeepAgentsApp(App):
                 await self._remount_pending_goal_rubric_review()
             except Exception:
                 logger.exception("Failed to restore pending goal review")
-
-            # Landing on a new thread re-arms the same-thread toast, so stepping
-            # back to a thread and re-selecting it announces itself again.
-            self._last_thread_unchanged = None
-            if not await self._run_session_start_hook(SessionStartCause.RESUME):
-                return
         except Exception as exc:
             if prefetched_payload is None:
                 logger.exception("Failed to prefetch history for thread %s", thread_id)
@@ -25295,6 +28390,26 @@ class AppResult:
     """`(is_available, latest_version)` for post-exit update warning."""
 
 
+class TextualAppError(Exception):
+    """`run_textual_app` failure that still carries the app's final state.
+
+    The TUI resolves resume intent and `/threads` switches asynchronously, so
+    only the app knows which thread was active when it crashed. Callers catch
+    this to render teardown hints against the right thread.
+    """
+
+    def __init__(self, message: str, result: AppResult) -> None:
+        """Store the partial result alongside the original error message.
+
+        Args:
+            message: The underlying exception's message.
+            result: Snapshot of the app's return code, thread ID, and session
+                stats at the moment of the crash.
+        """
+        super().__init__(message)
+        self.result = result
+
+
 async def run_textual_app(
     *,
     agent: Any = None,  # noqa: ANN401
@@ -25390,6 +28505,11 @@ async def run_textual_app(
 
     Returns:
         An `AppResult` with the return code and final thread ID.
+
+    Raises:
+        TextualAppError: The app crashed; the exception carries an `AppResult`
+            snapshot with the final thread ID so callers can still render
+            teardown hints for the thread that was active at the crash.
     """
     app = DeepAgentsApp(
         agent=agent,
@@ -25420,6 +28540,19 @@ async def run_textual_app(
     )
     try:
         await app.run_async()
+    except Exception as e:
+        # The app resolves resume intent and `/threads` switches internally, so
+        # only it knows which thread was active at the crash. Attach that state
+        # so callers can aim teardown resume hints at the right thread.
+        raise TextualAppError(
+            str(e),
+            AppResult(
+                return_code=app.return_code or 1,
+                thread_id=app._lc_thread_id,
+                session_stats=app._session_stats,
+                update_available=app._update_available,
+            ),
+        ) from e
     finally:
         # Guarantee server cleanup regardless of how the app exits.
         # Covers both the pre-started server_proc path and the deferred

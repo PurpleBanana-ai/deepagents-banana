@@ -40,6 +40,7 @@ from rich.style import Style
 from rich.text import Text
 
 from deepagents_code._cli_context import CLIContext
+from deepagents_code._constants import SESSION_END_DRAIN_TIMEOUT_SECONDS
 from deepagents_code._session_stats import (
     RecordedRequest,
     SessionStats,
@@ -47,6 +48,7 @@ from deepagents_code._session_stats import (
     finalize_recorded_requests,
     print_usage_table,
     record_message_usage,
+    usage_table_enabled,
 )
 from deepagents_code._tool_stream import (
     UNRENDERABLE_TOOL_OUTPUT,
@@ -60,6 +62,7 @@ from deepagents_code._tool_stream import (
     normalize_tool_status,
     tool_call_buffer_key,
 )
+from deepagents_code._tracing import stream_trace_config
 from deepagents_code._version import __version__
 from deepagents_code.agent import DEFAULT_AGENT_NAME
 from deepagents_code.config import (
@@ -69,7 +72,7 @@ from deepagents_code.config import (
     is_shell_command_allowed,
     settings,
 )
-from deepagents_code.file_ops import FileOpTracker
+from deepagents_code.file_ops import FileOpTracker, record_display_caveat
 from deepagents_code.hooks import (
     dispatch_hook,
     dispatch_hook_fire_and_forget,
@@ -780,12 +783,31 @@ def _process_message_chunk(
         else:
             tool_args = {}
         record = file_op_tracker.complete_with_message(message_obj)
-        if record and record.diff:
+        # Gated on the outcome, not on `record.diff`: two of the four outcomes
+        # produce no diff at all (`unreadable_after`, which returns before one is
+        # computed, and `terminators_only`, which has none by definition), and
+        # neither does a `delete` with a lost pre-image, where both sides are
+        # empty. None of those print anything without this. Headless output is
+        # what CI reads, so a change that could not be verified has to say so
+        # here too rather than only in the TUI.
+        caveat = record_display_caveat(record)
+        if record and (record.diff or caveat):
             if state.spinner:
                 state.spinner.stop()
             if not state.quiet:
                 console.print(
                     f"[dim]📝 {escape_markup(record.display_path)}[/dim]",
+                    highlight=False,
+                )
+            if caveat:
+                # Printed even under `--quiet`, which suppresses *diagnostics*;
+                # a statement that an operation could not be verified is not
+                # one, and dropping it here would leave the caveat existing
+                # nowhere. Safe for the mode's contract because quiet already
+                # routes `console` to stderr, so this cannot pollute the stdout
+                # result that `-p --quiet` exists to keep clean.
+                console.print(
+                    f"[yellow]{escape_markup(caveat)}[/yellow]",
                     highlight=False,
                 )
         tool_name = getattr(message_obj, "name", "")
@@ -1221,7 +1243,7 @@ async def _stream_agent(
             stream_input,
             stream_mode=["messages", "updates", "custom"],
             subgraphs=True,
-            config=config,
+            config=stream_trace_config(config, stream_input),
             context=context,
             durability="exit",
         ):
@@ -1304,11 +1326,33 @@ async def _after_headless_compact(state: StreamState) -> None:
         )
 
 
-async def _end_headless_session(state: StreamState, cause: SessionEndCause) -> None:
+async def _end_headless_session(
+    state: StreamState,
+    cause: SessionEndCause,
+    *,
+    timeout_seconds: float = SESSION_END_DRAIN_TIMEOUT_SECONDS,
+) -> None:
+    """End a headless session without letting Hooks v2 stall process exit.
+
+    Args:
+        state: Active headless stream state.
+        cause: Reason the session ended.
+        timeout_seconds: Maximum time to wait for `SessionEnd` handlers.
+    """
     if state.session_end_fired:
         return
     state.session_end_fired = True
-    await state.hooks.on_session_end(cause)
+    try:
+        await asyncio.wait_for(
+            state.hooks.on_session_end(cause),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        logger.warning(
+            "SessionEnd hook drain did not finish within %ss; continuing session "
+            "teardown",
+            timeout_seconds,
+        )
 
 
 def _dispatch_orphaned_tool_result_hooks(state: StreamState, tool_output: str) -> None:
@@ -1657,7 +1701,12 @@ async def _run_agent_loop(
             )
             console.print(link_text)
         console.print("[green]✓ Task completed[/green]")
-        print_usage_table(state.stats, wall_time, console)
+        # Inside `if not quiet:` on purpose — `--quiet` suppresses the table
+        # regardless of the option. `usage_table_enabled` fails open rather
+        # than raising here, because an escape would skip the
+        # `AGENT_COMPLETED` notification and the `session.end` hooks below.
+        if usage_table_enabled():
+            print_usage_table(state.stats, wall_time, console)
 
     notification_stop: ClientHookStopError | None = None
     try:
@@ -1912,9 +1961,9 @@ async def run_non_interactive(
             commands without an explicit `--trust-project-hooks` opt-in.
 
     Returns:
-        Exit code: 0 for success, 1 for error, 124 when the `--max-turns`
-            budget was exceeded (matching GNU `timeout`), 130 for keyboard
-            interrupt.
+        Exit code: 0 for success or an intentional hook stop, 1 for error, 124
+            when the `--max-turns` budget was exceeded (matching GNU `timeout`),
+            130 for keyboard interrupt.
     """
     _make_stdio_encoding_safe()
 
@@ -2047,6 +2096,7 @@ async def run_non_interactive(
         console.print(header)
 
     from deepagents_code.client.launch.server_manager import server_session
+    from deepagents_code.hooks.client_lifecycle import ClientHookStopError
 
     # Launch MCP preload concurrently with server startup
     mcp_task: asyncio.Task[Any] | None = None
@@ -2199,6 +2249,9 @@ async def run_non_interactive(
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted[/yellow]")
         return 130
+    except ClientHookStopError as exc:
+        console.print(Text(f"\nOperation stopped by hook: {exc}", style="yellow"))
+        return 0
     except HITLIterationLimitError as e:
         console.print(f"\n[red]{escape_markup(str(e))}[/red]")
         console.print(

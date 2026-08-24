@@ -8,7 +8,6 @@ import logging
 import os
 import re
 import shutil
-import tomllib
 import warnings
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -39,6 +38,7 @@ if TYPE_CHECKING:
     from langgraph.prebuilt.tool_node import ToolCallRequest
     from langgraph.pregel import Pregel
     from langgraph.runtime import Runtime
+    from langgraph.store.base import BaseStore
     from langgraph.types import Command
 
     from deepagents_code.mcp_tools import MCPServerInfo
@@ -49,7 +49,7 @@ from langchain.agents.middleware import (
     HumanInTheLoopMiddleware,
     InterruptOnConfig,
 )
-from langchain.agents.middleware.types import AgentMiddleware
+from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain.tools import (
     BaseTool,
     ToolRuntime,  # LangChain inspects this annotation for runtime injection.
@@ -1053,30 +1053,45 @@ def load_async_subagents(config_path: Path | None = None) -> list[AsyncSubAgent]
     ```
 
     Args:
-        config_path: Path to config file.
+        config_path: Path to config file. Passing a path also excludes
+            managed policy from this read, so production callers must pass
+            `None`.
 
             Defaults to `~/.deepagents/config.toml`.
 
     Returns:
         List of `AsyncSubAgent` specs (empty if section is absent or invalid).
     """
+    is_default = config_path is None
     if config_path is None:
-        config_path = Path.home() / ".deepagents" / "config.toml"
+        from deepagents_code.model_config import DEFAULT_CONFIG_PATH
 
-    if not config_path.exists():
-        return []
+        config_path = DEFAULT_CONFIG_PATH
 
-    try:
-        with config_path.open("rb") as f:
-            data = tomllib.load(f)
-    except (tomllib.TOMLDecodeError, PermissionError, OSError) as e:
-        logger.warning("Could not read async subagents from %s: %s", config_path, e)
+    from deepagents_code.configuration.service import get_config_sources
+
+    # `None` on the default path: that is what includes managed policy.
+    sources = get_config_sources(user_path=None if is_default else config_path)
+    if not sources.user.status.usable:
+        detail = sources.user.status.detail or sources.user.status.health.value
+        logger.warning(
+            "Could not read async subagents from %s: %s", config_path, detail
+        )
         console.print(
             f"[bold yellow]Warning:[/bold yellow] Could not read async subagents "
-            f"from {config_path}: {e}",
+            f"from {config_path}: {detail}",
         )
-        return []
-
+        # Managed policy parsed cleanly and must still apply, so keep
+        # going with the merged data (managed-only when the user file
+        # failed) instead of discarding it with the user's file.
+    dropped = sources.dropped_managed_detail()
+    if dropped is not None:
+        logger.error(
+            "Managed policy from %s is not being applied: %s",
+            sources.managed.status.path,
+            dropped,
+        )
+    data, _ = sources.merged()
     section = data.get("async_subagents")
     if not isinstance(section, dict):
         return []
@@ -1376,6 +1391,21 @@ _FS_TOOL_USAGE_INSTRUCTIONS: tuple[tuple[FsToolName, str], ...] = (
 )
 """dcode filesystem-tool preferences included in the generated prompt."""
 
+_WEB_SEARCH_TOOL_GUIDANCE = (
+    "\n\n### Web Search Tool Usage\n\n"
+    "When you use the web_search tool:\n\n"
+    "1. The tool will return search results with titles, URLs, and content excerpts\n"
+    "2. You MUST read and process these results, then respond naturally to the user\n"
+    "3. NEVER show raw JSON or tool results directly to the user\n"
+    "4. Synthesize the information from multiple sources into a coherent answer\n"
+    "5. Cite your sources by mentioning page titles or URLs when relevant\n"
+    "6. If the search doesn't find what you need, explain what you found and ask "
+    "clarifying questions\n\n"
+    "The user only sees your text responses - not tool results. Always provide a "
+    "complete, natural language answer after using web_search."
+)
+"""Usage guidance included only when the Tavily-backed tool is available."""
+
 
 def _build_fs_tool_prompt_guidance(fs_tools: list[FsToolName] | None) -> str:
     """Build dcode prompt guidance for the enabled filesystem tools.
@@ -1529,6 +1559,7 @@ def get_system_prompt(
         unsupported_modalities=settings.model_unsupported_modalities,
     )
     filesystem_tool_guidance = _build_fs_tool_prompt_guidance(fs_tools)
+    web_search_tool_guidance = _WEB_SEARCH_TOOL_GUIDANCE if settings.has_tavily else ""
 
     # Build working directory section (local vs sandbox)
     if sandbox_type:
@@ -1582,6 +1613,7 @@ def get_system_prompt(
         .replace("{working_dir_section}", working_dir_section)
         .replace("{skills_path}", skills_path)
         .replace("{filesystem_tool_guidance}", filesystem_tool_guidance)
+        .replace("{web_search_tool_guidance}", web_search_tool_guidance)
     )
 
     # Detect unreplaced placeholders (defense-in-depth for template typos)
@@ -2200,8 +2232,10 @@ def create_cli_agent(
     enable_interpreter: bool = False,
     rubric_model: str | BaseChatModel | None = None,
     rubric_max_iterations: int | None = None,
+    auto_classifier_model: str | BaseChatModel | None = None,
     recursion_limit: int | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
+    store: BaseStore | None = None,
     mcp_server_info: list[MCPServerInfo] | None = None,
     cwd: str | Path | None = None,
     project_context: ProjectContext | None = None,
@@ -2253,8 +2287,8 @@ def create_cli_agent(
 
             If `False`, tools pause for user confirmation via the approval menu.
             See `_add_interrupt_on` for the full list of gated tools.
-        auto_mode_enabled: Install classifier-backed Auto for the local Textual
-            runtime. Callers must leave this disabled for headless, remote, and
+        auto_mode_enabled: Install classifier-backed Auto for local TUI or ACP
+            runtimes. Callers must leave this disabled for headless and
             sandbox-backed graphs.
         interrupt_shell_only: If `True`, all HITL interrupts are disabled;
             shell commands are validated inline by `ShellAllowListMiddleware`
@@ -2325,12 +2359,23 @@ def create_cli_agent(
         rubric_max_iterations: Explicit grader iterations per rubric attempt
             before the agent terminates with `'max_iterations_reached'`; `None`
             uses the SDK default.
+        auto_classifier_model: Model the Auto approval classifier reviews with.
+
+            A `'provider:model'` string or `BaseChatModel`.
+
+            When `None`, `DEEPAGENTS_CODE_AUTO_CLASSIFIER_MODEL` is consulted,
+            then `[models].auto_classifier`, and the main `model` is reused when
+            both are unset. A blank string is *not* the same as `None`: it means
+            "inherit the main model" directly and, unlike `None`, does not
+            consult the env var or `config.toml`. Only meaningful when
+            `auto_mode_enabled` is `True`.
         recursion_limit: Explicit LangGraph `recursion_limit` (graph step budget)
             for the main agent. When `None`, it is resolved from the
             `DEEPAGENTS_CODE_RECURSION_LIMIT` env var, `[runtime].recursion_limit`
             in `config.toml`, then the default via `resolve_recursion_limit`.
         checkpointer: Optional checkpointer for session persistence.
             When `None`, the graph is compiled without a checkpointer.
+        store: Optional LangGraph Store for runtime approval state.
         mcp_server_info: MCP server metadata to surface in the system prompt.
         cwd: Override the working directory for the agent's filesystem backend
             and system prompt.
@@ -2361,10 +2406,9 @@ def create_cli_agent(
     """
     tools = tools or []
     mcp_tools = tuple(mcp_tools or ())
-    if auto_mode_enabled and (not interactive or sandbox is not None):
+    if auto_mode_enabled and sandbox is not None:
         logger.warning(
-            "Classifier-backed Auto is unavailable outside the local interactive "
-            "runtime; using Manual HITL"
+            "Classifier-backed Auto is unavailable with a sandbox; using Manual HITL"
         )
         auto_mode_enabled = False
     effective_cwd = (
@@ -2463,21 +2507,17 @@ def create_cli_agent(
         # Server-owned hooks must wrap subagent tools too; otherwise Pre/Post
         # ToolUse only fire on the parent graph. Disable Stop so finishing a
         # subagent does not emit the main-agent Stop event (SubagentStop still
-        # fires from the parent wrap around `task`). Hooks v2 stays off unless
-        # experimental mode is on.
-        from deepagents_code._env_vars import EXPERIMENTAL, is_env_truthy
+        # fires from the parent wrap around `task`).
+        from deepagents_code.hooks.server_middleware import ServerHooksMiddleware
 
-        if is_env_truthy(EXPERIMENTAL):
-            from deepagents_code.hooks.server_middleware import ServerHooksMiddleware
-
-            hooks_cwd = Path(effective_cwd) if effective_cwd is not None else Path.cwd()
-            middleware.append(
-                ServerHooksMiddleware(
-                    cwd=hooks_cwd,
-                    emit_stop=False,
-                    mcp_tools=mcp_tools,
-                )
+        hooks_cwd = Path(effective_cwd) if effective_cwd is not None else Path.cwd()
+        middleware.append(
+            ServerHooksMiddleware(
+                cwd=hooks_cwd,
+                emit_stop=False,
+                mcp_tools=mcp_tools,
             )
+        )
         # Subagents share the on-disk filesystem backend and can edit the user
         # AGENTS.md, so they get the same managed onboarding-name block guard as
         # the main agent. Gated on memory because the block only exists when
@@ -2569,8 +2609,9 @@ def create_cli_agent(
     # `ReliableRubricMiddleware`: otherwise the grading agent's spend lands in
     # the next turn's checkpoint, or is lost on a session's final turn.
     # The CLI reads these channels back from `state_values` on thread resume.
-    # Goal tools: exposes the read-only `get_goal`/`get_rubric` tools and the
-    # constrained `update_goal` tool, and maintains goal-state notices.
+    # Goal tools: exposes the constrained write-side `update_goal` tool and
+    # maintains goal-state notices that carry the objective and acceptance
+    # criteria while they are live, so the model needs no goal/rubric read tool.
     from deepagents_code.cost_tracking import CostTrackingMiddleware
     from deepagents_code.goal_tools import GoalToolsMiddleware
     from deepagents_code.resume_state import ResumeStateMiddleware
@@ -2844,13 +2885,25 @@ def create_cli_agent(
     compaction_middleware = _create_cli_compaction_middleware(model, composite_backend)
     if auto_mode_config is not None and resolved_interrupt_on is not None:
         from deepagents_code.auto_mode import AutoModeHITLMiddleware
+        from deepagents_code.config import resolve_auto_classifier_model
+        from deepagents_code.config_manifest import resolve_auto_classifier_timeout
 
         trusted_root, narrow_allow_list = auto_mode_config
+        # An explicit argument wins; otherwise the env var / `config.toml`
+        # preference is read here, where agent construction already runs off the
+        # blockbuster-guarded server loop (see `server_graph._make_graph`).
+        classifier_model = (
+            auto_classifier_model
+            if auto_classifier_model is not None
+            else resolve_auto_classifier_model()
+        )
         agent_middleware.append(
             AutoModeHITLMiddleware(
                 resolved_interrupt_on,
                 worktree_root=trusted_root,
                 shell_allow_list=narrow_allow_list,
+                classifier_model=classifier_model,
+                classifier_timeout_seconds=resolve_auto_classifier_timeout(),
                 trusted_ask_user_tool=trusted_ask_user_tool,
                 trusted_compaction_tool=compaction_middleware.tools[0],
             )
@@ -2862,19 +2915,13 @@ def create_cli_agent(
         agent_middleware.append(AsyncApprovalHITLMiddleware(resolved_interrupt_on))
 
     # Server-owned Hooks v2 lifecycle events (Pre/Post tool, Stop, subagent).
-    # Mounted only in experimental mode; when mounted, also gated at runtime by
-    # `hooks_server_events` on the per-run context so idle sessions without
-    # configured handlers pay no interrupt round-trip. Appended after the HITL
-    # middleware so `PreToolUse` resolves before approval routing.
-    from deepagents_code._env_vars import EXPERIMENTAL, is_env_truthy
+    # Gated at runtime by `hooks_server_events` on the per-run context so idle
+    # sessions without configured handlers pay no interrupt round-trip. Appended
+    # after the HITL middleware so `PreToolUse` resolves before approval routing.
+    from deepagents_code.hooks.server_middleware import ServerHooksMiddleware
 
-    if is_env_truthy(EXPERIMENTAL):
-        from deepagents_code.hooks.server_middleware import ServerHooksMiddleware
-
-        hooks_cwd = Path(effective_cwd) if effective_cwd is not None else Path.cwd()
-        agent_middleware.append(
-            ServerHooksMiddleware(cwd=hooks_cwd, mcp_tools=mcp_tools)
-        )
+    hooks_cwd = Path(effective_cwd) if effective_cwd is not None else Path.cwd()
+    agent_middleware.append(ServerHooksMiddleware(cwd=hooks_cwd, mcp_tools=mcp_tools))
 
     if fs_tools is not None:
         # `fs_tools` is an explicit allowlist here (`--allow-fs-tools all` and an
@@ -3058,6 +3105,7 @@ def create_cli_agent(
         interrupt_on=interrupt_on,
         context_schema=CLIContextSchema,
         checkpointer=checkpointer,
+        store=store,
         subagents=all_subagents or None,
         name=_sanitize_agent_message_name(assistant_id),
     ).with_config({**config, "recursion_limit": effective_recursion_limit})

@@ -6,7 +6,7 @@ from enum import StrEnum
 from pathlib import (
     Path,  # ruff:ignore[typing-only-standard-library-import] - Pydantic resolves model annotations at runtime.
 )
-from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from uuid import (
     UUID,  # ruff:ignore[typing-only-standard-library-import] - Pydantic resolves model annotations at runtime.
 )
@@ -43,6 +43,7 @@ class HookEvent(StrEnum):
     NOTIFICATION = "Notification"
     PRE_TOOL_USE = "PreToolUse"
     POST_TOOL_USE = "PostToolUse"
+    POST_TOOL_USE_FAILURE = "PostToolUseFailure"
     PRE_COMPACT = "PreCompact"
     STOP = "Stop"
     SUBAGENT_START = "SubagentStart"
@@ -70,9 +71,7 @@ class SessionEndCause(StrEnum):
 
     CLEAR = "clear"
     RESUME = "resume"
-    LOGOUT = "logout"
     PROMPT_INPUT_EXIT = "prompt_input_exit"
-    BYPASS_PERMISSIONS_DISABLED = "bypass_permissions_disabled"
     OTHER = "other"
 
 
@@ -82,6 +81,7 @@ class DcodeNotificationKind(StrEnum):
     PERMISSION_REQUIRED = "permission_required"
     AGENT_NEEDS_INPUT = "agent_needs_input"
     AGENT_COMPLETED = "agent_completed"
+    COLD_CACHE_WARNING = "cold_cache_warning"
 
 
 class CompactTrigger(StrEnum):
@@ -91,7 +91,7 @@ class CompactTrigger(StrEnum):
     AUTO = "auto"
 
 
-EffortLevel: TypeAlias = Literal["none", "low", "medium", "high", "xhigh", "max"]
+type EffortLevel = Literal["none", "low", "medium", "high", "xhigh", "max"]
 
 
 class ToolCallData(_DomainModel):
@@ -253,6 +253,16 @@ class PostToolUseEvent(_DomainModel):
         )
 
 
+class PostToolUseFailureEvent(_DomainModel):
+    """Domain payload for `PostToolUseFailure`."""
+
+    event: Literal[HookEvent.POST_TOOL_USE_FAILURE]
+    call: ToolCallData
+    error: str
+    is_interrupt: bool = False
+    duration_ms: int | None = None
+
+
 class PreCompactEvent(_DomainModel):
     """Domain payload for `PreCompact`."""
 
@@ -298,7 +308,7 @@ class SubagentStopEvent(_DomainModel):
     session_crons: list[SessionCronSnapshot] = Field(default_factory=list)
 
 
-HookDomainEvent: TypeAlias = Annotated[
+type HookDomainEvent = Annotated[
     SessionStartEvent
     | UserPromptSubmitEvent
     | SessionEndEvent
@@ -306,6 +316,7 @@ HookDomainEvent: TypeAlias = Annotated[
     | NotificationEvent
     | PreToolUseEvent
     | PostToolUseEvent
+    | PostToolUseFailureEvent
     | PreCompactEvent
     | StopEvent
     | SubagentStartEvent
@@ -399,6 +410,14 @@ class PostToolUseDecision(BaseHookDecision):
     context: list[str] = Field(default_factory=list)
 
 
+class PostToolUseFailureDecision(BaseHookDecision):
+    """Decision returned for `PostToolUseFailure`."""
+
+    event: Literal[HookEvent.POST_TOOL_USE_FAILURE]
+    feedback: list[str] = Field(default_factory=list)
+    context: list[str] = Field(default_factory=list)
+
+
 class PreCompactDecision(BaseHookDecision):
     """Decision returned for `PreCompact`."""
 
@@ -427,7 +446,7 @@ class SubagentStopDecision(BaseHookDecision):
     context: list[str] = Field(default_factory=list)
 
 
-HookDecision: TypeAlias = Annotated[
+type HookDecision = Annotated[
     SessionStartDecision
     | UserPromptSubmitDecision
     | SessionEndDecision
@@ -435,6 +454,7 @@ HookDecision: TypeAlias = Annotated[
     | NotificationDecision
     | PreToolUseDecision
     | PostToolUseDecision
+    | PostToolUseFailureDecision
     | PreCompactDecision
     | StopDecision
     | SubagentStartDecision

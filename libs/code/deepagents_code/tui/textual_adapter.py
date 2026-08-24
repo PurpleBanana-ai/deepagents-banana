@@ -23,7 +23,7 @@ if TYPE_CHECKING:
         Sequence,
     )
     from pathlib import Path
-    from typing import Protocol
+    from typing import Literal, Protocol
 
     from langchain.agents.middleware.human_in_the_loop import (
         ActionRequest,
@@ -106,8 +106,9 @@ from deepagents_code._tool_stream import (
     normalize_tool_status,
     tool_call_buffer_key,
 )
+from deepagents_code._tracing import stream_trace_config
 from deepagents_code.config import build_stream_config, get_glyphs
-from deepagents_code.file_ops import FileOpTracker
+from deepagents_code.file_ops import FileOpTracker, record_display_caveat
 from deepagents_code.hooks import (
     dispatch_hook,
     dispatch_hook_fire_and_forget,
@@ -128,10 +129,15 @@ from deepagents_code.tui.widgets.messages import (
 
 logger = logging.getLogger(__name__)
 
+_MAX_COMPLETED_AUTO_REVIEWS = 64
+
 _hitl_adapter_cache: TypeAdapter | None = None
 """Lazy singleton for the HITL request validator."""
 
 _ASK_USER_UNSUPPORTED_ERROR = "ask_user not supported by this UI"
+
+_REJECT_REASON_PREFIX = "User rejected the tool call with reason: "
+"""Synthetic framing prepended to a user-typed HITL rejection reason."""
 
 
 def _permission_tool_calls(
@@ -434,9 +440,29 @@ def _reject_tracked_rows(
     """
     rejected = _pop_rows_not_awaiting_deferred_result(adapter._current_tool_messages)
     for tool_msg in rejected.values():
-        tool_msg.set_rejected(reason=reason)
-        adapter._sync_tool_widget(tool_msg)
+        # DOM teardown may fail; cleanup must not mask the originating exception.
+        with contextlib.suppress(Exception):
+            tool_msg.set_rejected(reason=reason)
+            adapter._sync_tool_widget(tool_msg)
     return _dispatch_terminal_tool_result_hooks(rejected, "Tool approval rejected")
+
+
+def _frame_reject_reason(reason: str) -> str:
+    """Frame a user-typed rejection reason for the model.
+
+    Stock HITL uses the supplied message as the *entire* synthetic
+    `ToolMessage`, replacing its canned "user rejected the tool call" wording.
+    A bare reason ("no", "wrong file") therefore reaches the model with no
+    indication of who produced it or why the tool never ran, so the framing is
+    reattached here while the raw text is what the tool row renders.
+
+    Args:
+        reason: Non-empty reason typed into the rejection reason field.
+
+    Returns:
+        The reason prefixed with the synthetic rejection framing.
+    """
+    return f"{_REJECT_REASON_PREFIX}{reason}"
 
 
 def _get_hitl_request_adapter(hitl_request_type: type) -> TypeAdapter:
@@ -637,7 +663,10 @@ class TextualUIAdapter:
 
     def __init__(
         self,
-        mount_message: Callable[..., Awaitable[None]],
+        # Returns whether the widget reached the screen; most callers ignore it,
+        # but the diff path needs it to tell a rendered caveat from one dropped
+        # by a torn-down transcript.
+        mount_message: Callable[..., Awaitable[bool]],
         update_status: Callable[[str], None],
         request_approval: Callable[..., Awaitable[Any]],
         on_auto_approve_enabled: Callable[[], Awaitable[bool] | bool | None]
@@ -662,6 +691,8 @@ class TextualUIAdapter:
             Callable[[dict[str, Any]], Awaitable[None] | None] | None
         ) = None,
         on_approval_mode_fallback: Callable[[str], None] | None = None,
+        *,
+        show_diff_line_numbers: bool = True,
     ) -> None:
         """Initialize the adapter."""
         self._mount_message = mount_message
@@ -721,9 +752,21 @@ class TextualUIAdapter:
         self._on_approval_mode_fallback = on_approval_mode_fallback
         """Callback that synchronizes a fail-closed startup fallback to Manual."""
 
+        self._show_diff_line_numbers = show_diff_line_numbers
+        """Whether file-relative line numbers are shown in diff hunks."""
+
         # State tracking
         self._current_tool_messages: dict[str, ToolCallMessage] = {}
         """Map of tool call IDs to their message widgets."""
+
+        self._active_auto_reviews: dict[str, frozenset[str]] = {}
+        """Reviewed tool IDs keyed by active Auto classifier batch."""
+
+        self._completed_auto_reviews: dict[str, None] = {}
+        """Recently completed batches used to reject late lifecycle events.
+
+        An insertion-ordered mapping, not a set: the cap evicts oldest-first.
+        """
 
         # Token display callbacks (set by the app after construction)
         self._on_tokens_update: _TokensUpdateCallback | None = None
@@ -750,8 +793,127 @@ class TextualUIAdapter:
         a second authority: every server total replaces what this accumulated.
         """
 
+        self._on_usage_update: Callable[[], None] | None = None
+        """Called after streamed request usage changes."""
+
         self._on_stream_complete: Callable[[], None] | None = None
         """Called only after the agent stream reaches a clean end."""
+
+    def _reset_auto_mode_review_tracking(self) -> None:
+        """Start each user turn with no in-flight batch and no replay guard.
+
+        This runs once per turn, not per `astream` iteration. An interrupt
+        resume re-runs the producer's routing node and replays its completion,
+        so the replay guard has to outlive a single iteration.
+
+        Rows paused by a batch that never completed are left alone: their own
+        `ToolMessage` still resolves them, and this runs before the new turn has
+        any lifecycle event to act on.
+        """
+        self._active_auto_reviews.clear()
+        self._completed_auto_reviews.clear()
+
+    async def _handle_auto_mode_review_event(self, event: _AutoModeReviewEvent) -> None:
+        """Apply one validated Auto classifier lifecycle event."""
+        if event.phase == "review_started":
+            await self._start_auto_mode_review(event)
+        else:
+            await self._complete_auto_mode_review(event)
+
+    async def _start_auto_mode_review(self, event: _AutoModeReviewEvent) -> None:
+        """Pause reviewed tool rows and show classifier progress."""
+        if (
+            event.batch_id in self._active_auto_reviews
+            or event.batch_id in self._completed_auto_reviews
+        ):
+            return
+        self._active_auto_reviews[event.batch_id] = frozenset(event.tool_call_ids)
+        for tool_call_id in event.tool_call_ids:
+            self._move_reviewed_row(tool_call_id, running=False)
+        if self._set_spinner is not None:
+            await self._set_spinner("Reviewing approval request")
+
+    def _move_reviewed_row(self, tool_call_id: str, *, running: bool) -> None:
+        """Pause or resume one reviewed row.
+
+        Swallow a widget failure so the caller's sweep still reaches the rest of
+        the batch, and sync either way: a mutation that raised part-way through
+        has still changed the widget, and skipping the sync would leave the
+        store disagreeing with it until the next full redraw.
+        """
+        tool_msg = self._current_tool_messages.get(tool_call_id)
+        if tool_msg is None:
+            return
+        try:
+            if running:
+                _set_running_unless_deferred(tool_msg)
+            else:
+                tool_msg.pause_running()
+        except Exception:
+            logger.exception("Could not move Auto reviewed row %s", tool_call_id)
+        finally:
+            self._sync_tool_widget(tool_msg)
+
+    def _remember_completed_auto_review(self, batch_id: str) -> None:
+        """Bound the replay guard for a turn that runs many classifier batches."""
+        self._completed_auto_reviews[batch_id] = None
+        if len(self._completed_auto_reviews) > _MAX_COMPLETED_AUTO_REVIEWS:
+            oldest_batch_id = next(iter(self._completed_auto_reviews))
+            del self._completed_auto_reviews[oldest_batch_id]
+            logger.debug(
+                "Auto review batch %s left the completion cap; a late replay of "
+                "it may re-pause its rows",
+                oldest_batch_id,
+            )
+
+    async def _complete_auto_mode_review(self, event: _AutoModeReviewEvent) -> None:
+        """Resume the rows this batch may still run, then release the spinner.
+
+        Releasing means back to `Thinking`, or staying on the review status
+        while another batch is still active. There is no saved prior value.
+
+        Anything other than an exact match between the start's tool IDs and the
+        completion's means the two sides disagree, so the approval list cannot be
+        trusted. Resume every row the batch paused instead: a row that turns out
+        to be denied corrects itself when its `ToolMessage` lands, while a row
+        left paused stays frozen with no recovery path.
+        """
+        self._remember_completed_auto_review(event.batch_id)
+        reviewed_ids = self._active_auto_reviews.pop(event.batch_id, None)
+        if reviewed_ids is None:
+            # Expected for a replayed completion, and the only trace left by a
+            # start that the validator rejected or the writer dropped. Leave the
+            # spinner alone: this batch never claimed it.
+            logger.debug(
+                "Auto review completion for batch %s matched no active batch",
+                event.batch_id,
+            )
+            return
+        try:
+            if event.recovered:
+                resumed_ids: Iterable[str] = reviewed_ids
+            elif reviewed_ids == frozenset(event.tool_call_ids):
+                resumed_ids = event.approved_tool_call_ids
+            else:
+                logger.warning(
+                    "Auto review completion for batch %s covers a different tool "
+                    "set than its start (started=%d, completed=%d); resuming "
+                    "every reviewed row",
+                    event.batch_id,
+                    len(reviewed_ids),
+                    len(event.tool_call_ids),
+                )
+                resumed_ids = reviewed_ids
+            for tool_call_id in resumed_ids:
+                self._move_reviewed_row(tool_call_id, running=True)
+        finally:
+            status: _session_stats.SpinnerStatus = (
+                "Reviewing approval request"
+                if self._active_auto_reviews
+                else "Thinking"
+            )
+            if self._set_spinner is not None:
+                await self._set_spinner(status)
 
     def _sync_tool_widget(self, tool_msg: ToolCallMessage) -> None:
         """Sync a tool widget when the app provided a store callback.
@@ -1057,8 +1219,119 @@ def _require_approval_mode_key(value: str | None) -> str:
     return value
 
 
+class _AutoModeReviewEvent(NamedTuple):
+    """Validated lifecycle event for one Auto classifier review."""
+
+    phase: Literal["review_started", "review_completed"]
+    batch_id: str
+    tool_call_ids: tuple[str, ...]
+    approved_tool_call_ids: tuple[str, ...]
+    recovered: bool = False
+    """Synthesized from a rejected completion, so its ID lists carry no meaning."""
+
+
+def _opaque_ids(value: object, *, allow_empty: bool = False) -> tuple[str, ...] | None:
+    """Validate an ordered list of unique opaque identifiers.
+
+    Empty strings are rejected along with non-strings: an ID that cannot key a
+    tool row is malformed, not merely unusable.
+
+    Returns:
+        The validated identifiers, or `None` for an invalid value.
+    """
+    if not isinstance(value, list) or (not value and not allow_empty):
+        return None
+    if any(not isinstance(item, str) or not item for item in value):
+        return None
+    # The check above proved every item is a non-empty `str`.
+    identifiers = cast("tuple[str, ...]", tuple(value))
+    return identifiers if len(set(identifiers)) == len(identifiers) else None
+
+
+def _validated_auto_mode_review_event(
+    data: Any,  # noqa: ANN401
+    *,
+    phase: Literal["review_started", "review_completed"],
+) -> _AutoModeReviewEvent | None:
+    """Validate the body of a lifecycle payload with a known phase.
+
+    Args:
+        data: Payload already confirmed to be an Auto mode event dict.
+        phase: Lifecycle phase parsed from the payload.
+
+    Returns:
+        The validated lifecycle event, or `None` when the body is malformed.
+    """
+    expected_keys = {"type", "event", "batch_id", "tool_call_ids"}
+    if phase == "review_completed":
+        expected_keys.add("approved_tool_call_ids")
+    if set(data) != expected_keys:
+        return None
+    batch_id = data.get("batch_id")
+    tool_call_ids = _opaque_ids(data.get("tool_call_ids"))
+    if not isinstance(batch_id, str) or not batch_id or tool_call_ids is None:
+        return None
+    if phase == "review_started":
+        # The key-set check above already rejected `approved_tool_call_ids`
+        # here, because `expected_keys` omits it for this phase.
+        approved_tool_call_ids: tuple[str, ...] = ()
+    else:
+        approved_tool_call_ids = _opaque_ids(
+            data.get("approved_tool_call_ids"), allow_empty=True
+        )
+        if approved_tool_call_ids is None:
+            return None
+        if not set(approved_tool_call_ids).issubset(tool_call_ids):
+            return None
+    return _AutoModeReviewEvent(phase, batch_id, tool_call_ids, approved_tool_call_ids)
+
+
+def _parse_auto_mode_review_event(
+    data: object, *, is_main_agent: bool
+) -> _AutoModeReviewEvent | None:
+    """Validate an Auto classifier lifecycle event from the main agent.
+
+    Returns:
+        The validated lifecycle event, or `None` when the payload is not trusted.
+    """
+    if (
+        not is_main_agent
+        or not isinstance(data, dict)
+        or data.get("type") != "auto_mode"
+    ):
+        return None
+    phase = data.get("event")
+    if not isinstance(phase, str) or phase not in {
+        "review_started",
+        "review_completed",
+    }:
+        return None
+    event = _validated_auto_mode_review_event(data, phase=phase)
+    if event is not None:
+        return event
+    # `auto_mode` builds this payload by hand, and
+    # `_validated_auto_mode_review_event` re-derives its exact key set. Producer
+    # drift is therefore rejected rather than degraded. Past the phase check the
+    # payload is meant to be a lifecycle event, so a rejection is a defect, not
+    # a foreign event, and this warning is the only signal that the payload
+    # shapes have diverged.
+    batch_id = data.get("batch_id")
+    logger.warning(
+        "Rejected malformed Auto review event: event=%s batch_id=%s keys=%s",
+        phase,
+        batch_id,
+        list(data),
+    )
+    if phase == "review_started" or not isinstance(batch_id, str) or not batch_id:
+        return None
+    # Dropping a rejected completion is the unsafe direction: rows paused by a
+    # valid start would never resume. Recover the batch instead, and let the ID
+    # lists stay empty because nothing in this payload can be trusted.
+    return _AutoModeReviewEvent(phase, batch_id, (), (), recovered=True)
+
+
 def _is_renderable_auto_mode_event(data: Any, *, is_main_agent: bool) -> bool:  # noqa: ANN401
-    """Return whether a custom event is a sanitized top-level Auto event."""
+    """Return whether a custom event is a sanitized Auto control-state notice."""
     if (
         not is_main_agent
         or not isinstance(data, dict)
@@ -1069,7 +1342,7 @@ def _is_renderable_auto_mode_event(data: Any, *, is_main_agent: bool) -> bool:  
     reason = data.get("reason")
     mode = data.get("mode")
     return (
-        event in {"denial", "unavailable", "fallback", "warning"}
+        event in {"fallback", "warning"}
         and (reason is None or isinstance(reason, str))
         and (mode is None or (event == "fallback" and mode == "manual"))
     )
@@ -1093,6 +1366,28 @@ async def _finalize_usage_round(
             yield chunk
     finally:
         _session_stats.finalize_recorded_requests(recorded_requests)
+
+
+async def _mount_diff_note(adapter: Any, text: str) -> None:  # noqa: ANN401  # adapter type is the TUI callback bundle
+    """Mount a standalone transcript note about a diff that could not be shown.
+
+    A last resort for the cases where no tool row and no diff body survived to
+    carry the message. The transcript is the surface these statements were
+    written for; a log line reaches only a user who already suspects something
+    is wrong and knows to open the Debug Console.
+
+    Guarded because it runs on the turn loop: failing to render a note about a
+    rendering failure must not abort the turn and drop the remaining tools'
+    hooks.
+
+    Args:
+        adapter: The stream adapter holding the mount callback.
+        text: The sentence to display.
+    """
+    try:
+        await adapter._mount_message(AppMessage(text))
+    except Exception:
+        logger.exception("Failed to mount diff note: %s", text)
 
 
 async def execute_task_textual(
@@ -1169,10 +1464,12 @@ async def execute_task_textual(
 
     from deepagents_code.approval_mode import ApprovalMode, awrite_approval_mode
     from deepagents_code.auto_mode import USER_PROMPT_METADATA_KEY, user_prompt_metadata
+    from deepagents_code.hooks.client_lifecycle import ClientHookStopError
     from deepagents_code.hooks.models.domain import HookEvent
 
     hitl_request_adapter = _get_hitl_request_adapter(HITLRequest)
     ask_user_adapter = _get_ask_user_adapter()
+    adapter._reset_auto_mode_review_tracking()
 
     message_content: str | list[dict[str, Any]] | None = None
     if graph_input is None:
@@ -1485,7 +1782,7 @@ async def execute_task_textual(
                 stream_input,
                 stream_mode=["messages", "updates", "custom"],
                 subgraphs=True,
-                config=config,
+                config=stream_trace_config(config, stream_input),
                 context=context,
                 durability="exit",
             )
@@ -1532,6 +1829,24 @@ async def execute_task_textual(
                                 logger.warning(
                                     "on_session_cost callback failed", exc_info=True
                                 )
+                        continue
+
+                    auto_review_event = _parse_auto_mode_review_event(
+                        data, is_main_agent=is_main_agent
+                    )
+                    if auto_review_event is not None:
+                        try:
+                            await adapter._handle_auto_mode_review_event(
+                                auto_review_event
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Auto review event handler failed: phase=%s "
+                                "batch_id=%s tools=%d",
+                                auto_review_event.phase,
+                                auto_review_event.batch_id,
+                                len(auto_review_event.tool_call_ids),
+                            )
                         continue
 
                     rubric_message = data if isinstance(data, dict) else None
@@ -1785,6 +2100,8 @@ async def execute_task_textual(
                             ),
                             recorded_requests=recorded_usage_requests,
                         )
+                    if recorded_usage is not None and adapter._on_usage_update:
+                        adapter._on_usage_update()
                     if recorded_usage is not None and (
                         recorded_usage.cost_usd is not None
                         and adapter._on_provisional_cost
@@ -1909,6 +2226,12 @@ async def execute_task_textual(
                             completed_compaction_ids.add(compaction_id)
                             await _after_automatic_compact()
                         record = file_op_tracker.complete_with_message(message)
+                        # Computed once, ahead of the four branches below, so a
+                        # caveat cannot depend on which of them this result takes
+                        # — the diff mounts outside all four, so a torn-down row
+                        # used to yield a `DiffMessage` and no explanation.
+                        caveat = record_display_caveat(record)
+                        caveat_shown = False
 
                         # Update tool call status with output
                         tool_id = getattr(message, "tool_call_id", None)
@@ -1928,6 +2251,7 @@ async def execute_task_textual(
                             hook_output = ASK_USER_FAILED_SUMMARY
                         else:
                             hook_output = deferred_hook.tool_output
+                        tool_msg: ToolCallMessage | None = None
                         if tool_id and tool_id in adapter._current_tool_messages:
                             # Pop before the widget calls so the dict drains even
                             # if set_success/set_error raises.
@@ -1956,7 +2280,13 @@ async def execute_task_textual(
                             # the remaining tools' hooks.
                             try:
                                 if tool_status == "success":
-                                    tool_msg.set_success(output_str)
+                                    # One call so the caveat text and the flag
+                                    # that keeps this row out of a group summary
+                                    # cannot be set apart — see
+                                    # `set_success_with_caveat`.
+                                    caveat_shown = tool_msg.set_success_with_caveat(
+                                        caveat, output_str
+                                    )
                                 else:
                                     tool_msg.set_error(output_str or "Error")
                                 adapter._sync_tool_widget(tool_msg)
@@ -2032,7 +2362,8 @@ async def execute_task_textual(
                                 tool_name, tool_id, {}, tool_status, output_str
                             )
 
-                        # Show file operation results - always show diffs in chat
+                        # Show file operation results - always show diffs in
+                        # chat.
                         if record:
                             pending_text = pending_text_by_namespace.get(ns_key, "")
                             if pending_text:
@@ -2043,14 +2374,108 @@ async def execute_task_textual(
                                     assistant_message_by_namespace,
                                 )
                                 pending_text_by_namespace[ns_key] = ""
+                            # Hiding the row makes the diff the sole record of
+                            # the edit, so only a diff that can stand in for it
+                            # earns that — `shown` is the only outcome that
+                            # qualifies, for the reasons in `DiffOutcome`. An
+                            # empty body never qualifies either: with nothing to
+                            # show, nothing needs hiding, and a widget asserting
+                            # "no changes" would leave any inaccuracy in the
+                            # read-back as the only surviving account.
+                            replaces_row = (
+                                ToolCallMessage.can_be_superseded(record.tool_name)
+                                and record.status == "success"
+                                and record.diff_outcome == "shown"
+                                and bool(record.diff)
+                            )
                             if record.diff:
-                                await adapter._mount_message(
-                                    DiffMessage(
+                                # Guarded for the same reason as the row update
+                                # above: mounting and highlighting a diff is
+                                # cosmetic, and a failure here must not abort the
+                                # turn and drop the remaining tools' hooks.
+                                try:
+                                    diff_msg = DiffMessage(
                                         record.diff,
                                         record.display_path,
                                         tool_name=record.tool_name,
+                                        before=record.before_content or "",
+                                        after=record.after_content or "",
+                                        stats=record.diff_stats,
+                                        outcome=record.diff_outcome,
+                                        # Skip the caveat only when the row
+                                        # already displays the identical
+                                        # sentence and cannot be folded away.
+                                        # For `edit_file` both are guaranteed
+                                        # on screen — it is excluded from
+                                        # grouping, and a non-`shown` outcome
+                                        # blocks supersession — so without this
+                                        # the same sentence renders twice,
+                                        # adjacent.
+                                        show_caveat=not caveat_shown,
+                                        show_numbers=adapter._show_diff_line_numbers,
                                     )
+                                    mounted = await adapter._mount_message(diff_msg)
+                                    # Read from the widget rather than assuming
+                                    # a non-`shown` outcome put the caveat on
+                                    # screen: it also suppresses its own caveat
+                                    # when told the row has it. Conjoined with
+                                    # the mount result because `renders_caveat`
+                                    # describes how the widget was built, not
+                                    # where it ended up — a transcript torn down
+                                    # mid-stream makes the mount a silent no-op,
+                                    # and crediting it here would skip the
+                                    # fallback below and leave the caveat on no
+                                    # surface at all.
+                                    caveat_shown = caveat_shown or (
+                                        mounted and diff_msg.renders_caveat
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Failed to mount diff for %s",
+                                        record.display_path,
+                                    )
+                                    # The diff was expected and never appeared.
+                                    # Say so on screen — a silently absent diff
+                                    # reads as "nothing changed", and under
+                                    # `shown` there is no caveat to fall back
+                                    # on.
+                                    await _mount_diff_note(
+                                        adapter,
+                                        f"The diff for {record.display_path} "
+                                        "could not be rendered.",
+                                    )
+                                else:
+                                    # Hiding the row is a separate step with its
+                                    # own failure: the diff is already on screen,
+                                    # so reporting "could not be rendered" here
+                                    # would contradict what the user can see.
+                                    # Only the row stayed visible, which is the
+                                    # safe direction and needs no transcript
+                                    # note.
+                                    if tool_msg is not None and replaces_row:
+                                        try:
+                                            tool_msg.mark_superseded_by_diff()
+                                            adapter._sync_tool_widget(tool_msg)
+                                        except Exception:
+                                            logger.exception(
+                                                "Failed to hide superseded row for %s",
+                                                record.display_path,
+                                            )
+                            if caveat and not caveat_shown:
+                                # No row took the caveat (its widget was torn
+                                # down) and no diff mounted to carry it — a
+                                # `delete` with a lost pre-image is the live
+                                # case. Put it in the transcript, which is the
+                                # surface the caveat was written for; a log line
+                                # alone leaves a destructive change looking
+                                # routine to anyone not watching the Debug
+                                # Console.
+                                logger.warning(
+                                    "No surface carried the display caveat for %s: %s",
+                                    record.display_path,
+                                    caveat,
                                 )
+                                await _mount_diff_note(adapter, caveat)
 
                         # Reshow spinner only when all in-flight tools have
                         # completed (avoids premature "Thinking..." when
@@ -2289,6 +2714,7 @@ async def execute_task_textual(
             if interrupt_occurred:
                 any_rejected = False
                 ask_user_cancelled = False
+                dismissed_question_count = 0
                 resume_payload: dict[str, Any] = dict(pending_hook_resumes)
 
                 # Tools mounted above start their spinner immediately, but a
@@ -2461,6 +2887,12 @@ async def execute_task_textual(
                             # Halt the turn on cancel; error branches still
                             # resume so the agent can react to the failure.
                             ask_user_cancelled = True
+                            # Counts questions, not calls, purely so the banner
+                            # below can pick a singular or plural subject — the
+                            # halt reads the flag above, never this. A widget
+                            # dismisses its whole prompt, so every question in a
+                            # cancelled call went with it.
+                            dismissed_question_count += len(questions)
                             tool_msg = adapter._current_tool_messages.pop(tool_id, None)
                             output = ASK_USER_CANCELLED_SUMMARY
                             _dispatch_tool_error_hook("ask_user")
@@ -2804,7 +3236,8 @@ async def execute_task_textual(
                                 )
                                 reject_decision: RejectDecision = (
                                     RejectDecision(
-                                        type="reject", message=reject_message
+                                        type="reject",
+                                        message=_frame_reject_reason(reject_message),
                                     )
                                     if reject_message
                                     else RejectDecision(type="reject")
@@ -2923,18 +3356,31 @@ async def execute_task_textual(
                                 tool_id,
                             )
 
+                    dismissed_subject = (
+                        "Questions" if dismissed_question_count > 1 else "Question"
+                    )
                     message = (
-                        "Question cancelled. Tell the agent what you'd like instead."
+                        f"{dismissed_subject} dismissed. Tell the agent what you'd "
+                        "like instead."
                         if ask_user_cancelled
                         else "Command rejected. Tell the agent what you'd like instead."
                     )
                     if undelivered:
                         # The user typed answers and they are now gone; saying so
                         # is the only way they learn not to wait for a response.
+                        # Which event destroyed them differs: a dismissal in this
+                        # batch, or — when `pending_ask_user` is empty because it
+                        # resets each stream iteration — a rejection in a later
+                        # iteration discarding an earlier one's answered row.
+                        cause = (
+                            f"{dismissed_subject} dismissed"
+                            if ask_user_cancelled
+                            else "Command rejected"
+                        )
                         message = (
-                            "Question cancelled, so answers to the other "
-                            "question(s) in this batch were not sent. Tell the "
-                            "agent what you'd like instead."
+                            f"{cause}, so answers to the other question(s) in this "
+                            "batch were not sent. Tell the agent what you'd like "
+                            "instead."
                         )
                     await adapter._mount_message(AppMessage(message))
                     turn_stats.wall_time_seconds = time.monotonic() - start_time
@@ -3022,14 +3468,22 @@ async def execute_task_textual(
                     DcodeNotificationKind,
                 )
 
-                await hooks.notify(
-                    DcodeNotificationKind.AGENT_COMPLETED,
-                    "Agent completed",
-                )
+                try:
+                    await hooks.notify(
+                        DcodeNotificationKind.AGENT_COMPLETED,
+                        "Agent completed",
+                    )
+                except ClientHookStopError as exc:
+                    await adapter._mount_message(
+                        AppMessage(f"Operation stopped by hook: {exc}")
+                    )
                 if not hooks.has_handlers(HookEvent.NOTIFICATION):
                     await dispatch_hook("task.complete", {"thread_id": thread_id})
                 break
 
+    except ClientHookStopError:
+        _reject_tracked_rows(adapter)
+        raise
     except (asyncio.CancelledError, KeyboardInterrupt):
         await _handle_interrupt_cleanup(
             adapter=adapter,
@@ -3204,7 +3658,10 @@ async def _handle_interrupt_cleanup(
     await _stop_assistant_streams(adapter, assistant_message_by_namespace)
 
     if recover_interrupted_turn:
-        await adapter._mount_message(AppMessage("Interrupted by user"))
+        glyphs = get_glyphs()
+        await adapter._mount_message(
+            AppMessage(f"{glyphs.square_filled} Interrupted by user")
+        )
 
     # Proactively cancel server-side runs before persisting recovery state, so
     # the aupdate_state writes below don't 409 against a still-busy thread. This

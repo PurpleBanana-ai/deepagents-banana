@@ -2,6 +2,49 @@
 
 # Deep Agents Changelog
 
+## [0.7.8](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.7...deepagents==0.7.8) (2026-08-20)
+
+### Bug Fixes
+
+- Add `files` state only for state backends ([#5643](https://github.com/langchain-ai/deepagents/issues/5643))
+
+## [0.7.7](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.6...deepagents==0.7.7) (2026-08-18)
+
+### Bug fixes
+
+- Batched concurrent `ContextHubBackend` mutations to improve SDK backend behavior ([#5471](https://github.com/langchain-ai/deepagents/issues/5471)) ([822f7c9](https://github.com/langchain-ai/deepagents/commit/822f7c9b02e6d99bdb46b5545bb2543783c01769)).
+- Made `BackendProtocol.glob` recursive for bare patterns ([#5026](https://github.com/langchain-ai/deepagents/issues/5026)) ([32f35d5](https://github.com/langchain-ai/deepagents/commit/32f35d5e01f460549c10365eb569978909f5c969)).
+
+## [0.7.6](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.5...deepagents==0.7.6) (2026-08-13)
+
+### Bug Fixes
+
+- Offload conversation history to a distinct session ID when summarizing. ([#5470](https://github.com/langchain-ai/deepagents/issues/5470))
+
+## [0.7.5](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.4...deepagents==0.7.5) (2026-08-06)
+
+### Bug Fixes
+
+- Identify SDK provider classes that support files. ([#5326](https://github.com/langchain-ai/deepagents/issues/5326))
+
+## [0.7.4](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.3...deepagents==0.7.4) (2026-08-04)
+
+### Features
+
+- Exposed the `execute` exit code in SDK artifacts. ([#5300](https://github.com/langchain-ai/deepagents/issues/5300))
+
+## [0.7.3](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.2...deepagents==0.7.3) (2026-08-03)
+
+### Bug Fixes
+
+- Fixed exact-file `delete` target resolution in the SDK using first-match-wins behavior. ([#5229](https://github.com/langchain-ai/deepagents/issues/5229))
+
+## [0.7.2](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.1...deepagents==0.7.2) (2026-08-03)
+
+### Bug Fixes
+
+- Scrub multimodal content blocks that are unsupported by the model's profile. ([#5194](https://github.com/langchain-ai/deepagents/issues/5194))
+
 ## [0.7.1](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.0...deepagents==0.7.1) (2026-07-30)
 
 ### Features

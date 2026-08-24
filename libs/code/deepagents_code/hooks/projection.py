@@ -13,6 +13,7 @@ from deepagents_code.hooks.models.domain import (
     NotificationEvent,
     PermissionRequestEvent,
     PostToolUseEvent,
+    PostToolUseFailureEvent,
     PreCompactEvent,
     PreToolUseEvent,
     SessionEndEvent,
@@ -27,6 +28,7 @@ from deepagents_code.hooks.models.wire import (
     Effort,
     NotificationWireInput,
     PermissionRequestWireInput,
+    PostToolUseFailureWireInput,
     PostToolUseWireInput,
     PreCompactWireInput,
     PreToolUseWireInput,
@@ -219,6 +221,26 @@ def _project_post_tool_use(
     )
 
 
+@_project_event.register(PostToolUseFailureEvent)
+def _project_post_tool_use_failure(
+    event: PostToolUseFailureEvent,
+    invocation: HookInvocation,
+    transcript_path: Path,
+    _agent_transcript_path: Path | None,
+) -> HookWireInput:
+    tool_name, tool_input = to_wire_call(event.call)
+    return PostToolUseFailureWireInput(
+        **_base_fields(invocation, transcript_path),
+        hook_event_name=HookEvent.POST_TOOL_USE_FAILURE,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        tool_use_id=event.call.id,
+        error=event.error,
+        is_interrupt=event.is_interrupt,
+        duration_ms=event.duration_ms,
+    )
+
+
 @_project_event.register(PreCompactEvent)
 def _project_pre_compact(
     event: PreCompactEvent,
@@ -375,6 +397,9 @@ def to_wire_notification_type(value: str) -> WireNotificationType:
         WireNotificationType.PERMISSION_PROMPT: WireNotificationType.PERMISSION_PROMPT,
         DcodeNotificationKind.AGENT_NEEDS_INPUT: WireNotificationType.AGENT_NEEDS_INPUT,
         DcodeNotificationKind.AGENT_COMPLETED: WireNotificationType.AGENT_COMPLETED,
+        DcodeNotificationKind.COLD_CACHE_WARNING: (
+            WireNotificationType.COLD_CACHE_WARNING
+        ),
     }
     try:
         return mappings[value]

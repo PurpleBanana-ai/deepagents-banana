@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import logging
 import signal
 import sys
 from collections.abc import AsyncIterator, Iterator, Sequence
@@ -19,12 +20,12 @@ if TYPE_CHECKING:
 from rich.style import Style
 from rich.text import Text
 
-from deepagents_code._env_vars import EXPERIMENTAL
 from deepagents_code._tool_stream import (
     TOOL_OUTPUT_TRUNCATION_MARKER,
     UNRENDERABLE_TOOL_OUTPUT,
     ToolCallBuffer,
 )
+from deepagents_code._tracing import RESUME_TRACE_TAG
 from deepagents_code.approval_mode import ApprovalMode
 from deepagents_code.client.non_interactive import (
     _MAX_HITL_ITERATIONS,
@@ -36,6 +37,7 @@ from deepagents_code.client.non_interactive import (
     _collect_action_request_warnings,
     _compaction_result_id,
     _dispatch_orphaned_tool_result_hooks,
+    _end_headless_session,
     _make_hitl_decision,
     _make_stdio_encoding_safe,
     _process_ai_message,
@@ -49,7 +51,11 @@ from deepagents_code.client.non_interactive import (
     run_non_interactive,
 )
 from deepagents_code.config import SHELL_ALLOW_ALL, ModelResult
-from deepagents_code.file_ops import FileOpTracker
+from deepagents_code.file_ops import (
+    DiffOutcome,
+    FileOperationRecord,
+    FileOpTracker,
+)
 from deepagents_code.hooks.client_lifecycle import (
     ClientHookService,
     ClientHookStopError,
@@ -59,6 +65,7 @@ from deepagents_code.hooks.models.domain import (
     HookEvent,
     PermissionEffect,
     PermissionRequestDecision,
+    SessionEndCause,
     SessionEndDecision,
     SessionStartDecision,
     UserPromptSubmitDecision,
@@ -381,11 +388,8 @@ class TestSandboxTypeForwarding:
         assert kwargs["profile_overrides"] == {"max_input_tokens": 32_000}
         assert kwargs["enable_interpreter"] is None
 
-    async def test_permission_hooks_override_headless_yolo_bypass(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_permission_hooks_override_headless_yolo_bypass(self) -> None:
         """Permission hooks force client resolution while retaining YOLO context."""
-        monkeypatch.setenv(EXPERIMENTAL, "1")
         runtime = MagicMock()
         runtime.configured_events.return_value = frozenset(
             {HookEvent.PERMISSION_REQUEST}
@@ -669,9 +673,31 @@ class TestQuietFileOpNotification:
     """The file-operation (📝) notification honors quiet mode."""
 
     @staticmethod
-    def _run(*, quiet: bool) -> str:
-        """Drive a file-op `ToolMessage` chunk and return captured stderr."""
-        record = SimpleNamespace(diff="--- a\n+++ b", display_path="src/foo.py")
+    def _run(
+        *,
+        quiet: bool,
+        diff_outcome: DiffOutcome = "shown",
+        after_read_error: str | None = None,
+        tool_succeeded: bool = True,
+    ) -> str:
+        """Drive a file-op `ToolMessage` chunk and return captured stderr.
+
+        Builds a real `FileOperationRecord` rather than a stand-in: the parity
+        this class asserts is between `-p` and the TUI reading the same type,
+        and a `SimpleNamespace` would keep passing after a field was renamed
+        out from under both.
+        """
+        record = FileOperationRecord(
+            tool_name="delete",
+            display_path="src/foo.py",
+            physical_path=None,
+            tool_call_id="tc1",
+            status="success",
+            tool_succeeded=tool_succeeded,
+            diff="--- a\n+++ b" if diff_outcome == "shown" else None,
+            diff_outcome=diff_outcome,
+            after_read_error=after_read_error,
+        )
         tracker = MagicMock()
         tracker.complete_with_message.return_value = record
 
@@ -692,6 +718,73 @@ class TestQuietFileOpNotification:
 
     def test_non_quiet_emits_file_op_notification(self) -> None:
         assert "foo.py" in self._run(quiet=False)
+
+    def test_a_lost_pre_image_is_reported_without_a_diff(self) -> None:
+        """Headless output must not stay silent about a change it cannot verify.
+
+        A `delete` whose pre-image was lost produces no diff, so gating the
+        notification on `record.diff` printed nothing at all — leaving `-p` and
+        CI users with no signal that the file's contents were never read.
+        """
+        output = self._run(quiet=False, diff_outcome="untrusted_before")
+
+        assert "foo.py" in output
+        assert "prior contents could not be read" in output
+
+    def test_quiet_keeps_the_caveat_but_drops_the_path_line(self) -> None:
+        """Quiet suppresses diagnostics; an unverifiable change is not one.
+
+        `--quiet` exists to keep stdout clean for `-p`, and it already routes
+        this console to stderr — so the caveat cannot pollute the result either
+        way. Dropping it here would leave a change that could not be verified
+        stated nowhere at all, which is the mode CI reads.
+        """
+        output = self._run(quiet=True, diff_outcome="untrusted_before")
+
+        assert "prior contents could not be read" in output
+        assert "foo.py" not in output
+
+    @pytest.mark.parametrize(
+        ("diff_outcome", "after_read_error", "expected"),
+        [
+            ("untrusted_before", None, "prior contents could not be read"),
+            ("unreadable_after", "permission_denied", "permission_denied"),
+            ("terminators_only", None, "confined to line terminators"),
+        ],
+    )
+    def test_every_unshowable_outcome_reaches_headless_output(
+        self,
+        diff_outcome: DiffOutcome,
+        after_read_error: str | None,
+        expected: str,
+    ) -> None:
+        """`-p` is the surface CI reads, so no outcome may go unstated there.
+
+        Only `untrusted_before` was covered, leaving the other two free to
+        print an unqualified path — a change reported as routine when it could
+        not be verified.
+        """
+        output = self._run(
+            quiet=False,
+            diff_outcome=diff_outcome,
+            after_read_error=after_read_error,
+        )
+
+        assert expected in output
+
+    def test_a_failed_tool_gets_no_success_caveat(self) -> None:
+        """A caveat describes what a *successful* call could not show.
+
+        With the pre-image lost and the tool then failing, the outcome survives
+        into the caveat, which would print "The `delete` call succeeded" beside
+        an operation that did not — and a CI consumer parsing `-p` would record
+        a successful write.
+        """
+        output = self._run(
+            quiet=False, diff_outcome="untrusted_before", tool_succeeded=False
+        )
+
+        assert "succeeded" not in output
 
 
 class TestNoStreamMode:
@@ -1423,6 +1516,58 @@ def _manager(runtime: MagicMock) -> HooksManager:
     )
 
 
+async def test_headless_session_end_timeout_is_bounded_and_at_most_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A slow Hooks v2 `SessionEnd` cannot stall or fire twice on exit."""
+    calls = 0
+    cancelled = asyncio.Event()
+
+    async def invoke(_invocation: object) -> SessionEndDecision:
+        nonlocal calls
+        calls += 1
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return SessionEndDecision(event=HookEvent.SESSION_END)
+
+    runtime = MagicMock()
+    runtime.cwd = Path.cwd()
+    runtime.configured_events.return_value = frozenset({HookEvent.SESSION_END})
+    runtime.invoke = invoke
+    state = StreamState(hooks=_manager(runtime))
+    loop = asyncio.get_running_loop()
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="deepagents_code.client.non_interactive",
+    ):
+        started = loop.time()
+        await _end_headless_session(
+            state,
+            SessionEndCause.PROMPT_INPUT_EXIT,
+            timeout_seconds=0.01,
+        )
+        elapsed = loop.time() - started
+        await _end_headless_session(
+            state,
+            SessionEndCause.PROMPT_INPUT_EXIT,
+            timeout_seconds=0.01,
+        )
+
+    assert elapsed < 0.5
+    assert cancelled.is_set()
+    assert calls == 1
+    assert state.session_end_fired
+    assert any(
+        record.levelno == logging.WARNING
+        and "SessionEnd hook drain did not finish" in record.message
+        for record in caplog.records
+    )
+
+
 async def test_headless_compact_permission_uses_live_context() -> None:
     """`compact_conversation` is gated by `PermissionRequest`, not `PreCompact`.
 
@@ -1679,7 +1824,6 @@ class TestMaxTurns:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """`--trust-project-hooks` loads repository hook handlers."""
-        monkeypatch.setenv(EXPERIMENTAL, "1")
         monkeypatch.chdir(tmp_path)
         project_hooks = tmp_path / ".deepagents"
         project_hooks.mkdir()
@@ -2034,6 +2178,56 @@ class TestMaxTurns:
                     max_turns=3,
                 )
         assert agent.astream.call_count == 3  # 1 initial + 2 HITL resumes = 3 turns
+
+    async def test_tags_every_resume_round_but_not_the_initial_run(self) -> None:
+        """Headless resumes carry the resume marker; the turn's first run does not.
+
+        The tag is what lets LangSmith fold a headless approval turn's sibling
+        root runs back together, and long auto-approval CI runs are where that
+        matters most. Also pins that the base config is never tagged in place --
+        reassigning instead of deriving would leak the marker onto the next
+        turn's initial run.
+        """
+        agent = _make_looping_agent()
+        console = Console(quiet=True)
+        file_op_tracker = MagicMock()
+        file_op_tracker.complete_with_message.return_value = None
+        config: RunnableConfig = {"configurable": {"thread_id": "t1"}}
+
+        with (
+            patch(
+                "deepagents_code.client.non_interactive.dispatch_hook",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
+            ),
+            patch("deepagents_code.client.non_interactive.settings") as mock_settings,
+            patch(
+                "deepagents_code.client.non_interactive._HITL_REQUEST_ADAPTER"
+            ) as mock_adapter,
+        ):
+            mock_settings.shell_allow_list = None
+            mock_settings.model_name = ""
+            mock_adapter.validate_python.side_effect = lambda v: v
+            with pytest.raises(HITLIterationLimitError):
+                await _run_agent_loop(
+                    agent,
+                    "task",
+                    config,
+                    console,
+                    file_op_tracker,
+                    quiet=True,
+                    max_turns=3,
+                )
+
+        configs = [call.kwargs["config"] for call in agent.astream.call_args_list]
+        assert len(configs) == 3
+        assert RESUME_TRACE_TAG not in configs[0].get("tags", [])
+        for resume_config in configs[1:]:
+            assert RESUME_TRACE_TAG in resume_config["tags"]
+            assert resume_config["configurable"] == config["configurable"]
+        assert "tags" not in config
 
     async def test_limit_hit_returns_exit_code_124(self) -> None:
         """run_non_interactive returns 124 when --max-turns is exhausted.
@@ -3860,3 +4054,140 @@ class TestDrainWiring:
 
         assert result == 124
         mock_drain.assert_awaited_once()
+
+
+class TestHeadlessUsageStats:
+    """Test `[ui].show_usage_stats` gating in headless runs."""
+
+    @staticmethod
+    async def _run_headless(
+        config_toml: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        quiet: bool = False,
+    ) -> tuple[int, str]:
+        """Run a headless session and report what teardown printed.
+
+        Args:
+            config_toml: Contents to write to the user config file.
+            tmp_path: Directory to hold the config file.
+            monkeypatch: Fixture used to redirect the config path.
+            quiet: Whether to run as `dcode -x --quiet`.
+
+        Returns:
+            How many times the teardown rendered the usage table, and
+            everything it passed to `console.print`. The second half is what
+            distinguishes "the table was suppressed" from "teardown stopped
+            early", which a count alone cannot.
+
+        Raises:
+            AssertionError: If the run did not reach teardown, which would let a
+                zero count mean "never got there" rather than "suppressed".
+        """
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(config_toml, encoding="utf-8")
+        monkeypatch.setattr(
+            "deepagents_code.model_config.DEFAULT_CONFIG_PATH", config_path
+        )
+
+        mock_agent = MagicMock()
+        mock_agent.astream = MagicMock(return_value=_async_iter([]))
+        mock_console = MagicMock(spec=Console)
+
+        with (
+            patch(
+                "deepagents_code.client.non_interactive.Console",
+                return_value=mock_console,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.create_model",
+                return_value=ModelResult(
+                    model=MagicMock(),
+                    model_name="test-model",
+                    provider="test",
+                ),
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.print_usage_table"
+            ) as mock_table,
+            patch("deepagents_code.client.non_interactive.settings") as mock_settings,
+            patch(
+                "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
+                new_callable=AsyncMock,
+                return_value=(mock_agent, MagicMock(), None),
+            ),
+        ):
+            mock_settings.shell_allow_list = None
+            mock_settings.has_tavily = False
+            mock_settings.model_name = None
+
+            return_code = await run_non_interactive(message="test", quiet=quiet)
+
+        assert return_code == 0, (
+            "run must reach teardown for the count to mean anything"
+        )
+        printed = "".join(
+            str(call.args[0]) for call in mock_console.print.call_args_list if call.args
+        )
+        return mock_table.call_count, printed
+
+    async def test_shown_by_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An absent preference keeps the headless usage table."""
+        count, printed = await self._run_headless("", tmp_path, monkeypatch)
+        assert count == 1
+        assert "Task completed" in printed
+
+    async def test_suppressed_when_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`show_usage_stats = false` suppresses the headless table too.
+
+        The key names the preference, not the surface, so a user who turns it
+        off must not still get the table after every `dcode -x` run.
+        """
+        count, printed = await self._run_headless(
+            "[ui]\nshow_usage_stats = false\n", tmp_path, monkeypatch
+        )
+        assert count == 0
+        # The rest of teardown must survive the suppression. A gate written as
+        # an early `return` instead of an `if` would keep the return code at 0
+        # and the count at 0 while silently dropping the completion line, the
+        # `AGENT_COMPLETED` notification, and the `session.end` hooks below it.
+        assert "Task completed" in printed
+
+    async def test_quiet_suppresses_the_table_even_when_enabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--quiet` wins over an explicit opt-in.
+
+        The gate is nested inside the `if not quiet:` block that also holds the
+        completion line and the trace link. Hoisting it out would print a table
+        in the middle of output a caller asked to keep clean, with every other
+        test in this class still green.
+        """
+        count, printed = await self._run_headless(
+            "[ui]\nshow_usage_stats = true\n", tmp_path, monkeypatch, quiet=True
+        )
+        assert count == 0
+        # `--quiet` drops the completion line too, so its absence here is the
+        # expected outcome rather than a broken teardown.
+        assert "Task completed" not in printed
+
+    async def test_env_var_suppresses_the_table(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`DEEPAGENTS_CODE_SHOW_USAGE_STATS` outranks an opt-in config file.
+
+        This is the headless case the env var exists for: a CI runner can set
+        one but usually has no `~/.deepagents/config.toml` to edit.
+        """
+        monkeypatch.setenv("DEEPAGENTS_CODE_SHOW_USAGE_STATS", "0")
+
+        count, printed = await self._run_headless(
+            "[ui]\nshow_usage_stats = true\n", tmp_path, monkeypatch
+        )
+        assert count == 0
+        assert "Task completed" in printed

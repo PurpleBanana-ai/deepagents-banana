@@ -143,10 +143,26 @@ def show_help() -> None:
     console.print(
         "  --startup-cmd CMD          Shell command to run at startup, before first prompt"  # noqa: E501
     )
-    console.print("  -y, --auto-approve         Enable classifier-backed Auto mode")
+    console.print(
+        "  -y, --auto-approve         Enable classifier-backed Auto mode (TUI or ACP);"
+    )
+    console.print(
+        "                             ignored with a warning in headless mode"
+    )
+    console.print("  --auto-classifier-model MODEL")
+    console.print(
+        "                             Model the Auto classifier reviews actions with"
+    )
+    console.print(
+        "                             Local TUI or ACP only; defaults to the "
+        "main agent model"
+    )
     console.print(
         "  --yolo                     Run gated actions without review after "
-        "acknowledgement"
+        "acknowledgement (TUI or ACP);"
+    )
+    console.print(
+        "                             ignored with a warning in headless mode"
     )
     console.print("  --sandbox TYPE             Remote sandbox for execution")
     console.print(

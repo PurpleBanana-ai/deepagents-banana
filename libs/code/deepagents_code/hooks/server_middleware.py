@@ -1,8 +1,8 @@
 """Server-owned Hooks v2 lifecycle middleware.
 
-Emits `PreCompact`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart`, and
-`SubagentStop` through the LangGraph interrupt channel so the client runtime can
-execute matching handlers and return typed decisions.
+Emits `PreCompact`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`,
+`SubagentStart`, and `SubagentStop` through the LangGraph interrupt channel so the
+client runtime can execute matching handlers and return typed decisions.
 """
 
 from __future__ import annotations
@@ -14,17 +14,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import (
-    TYPE_CHECKING,
-    Annotated,
-    Any,
-    Literal,
-    NotRequired,
-    TypeAlias,
-    TypeGuard,
-    TypeVar,
-    cast,
-)
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, TypeGuard, cast
 from uuid import UUID, uuid5
 
 from langchain.agents.middleware.human_in_the_loop import (
@@ -42,6 +32,7 @@ from langchain.agents.middleware.types import (
 )
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command, interrupt
+from pydantic import ValidationError
 from typing_extensions import TypedDict
 
 from deepagents_code.approval_mode import ApprovalMode, coerce_approval_mode
@@ -55,11 +46,14 @@ from deepagents_code.hooks.models.domain import (
     CompactTrigger,
     HookContext,
     HookDecision,
+    HookDiagnostic,
     HookEvent,
     HookInvocation,
     PermissionEffect,
     PostToolUseDecision,
     PostToolUseEvent,
+    PostToolUseFailureDecision,
+    PostToolUseFailureEvent,
     PreCompactDecision,
     PreCompactEvent,
     PreToolUseDecision,
@@ -73,6 +67,7 @@ from deepagents_code.hooks.models.domain import (
     ToolCallData,
 )
 from deepagents_code.hooks.models.transport import HookInvocationRequest
+from deepagents_code.hooks.reducer import reduce_hook_results
 from deepagents_code.hooks.tools import to_wire_tool_name
 
 if TYPE_CHECKING:
@@ -90,11 +85,12 @@ if TYPE_CHECKING:
 _DEFAULT_DEADLINE = timedelta(seconds=600)
 _STOP_STATE_KEY = "_hooks_stop_continuation_count"
 _PRE_TOOL_STATE_KEY = "_hooks_pre_tool_outcomes"
+_PENDING_POST_TOOL_STATE_KEY = "_hooks_pending_post_tools"
 _TASK_TOOL_NAME = "task"
 _COMPACT_TOOL_NAME = "compact_conversation"
 _INVOCATION_NAMESPACE = UUID("f2896d18-cf2a-4e7d-b11a-d5b10fc0e335")
 
-PreToolBehavior: TypeAlias = Literal["allow", "deny", "none"]
+type PreToolBehavior = Literal["allow", "deny", "none"]
 _DEFAULT_DENY_REASON = "Blocked by PreToolUse hook"
 
 
@@ -113,28 +109,62 @@ class _PreToolPassed(TypedDict):
     context: list[str]
 
 
-_PreToolState: TypeAlias = _PreToolDenied | _PreToolPassed
+type _PreToolState = _PreToolDenied | _PreToolPassed
+
+# Maps a tool-call id to the measured execution duration while the call awaits
+# its post-execution hook. The value is overloaded as a tombstone: a `None`
+# value means "delete this key", not "no duration". This mirrors LangGraph's
+# `RemoveMessage` sentinel -- a LangGraph reducer merges an update into the
+# channel and returns the whole new value, so removal is expressed by writing
+# a `None` sentinel that `_merge_pending_post_tools` pops, rather than by
+# omitting the key (a plain merge can only add/overwrite, never remove).
+# `_pending_post_tools` filters these tombstones out, so consumers only ever
+# see real `int` durations.
+type _PendingPostToolState = dict[str, int | None]
+
+
+def _merge_pending_post_tools(
+    current: _PendingPostToolState,
+    update: _PendingPostToolState,
+) -> _PendingPostToolState:
+    """Merge pending entries, treating a `None` value as a deletion sentinel.
+
+    LangGraph reducers return the entire new channel value, so writing
+    `{call_id: None}` removes `call_id` from the merged result instead of
+    storing the `None`. A merge can only add/overwrite keys, so this sentinel
+    is the mechanism for removing a consumed entry.
+
+    Args:
+        current: Current channel value.
+        update: Incoming update; `None` values delete their keys.
+
+    Returns:
+        The merged channel value with tombstoned keys removed.
+    """
+    merged = dict(current)
+    for call_id, duration_ms in update.items():
+        if duration_ms is None:
+            merged.pop(call_id, None)
+        else:
+            merged[call_id] = duration_ms
+    return merged
 
 
 class ServerHooksState(AgentState[Any]):
     """Agent state extensions for server-owned hook middleware.
 
-    Both fields are per-turn bookkeeping owned by `ServerHooksMiddleware` and
+    All fields are per-turn bookkeeping owned by `ServerHooksMiddleware` and
     marked `PrivateStateAttr`: they are omitted from the public graph I/O schema,
-    and `SubAgentMiddleware` strips them from subagent result merges so parallel
-    `task` calls cannot produce two concurrent writes to these `LastValue`
-    channels.
+    and `SubAgentMiddleware` strips them from subagent result merges.
 
     `PrivateStateAttr` only omits the fields from the input and output schemas;
-    the channels stay ordinary checkpointed `LastValue` channels visible to every
-    node, so values still flow from `after_model` to `wrap_tool_call` and survive
-    interrupt/resume.
+    the channels remain checkpointed and visible to graph nodes, so values flow
+    across lifecycle boundaries and survive interrupt/resume.
 
     Note:
-        If either field ever needs a reducer, the reducer must be placed *after*
-        `PrivateStateAttr` in the `Annotated` metadata. LangGraph only inspects
-        the last metadata entry when detecting reducers, so a reducer added
-        before the marker is silently ignored.
+        Reducers must be placed *after* `PrivateStateAttr` in the `Annotated`
+        metadata. LangGraph only inspects the last metadata entry when detecting
+        reducers, so a reducer added before the marker is silently ignored.
     """
 
     _hooks_stop_continuation_count: NotRequired[Annotated[int, PrivateStateAttr]]
@@ -149,6 +179,15 @@ class ServerHooksState(AgentState[Any]):
     `_after_model` replaces the whole dict (including with `{}`) so stale ids
     cannot survive into a later turn.
     """
+
+    _hooks_pending_post_tools: NotRequired[
+        Annotated[
+            _PendingPostToolState,
+            PrivateStateAttr,
+            _merge_pending_post_tools,
+        ]
+    ]
+    """Executed calls awaiting post-tool hooks at a checkpointed boundary."""
 
 
 class _SessionHookGate(TypedDict):
@@ -226,6 +265,30 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
             and (server := _mcp_server_from_tool(tool)) is not None
         }
 
+    def before_model(
+        self,
+        state: ServerHooksState,
+        runtime: Runtime[ContextT],
+    ) -> dict[str, Any] | None:
+        """Run post-execution hooks after tool results are checkpointed.
+
+        Returns:
+            State updates for rewritten results and completed hook bookkeeping.
+        """
+        return self._before_model(state, runtime)
+
+    async def abefore_model(
+        self,
+        state: ServerHooksState,
+        runtime: Runtime[ContextT],
+    ) -> dict[str, Any] | None:
+        """Run async post-execution hooks at the same safe boundary.
+
+        Returns:
+            State updates for rewritten results and completed hook bookkeeping.
+        """
+        return self._before_model(state, runtime)
+
     def after_model(
         self,
         state: ServerHooksState,
@@ -255,10 +318,10 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
-        """Run Pre/Post tool hooks around a synchronous tool call.
+        """Run pre-tool hooks and record synchronous results for post hooks.
 
         Returns:
-            Tool result, possibly rewritten by hook decisions.
+            Tool result with checkpointed post-hook bookkeeping when needed.
         """
         gate = _session_gate(request.runtime.context)
         call = _tool_call_data(request)
@@ -277,22 +340,19 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
             result = handler(request)
         duration_ms = int((time.perf_counter() - started) * 1000)
         result = _append_message_text(result, pre.context, call.id)
-        result = self._maybe_post_tool_use(
-            call, context, gate, request.runtime.config, result, duration_ms
-        )
-        return self._maybe_subagent_stop(
-            call, context, gate, request.runtime.config, result
-        )
+        if _post_tool_boundary_enabled(gate, call):
+            return _record_pending_post_tool(result, call.id, duration_ms)
+        return result
 
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
     ) -> ToolMessage | Command[Any]:
-        """Run Pre/Post tool hooks around an asynchronous tool call.
+        """Run pre-tool hooks and record asynchronous results for post hooks.
 
         Returns:
-            Tool result, possibly rewritten by hook decisions.
+            Tool result with checkpointed post-hook bookkeeping when needed.
         """
         gate = _session_gate(request.runtime.context)
         call = _tool_call_data(request)
@@ -311,12 +371,9 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
             result = await handler(request)
         duration_ms = int((time.perf_counter() - started) * 1000)
         result = _append_message_text(result, pre.context, call.id)
-        result = self._maybe_post_tool_use(
-            call, context, gate, request.runtime.config, result, duration_ms
-        )
-        return self._maybe_subagent_stop(
-            call, context, gate, request.runtime.config, result
-        )
+        if _post_tool_boundary_enabled(gate, call):
+            return _record_pending_post_tool(result, call.id, duration_ms)
+        return result
 
     @hook_config(can_jump_to=["model"])
     def after_agent(
@@ -373,6 +430,70 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
                 ),
             )
         return _inject_subagent_start_context(request, decision)
+
+    def _before_model(
+        self,
+        state: ServerHooksState,
+        runtime: Runtime[ContextT],
+    ) -> dict[str, Any] | None:
+        pending = _pending_post_tools(state)
+        if not pending:
+            return None
+        # Construct a new _PendingPostToolState where `duration_ms` is None
+        # for each entry. This causes the pending state to be evicted during
+        # graph state reconciliation in _merge_pending_post_tools
+        completed: _PendingPostToolState = dict.fromkeys(pending)
+        messages = state.get("messages", ())
+        latest_call_message = _latest_tool_call_message(messages)
+        # If there is an extant _PendingPostToolState but no corresponding
+        # tool message, mark the _PendingPostToolState as resolved.
+        if latest_call_message is None:
+            return {_PENDING_POST_TOOL_STATE_KEY: completed}
+        message_index, ai_message = latest_call_message
+        results = {
+            message.tool_call_id: message
+            for message in messages[message_index + 1 :]
+            if isinstance(message, ToolMessage)
+        }
+        gate = _session_gate(runtime.context)
+        config = _runtime_hook_config(runtime)
+        context = _hook_context(runtime.context, config, self._cwd)
+        updates: list[ToolMessage] = []
+        for tool_call in ai_message.tool_calls:
+            call = _tool_call_data_from_call(
+                tool_call,
+                mcp_server=self._mcp_servers.get(str(tool_call.get("name") or "")),
+            )
+            duration_ms = pending.get(call.id)
+            result = results.get(call.id)
+            if duration_ms is None or result is None:
+                # This pending entry has already been consumed, continue
+                continue
+            updated = self._maybe_post_tool_use(
+                call,
+                context,
+                gate,
+                config,
+                result,
+                duration_ms,
+            )
+            updated = self._maybe_subagent_stop(
+                call,
+                context,
+                gate,
+                config,
+                updated,
+            )
+            if not isinstance(updated, ToolMessage):
+                msg = "Post-tool hooks must preserve committed ToolMessage results"
+                raise TypeError(msg)
+            updates.append(updated)
+        state_update: dict[str, Any] = {
+            _PENDING_POST_TOOL_STATE_KEY: completed,
+        }
+        if updates:
+            state_update["messages"] = updates
+        return state_update
 
     def _after_model(
         self,
@@ -475,22 +596,39 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
         result: ToolMessage | Command[Any],
         duration_ms: int,
     ) -> ToolMessage | Command[Any]:
-        if not _event_enabled(gate, HookEvent.POST_TOOL_USE):
+        error = _tool_result_error(result, call)
+        event = (
+            HookEvent.POST_TOOL_USE_FAILURE
+            if error is not None
+            else HookEvent.POST_TOOL_USE
+        )
+        if not _event_enabled(gate, event):
             return result
-        if _tool_result_failed(result, call.id):
-            return result
-        decision = _invoke_hook(
-            context,
-            PostToolUseEvent.from_tool_result(
+        if error is not None:
+            hook_event = PostToolUseFailureEvent(
+                event=HookEvent.POST_TOOL_USE_FAILURE,
+                call=call,
+                error=error,
+                duration_ms=duration_ms,
+            )
+            decision_type = PostToolUseFailureDecision
+        else:
+            hook_event = PostToolUseEvent.from_tool_result(
                 result,
                 call=call,
                 duration_ms=duration_ms,
+            )
+            decision_type = PostToolUseDecision
+        decision = _require_decision(
+            _invoke_hook(
+                context,
+                hook_event,
+                gate=gate,
+                config=config,
+                deadline=self._default_deadline,
             ),
-            gate=gate,
-            config=config,
-            deadline=self._default_deadline,
+            decision_type,
         )
-        decision = _require_decision(decision, PostToolUseDecision)
         return _apply_post_tool_use(result, decision, call.id)
 
     def _maybe_subagent_stop(
@@ -560,13 +698,10 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
         }
 
 
-_DecisionT = TypeVar("_DecisionT", bound=BaseHookDecision)
-
-
-def _require_decision(
+def _require_decision[DecisionT: BaseHookDecision](
     decision: HookDecision,
-    expected: type[_DecisionT],
-) -> _DecisionT:
+    expected: type[DecisionT],
+) -> DecisionT:
     if not isinstance(decision, expected):
         msg = f"Expected {expected.__name__}, got {type(decision).__name__}"
         raise TypeError(msg)
@@ -591,6 +726,31 @@ def _event_enabled(gate: _SessionHookGate | None, event: HookEvent) -> bool:
     return gate is not None and event.value in gate["events"]
 
 
+def _post_tool_boundary_enabled(
+    gate: _SessionHookGate | None,
+    call: ToolCallData,
+) -> bool:
+    return (
+        _event_enabled(gate, HookEvent.POST_TOOL_USE)
+        or _event_enabled(gate, HookEvent.POST_TOOL_USE_FAILURE)
+        or (
+            call.name == _TASK_TOOL_NAME
+            and _event_enabled(gate, HookEvent.SUBAGENT_STOP)
+        )
+    )
+
+
+def _pending_post_tools(state: ServerHooksState) -> dict[str, int]:
+    raw = state.get(_PENDING_POST_TOOL_STATE_KEY)
+    if not isinstance(raw, Mapping):
+        return {}
+    return {
+        str(call_id): duration_ms
+        for call_id, duration_ms in raw.items()
+        if isinstance(duration_ms, int) and not isinstance(duration_ms, bool)
+    }
+
+
 def hook_decided_permission(state: object, tool_call_id: str) -> bool:
     """Report whether a pre-execution hook already settled permission for a call.
 
@@ -604,10 +764,31 @@ def hook_decided_permission(state: object, tool_call_id: str) -> bool:
         expressed no opinion, or no outcome was recorded -- in every one of those
         cases normal approval still applies.
     """
+    return hook_permission_behavior(state, tool_call_id) is not None
+
+
+def hook_permission_behavior(
+    state: object, tool_call_id: str
+) -> Literal["allow", "deny"] | None:
+    """Return the explicit pre-execution hook permission for a call.
+
+    Args:
+        state: Agent state carrying the current turn's hook outcomes.
+        tool_call_id: Tool call to look up.
+
+    Returns:
+        The hook's explicit `allow` or `deny`, or `None` when normal approval
+            routing still decides permission.
+    """
     outcome = _pre_tool_state(state, tool_call_id)
     if outcome is None:
-        return False
-    return outcome.get("behavior") in {"allow", "deny"}
+        return None
+    behavior = outcome.get("behavior")
+    if behavior == "allow":
+        return "allow"
+    if behavior == "deny":
+        return "deny"
+    return None
 
 
 def _pre_tool_state(state: object, tool_call_id: str) -> Mapping[str, object] | None:
@@ -650,6 +831,7 @@ def _invoke_hook(
     event: (
         PreToolUseEvent
         | PostToolUseEvent
+        | PostToolUseFailureEvent
         | PreCompactEvent
         | StopEvent
         | SubagentStartEvent
@@ -680,11 +862,21 @@ def _invoke_hook(
         deadline=datetime.now(UTC) + deadline,
     )
     raw = interrupt(build_hook_interrupt_payload(request))
-    response = parse_hook_resume_value(
-        raw,
-        invocation_id=request.invocation_id,
-        snapshot_id=request.snapshot_id,
-    )
+    try:
+        response = parse_hook_resume_value(
+            raw,
+            invocation_id=request.invocation_id,
+            snapshot_id=request.snapshot_id,
+        )
+    except ValidationError:
+        # Only shape errors degrade to a neutral decision. A plain `ValueError`
+        # means the client answered a different request, so it stays fatal.
+        diagnostic = HookDiagnostic(
+            code="invalid_resume",
+            severity="warning",
+            message="Malformed hook resume value; treating it as no decision",
+        )
+        return reduce_hook_results(request.invocation, (), diagnostics=(diagnostic,))
     return response.decision
 
 
@@ -737,6 +929,21 @@ def _context_mapping(runtime_context: object) -> dict[str, Any]:
     return result
 
 
+def _runtime_hook_config(runtime: Runtime[Any]) -> dict[str, Any] | None:
+    info = runtime.execution_info
+    if info is None:
+        return None
+    configurable = {
+        key: value
+        for key, value in (
+            ("run_id", info.run_id),
+            ("thread_id", info.thread_id),
+        )
+        if value
+    }
+    return {"configurable": configurable} if configurable else None
+
+
 def _run_id(config: Mapping[str, Any] | None, thread_id: str) -> str:
     if isinstance(config, Mapping):
         configurable = config.get("configurable")
@@ -757,6 +964,7 @@ def _invocation_id(
     event: (
         PreToolUseEvent
         | PostToolUseEvent
+        | PostToolUseFailureEvent
         | PreCompactEvent
         | StopEvent
         | SubagentStartEvent
@@ -784,6 +992,7 @@ def _logical_event_identity(
     event: (
         PreToolUseEvent
         | PostToolUseEvent
+        | PostToolUseFailureEvent
         | PreCompactEvent
         | StopEvent
         | SubagentStartEvent
@@ -792,7 +1001,10 @@ def _logical_event_identity(
     *,
     logical_event_id: str | None = None,
 ) -> str:
-    if isinstance(event, PreToolUseEvent | PostToolUseEvent):
+    if isinstance(
+        event,
+        PreToolUseEvent | PostToolUseEvent | PostToolUseFailureEvent,
+    ):
         return event.call.id
     if isinstance(event, PreCompactEvent):
         if logical_event_id:
@@ -929,6 +1141,20 @@ def _ask_permission_via_hitl(
     return None
 
 
+def _record_pending_post_tool(
+    result: ToolMessage | Command[Any],
+    call_id: str,
+    duration_ms: int,
+) -> Command[Any]:
+    pending = {_PENDING_POST_TOOL_STATE_KEY: {call_id: duration_ms}}
+    if isinstance(result, ToolMessage):
+        return Command(update={"messages": [result], **pending})
+    update = result.update
+    if not isinstance(update, Mapping):
+        return result
+    return replace(result, update={**update, **pending})
+
+
 def _append_message_text(
     result: ToolMessage | Command[Any],
     parts: Sequence[str],
@@ -941,7 +1167,7 @@ def _append_message_text(
 
 def _apply_post_tool_use(
     result: ToolMessage | Command[Any],
-    decision: PostToolUseDecision,
+    decision: PostToolUseDecision | PostToolUseFailureDecision,
     call_id: str,
 ) -> ToolMessage | Command[Any]:
     extras: list[str] = []
@@ -993,13 +1219,29 @@ def _append_tool_result_text(
     return replace(result, update={**update, "messages": messages})
 
 
-def _tool_result_failed(result: ToolMessage | Command[Any], call_id: str) -> bool:
-    if isinstance(result, ToolMessage):
-        return result.status == "error"
-    return any(
-        _is_call_result(message, call_id) and message.status == "error"
-        for message in _command_messages(result)
+def _tool_result_error(
+    result: ToolMessage | Command[Any],
+    call: ToolCallData,
+) -> str | None:
+    messages = (
+        [result] if isinstance(result, ToolMessage) else _command_messages(result)
     )
+    for message in messages:
+        if not _is_call_result(message, call.id):
+            continue
+        if message.status == "error":
+            return _tool_result_text(result, call.id)
+        artifact = message.artifact
+        if call.name != "execute" or not isinstance(artifact, Mapping):
+            continue
+        exit_code = artifact.get("exit_code")
+        if (
+            isinstance(exit_code, int)
+            and not isinstance(exit_code, bool)
+            and exit_code != 0
+        ):
+            return f"Command exited with non-zero status code {exit_code}"
+    return None
 
 
 def _command_messages(result: Command[Any]) -> Sequence[object]:
@@ -1090,6 +1332,19 @@ def _tool_result_text(result: ToolMessage | Command[Any], call_id: str) -> str:
         str(message.content)
         for message in _command_messages(result)
         if _is_call_result(message, call_id)
+    )
+
+
+def _latest_tool_call_message(
+    messages: Sequence[Any],
+) -> tuple[int, AIMessage] | None:
+    return next(
+        (
+            (index, message)
+            for index, message in reversed(list(enumerate(messages)))
+            if isinstance(message, AIMessage) and message.tool_calls
+        ),
+        None,
     )
 
 
