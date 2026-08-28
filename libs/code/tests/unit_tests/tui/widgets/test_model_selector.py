@@ -11,9 +11,12 @@ import pytest
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
+from textual.geometry import Offset
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
+from deepagents_code import clipboard as clipboard_module
+from deepagents_code._paths import PATHS
 from deepagents_code.config import get_glyphs
 from deepagents_code.model_config import (
     ModelProfileEntry,
@@ -250,6 +253,60 @@ class TestModelSelectorEscapeKey:
 class TestModelSelectorChrome:
     """Tests for model selector title and description chrome."""
 
+    async def test_current_model_title_copies_spec(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Clicking the current model in the title copies its canonical spec."""
+        copied: list[str] = []
+
+        def fake_copy(
+            _app: App[None],
+            text: str,
+            *,
+            failure_noun: str,
+            success_message: str | None = None,
+        ) -> bool:
+            copied.append(text)
+            assert failure_noun == "selection"
+            assert success_message == "Model copied"
+            _app.notify(success_message)
+            return True
+
+        monkeypatch.setattr(clipboard_module, "copy_text_with_feedback", fake_copy)
+        app = ModelSelectorTestApp()
+        async with app.run_test() as pilot:
+            screen = ModelSelectorScreen(
+                current_model="claude-sonnet-4-5",
+                current_provider="anthropic",
+                default_scope=MAIN_MODEL_DEFAULT_SCOPE,
+            )
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.pause()
+            title = screen.query_one("#model-selector-title", Static)
+            x = title.content_region.x - title.region.x
+            model_offset = None
+            plain_offset = None
+            for segment in title.render_line(0):
+                if segment.text.startswith("Select Model"):
+                    plain_offset = Offset(x, 0)
+                if segment.style and segment.style.meta.get("copy_text"):
+                    model_offset = Offset(x, 0)
+                    break
+                x += segment.cell_length
+            assert model_offset is not None
+            assert plain_offset is not None
+
+            await pilot.hover(title, offset=model_offset)
+            assert title.styles.pointer == "pointer"
+            await pilot.hover(title, offset=plain_offset)
+            assert title.styles.pointer == "default"
+            await pilot.click(title, offset=model_offset)
+            await pilot.pause()
+
+            assert copied == ["anthropic:claude-sonnet-4-5"]
+            assert list(app._notifications)[-1].message == "Model copied"
+
     async def test_optional_title_and_description_render(self) -> None:
         """A custom title and description should render above the filter."""
         app = ModelSelectorTestApp()
@@ -288,6 +345,7 @@ class TestModelSelectorChrome:
             assert "Tab/Shift+Tab navigate" not in str(help_text.content)
             assert "Tab autocomplete" in str(help_text.content)
             assert "Esc skip setup" not in str(help_text.content)
+            assert "Esc close" not in str(help_text.content)
             assert "Esc cancel" not in str(help_text.content)
 
     async def test_curated_selector_help_hides_default_hint(self) -> None:
@@ -329,8 +387,8 @@ class TestModelSelectorChrome:
         assert max_height.cells is not None
         assert max_height.cells <= 16
 
-    async def test_standard_selector_help_hides_cancel_hint(self) -> None:
-        """The regular /model selector should not leave a trailing separator."""
+    async def test_standard_selector_help_shows_close_hint(self) -> None:
+        """The regular `/model` selector should advertise Escape dismissal."""
         app = ModelSelectorTestApp()
         async with app.run_test() as pilot:
             screen = ModelSelectorScreen(default_scope=MAIN_MODEL_DEFAULT_SCOPE)
@@ -343,7 +401,7 @@ class TestModelSelectorChrome:
             # Standard mode still advertises the default-setting shortcut that
             # curated/onboarding mode hides.
             assert "Ctrl+S set default" in str(help_text.content)
-            assert "Esc cancel" not in str(help_text.content)
+            assert "Esc close" in str(help_text.content)
 
     async def test_standard_selector_help_wraps_to_two_rows(self) -> None:
         """The standard footer is wider than the modal, so it must wrap.
@@ -891,7 +949,7 @@ class TestDefaultModelScope:
         assert notified
         message, severity = notified[0]
         assert severity == "error"
-        assert "~/.deepagents/config.toml" in message
+        assert PATHS.display(PATHS.profile.config_file) in message
         assert "unwritable" in message
         assert "malformed" in message
 
@@ -2195,6 +2253,90 @@ class TestModelSelectorAuthRouting:
 class TestModelSelectorFiltering:
     """Tests for search filtering."""
 
+    async def test_empty_allowlist_explains_policy(self) -> None:
+        """An empty policy shows its cause instead of offering custom models."""
+        from deepagents_code import model_config
+
+        model_config.DEFAULT_CONFIG_PATH.write_text(
+            "[models]\nallowed = []\n",
+            encoding="utf-8",
+        )
+        model_config.clear_caches()
+
+        app = ModelSelectorTestApp()
+        async with app.run_test() as pilot:
+            app.show_selector()
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, ModelSelectorScreen)
+            options = screen.query_one("#model-options", Container)
+            content = " ".join(str(widget.content) for widget in options.query(Static))
+            # An empty filter must not be blamed on a typo, and the message
+            # names the policy rather than offering a custom spec.
+            assert "models.allowed permits no models" in content
+            assert "press Enter" not in content
+
+    async def test_nonspec_filter_is_not_blamed_on_policy(self) -> None:
+        """A typo in the filter box is not the administrator's fault.
+
+        `is_model_allowed` rejects any non-spec string, so testing the filter
+        text directly would attribute every mistyped filter -- and every empty
+        one -- to `models.allowed`.
+        """
+        from deepagents_code import model_config
+
+        model_config.DEFAULT_CONFIG_PATH.write_text(
+            '[models]\nallowed = ["anthropic:claude-sonnet-5"]\n',
+            encoding="utf-8",
+        )
+        model_config.clear_caches()
+
+        app = ModelSelectorTestApp()
+        async with app.run_test() as pilot:
+            app.show_selector()
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, ModelSelectorScreen)
+            await pilot.press("z", "z", "z", "q")
+            await pilot.pause()
+
+            options = screen.query_one("#model-options", Container)
+            content = " ".join(str(widget.content) for widget in options.query(Static))
+            assert "models.allowed" not in content
+
+    async def test_blocked_spec_filter_names_the_policy_and_allowed_models(
+        self,
+    ) -> None:
+        """Typing a real but blocked spec does name the policy, and what is allowed."""
+        from deepagents_code import model_config
+
+        model_config.DEFAULT_CONFIG_PATH.write_text(
+            '[models]\nallowed = ["anthropic:claude-sonnet-5"]\n',
+            encoding="utf-8",
+        )
+        model_config.clear_caches()
+
+        app = ModelSelectorTestApp()
+        async with app.run_test() as pilot:
+            app.show_selector()
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, ModelSelectorScreen)
+            screen._filter_text = "openai:blocked"
+            screen._filtered_models = []
+            await screen._update_display()
+            await pilot.pause()
+
+            options = screen.query_one("#model-options", Container)
+            content = " ".join(str(widget.content) for widget in options.query(Static))
+            assert "not allowed by the configured models.allowed" in content
+            # Naming the permitted specs is the only way out when they are not
+            # discoverable, so the empty state must carry them.
+            assert "anthropic:claude-sonnet-5" in content
+
     async def test_typing_filters_models(self) -> None:
         """Typing in the filter input should filter models."""
         app = ModelSelectorTestApp()
@@ -2231,6 +2373,82 @@ class TestModelSelectorFiltering:
         screen.action_select()
 
         assert result == ("custom:my-model", "custom")
+
+    @pytest.mark.parametrize("custom_input", ["custom:blocked", "blocked"])
+    def test_disallowed_custom_model_spec_is_not_selected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        custom_input: str,
+    ) -> None:
+        """Enter has no selection side effects for custom models denied by policy."""
+        from deepagents_code import model_config
+
+        model_config.DEFAULT_CONFIG_PATH.write_text(
+            '[models]\nallowed = ["custom:allowed"]\n',
+            encoding="utf-8",
+        )
+        model_config.clear_caches()
+
+        screen = _model_selector_for_filtering()
+
+        class FakeInput:
+            value = custom_input
+
+        screen._filtered_models = []
+        monkeypatch.setattr(screen, "query_one", lambda *_args, **_kwargs: FakeInput())
+        select = MagicMock()
+        dismiss = MagicMock()
+        notify = MagicMock()
+        monkeypatch.setattr(screen, "_select_with_auth_check", select)
+        monkeypatch.setattr(screen, "_dismiss_with_result", dismiss)
+        monkeypatch.setattr(screen, "notify", notify)
+
+        screen.action_select()
+
+        select.assert_not_called()
+        dismiss.assert_not_called()
+        # Silently swallowing the keypress reads as a dead binding, so the
+        # refusal has to say why.
+        notify.assert_called_once()
+        assert "models.allowed" in notify.call_args.args[0]
+        assert notify.call_args.kwargs["severity"] == "error"
+
+    def test_allowed_bare_name_is_selectable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A supported bare name is not rejected for lacking a provider prefix.
+
+        With `allowed = ["openai:gpt-5.6-terra"]`, entering `gpt-5.6-terra` must
+        be accepted: `create_model` infers `openai`, builds the canonical spec,
+        and allows it. The preflight has to judge the same canonical form.
+        """
+        from deepagents_code import model_config
+
+        monkeypatch.setenv("OPENAI_API_KEY", "test-placeholder-not-a-real-key")
+        model_config.DEFAULT_CONFIG_PATH.write_text(
+            '[models]\nallowed = ["openai:gpt-5.6-terra"]\n',
+            encoding="utf-8",
+        )
+        model_config.clear_caches()
+
+        screen = _model_selector_for_filtering()
+
+        class FakeInput:
+            value = "gpt-5.6-terra"
+
+        screen._filtered_models = []
+        monkeypatch.setattr(screen, "query_one", lambda *_args, **_kwargs: FakeInput())
+        dismiss = MagicMock()
+        notify = MagicMock()
+        monkeypatch.setattr(screen, "_dismiss_with_result", dismiss)
+        monkeypatch.setattr(screen, "notify", notify)
+
+        screen.action_select()
+
+        # A bare name has no provider to pass along, so it takes the
+        # no-prefix branch and `create_model` infers the provider downstream.
+        dismiss.assert_called_once_with(("gpt-5.6-terra", ""))
+        notify.assert_not_called()
 
     def test_enter_selects_highlighted_model_not_filter_text(
         self, monkeypatch: pytest.MonkeyPatch

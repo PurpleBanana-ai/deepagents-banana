@@ -1,5 +1,6 @@
 """Tests for resume-state persistence and token display callbacks."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast, get_type_hints
 
@@ -15,6 +16,7 @@ from deepagents_code.resume_state import (
     _extract_context_tokens,
     coerce_goal_proposal_kind,
     coerce_goal_status,
+    coerce_model_spec,
 )
 
 
@@ -80,6 +82,12 @@ class TestResumeState:
         metadata = getattr(hints["_sticky_rubric"], "__metadata__", ())
         assert PrivateStateAttr in metadata
 
+    def test_rubric_model_spec_is_private(self) -> None:
+        """The thread-local grader selection must not enter public graph I/O."""
+        hints = get_type_hints(ResumeState, include_extras=True)
+        metadata = getattr(hints["_rubric_model_spec"], "__metadata__", ())
+        assert PrivateStateAttr in metadata
+
     def test_pending_goal_kind_is_private(self) -> None:
         """Proposal mode should persist without entering public graph I/O."""
         hints = get_type_hints(ResumeState, include_extras=True)
@@ -95,6 +103,17 @@ class TestResumeState:
     def test_middleware_exposes_state_schema(self):
         """ResumeStateMiddleware registers the correct state schema."""
         assert ResumeStateMiddleware.state_schema is ResumeState
+
+
+class TestCoerceRubricModelSpec:
+    """Tests for checkpointed grader model coercion."""
+
+    def test_accepts_nonblank_string(self) -> None:
+        assert coerce_model_spec(" openai:gpt-5.5 ") == "openai:gpt-5.5"
+
+    @pytest.mark.parametrize("value", [None, "", "   ", 1, {}])
+    def test_rejects_malformed_values(self, value: object) -> None:
+        assert coerce_model_spec(value) is None
 
 
 class TestCoerceGoalStatus:
@@ -374,11 +393,13 @@ class TestCostDisplayCallbacks:
         assert app._displayed_cost_usd == pytest.approx(1.25)
 
     def test_cost_threshold_warns_once_per_thread(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setattr(
-            "deepagents_code.config_manifest.load_config_toml",
-            lambda: {"warnings": {"session_cost_threshold_usd": 1.0}},
+        # `DeepAgentsApp` reads the threshold through the shared resolver, whose
+        # user tier is the `DEFAULT_CONFIG_PATH` file `_isolate_state_dir`
+        # redirects under `tmp_path`.
+        (tmp_path / "config.toml").write_text(
+            "[warnings]\nsession_cost_threshold_usd = 1.0\n", encoding="utf-8"
         )
         app = DeepAgentsApp()
         notifications: list[str] = []

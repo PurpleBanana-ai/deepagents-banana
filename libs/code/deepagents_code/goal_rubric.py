@@ -23,7 +23,9 @@ from langchain.agents.middleware.types import (
     AgentMiddleware,
     AgentState,
     OmitFromOutput,
+    TracePolicy,
     hook_config,
+    omit_payload,
 )
 from langchain_core.messages import (
     AIMessage,
@@ -44,6 +46,7 @@ from deepagents_code._repository_bounds import (
     REPOSITORY_TOOL_NAMES as _REPOSITORY_TOOL_NAMES,
     RepositoryBounds,
 )
+from deepagents_code.config import DEFAULT_MODEL_RETRIES
 from deepagents_code.goal_state_limits import (
     GOAL_APPLICATION_CHAR_LIMIT,
     GOAL_OBJECTIVE_CHAR_LIMIT,
@@ -375,6 +378,9 @@ class _GoalContextFallbackMiddleware(AgentMiddleware[Any, Any]):
     "fix" the retry by re-adding tools.
     """
 
+    trace_policy = TracePolicy(process_inputs=omit_payload)
+    """Omit hook inputs from traces by default; set a `TracePolicy` to override."""
+
     @override
     def wrap_model_call(
         self,
@@ -454,6 +460,9 @@ def _goal_only_messages(messages: Sequence[BaseMessage]) -> list[AnyMessage]:
 
 class _CriteriaContextBudgetMiddleware(AgentMiddleware[GoalCriteriaAgentState, None]):
     """Bound tool-result text accumulated by one nested context operation."""
+
+    trace_policy = TracePolicy(process_inputs=omit_payload)
+    """Omit hook inputs from traces by default; set a `TracePolicy` to override."""
 
     def __init__(self, *, label: str = "Criteria context") -> None:
         """Initialize bounded per-operation context counters.
@@ -539,6 +548,9 @@ class _CriteriaContextBudgetMiddleware(AgentMiddleware[GoalCriteriaAgentState, N
 class _ContextToolCallBudgetMiddleware(AgentMiddleware[Any, Any]):
     """Bound selected context-tool calls independently for each nested operation."""
 
+    trace_policy = TracePolicy(process_inputs=omit_payload)
+    """Omit hook inputs from traces by default; set a `TracePolicy` to override."""
+
     def __init__(self, tool_names: set[str], *, limit: int) -> None:
         """Initialize a per-operation call budget for the selected tools.
 
@@ -615,6 +627,9 @@ class _ContextToolCallBudgetMiddleware(AgentMiddleware[Any, Any]):
 
 class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
     """Bound repository inspection calls and read/result sizes."""
+
+    trace_policy = TracePolicy(process_inputs=omit_payload)
+    """Omit hook inputs from traces by default; set a `TracePolicy` to override."""
 
     def __init__(self, backend: BackendProtocol, *, root: str = "/") -> None:
         """Initialize a per-operation repository tool budget.
@@ -768,6 +783,9 @@ class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
 
 class _WebSearchBudgetMiddleware(AgentMiddleware[GoalCriteriaAgentState, None]):
     """Limit web searches independently for each nested context operation."""
+
+    trace_policy = TracePolicy(process_inputs=omit_payload)
+    """Omit hook inputs from traces by default; set a `TracePolicy` to override."""
 
     def __init__(self) -> None:
         """Initialize bounded per-operation search counters."""
@@ -1323,6 +1341,9 @@ def _prompt_with_conversation_context(
 class GoalCriteriaMiddleware(AgentMiddleware[GoalCriteriaState, Any]):
     """Run goal-criteria requests entirely inside the main server graph."""
 
+    trace_policy = TracePolicy(process_inputs=omit_payload)
+    """Omit hook inputs from traces by default; set a `TracePolicy` to override."""
+
     state_schema = GoalCriteriaState
 
     def __init__(
@@ -1540,6 +1561,8 @@ def create_goal_criteria_agent(
     repository_backend: BackendProtocol | None,
     repository_root: str = "/",
     context_tools: Sequence[BaseTool | Callable[..., Any]],
+    model_retries: int = DEFAULT_MODEL_RETRIES,
+    cli_max_retries: int | None = None,
 ) -> Any:  # noqa: ANN401
     """Create the ephemeral server-side criteria agent graph.
 
@@ -1549,6 +1572,8 @@ def create_goal_criteria_agent(
             sandbox, or `None` when repository context is unavailable.
         repository_root: Absolute path that bounds reads on `repository_backend`.
         context_tools: Loaded `fetch_url`, optional `web_search`, and MCP tools.
+        model_retries: Model-node retry attempts after the first call.
+        cli_max_retries: Explicit `--max-retries` value for runtime model switches.
 
     Returns:
         Compiled criteria agent graph.
@@ -1562,6 +1587,8 @@ def create_goal_criteria_agent(
         repository_root=repository_root,
         context_tools=context_tools,
         auto_mode_enabled=True,
+        model_retries=model_retries,
+        cli_max_retries=cli_max_retries,
     )
 
 
@@ -1573,6 +1600,8 @@ def _create_goal_criteria_agent(
     context_tools: Sequence[BaseTool | Callable[..., Any]],
     auto_mode_enabled: bool,
     fs_tools: list[FsToolName] | None = None,
+    model_retries: int = DEFAULT_MODEL_RETRIES,
+    cli_max_retries: int | None = None,
 ) -> Any:  # noqa: ANN401
     """Build a criteria agent with the parent runtime's Auto eligibility.
 
@@ -1586,6 +1615,8 @@ def _create_goal_criteria_agent(
 
             The criteria agent exposes only the allowed subset of its read-only
             repository tools.
+        model_retries: Model-node retry attempts after the first call.
+        cli_max_retries: Explicit `--max-retries` value for runtime model switches.
 
     Returns:
         Compiled criteria agent graph.
@@ -1601,6 +1632,7 @@ def _create_goal_criteria_agent(
     from deepagents_code._cli_context import CLIContextSchema
     from deepagents_code.agent import AsyncApprovalHITLMiddleware
     from deepagents_code.configurable_model import ConfigurableModelMiddleware
+    from deepagents_code.model_retry import CodeModelRetryMiddleware
 
     normalized_context_tools: list[BaseTool] = []
     for tool in context_tools:
@@ -1624,10 +1656,14 @@ def _create_goal_criteria_agent(
         msg = f"Context tool names conflict with criteria-agent tools: {names}."
         raise ValueError(msg)
     middleware: list[AgentMiddleware[Any, Any]] = [
-        ConfigurableModelMiddleware(persist_model_state=False),
+        ConfigurableModelMiddleware(
+            persist_model_state=False,
+            cli_max_retries=cli_max_retries,
+        ),
         _GoalContextFallbackMiddleware(),
         _WebSearchBudgetMiddleware(),
         _CriteriaContextBudgetMiddleware(),
+        CodeModelRetryMiddleware(max_retries=model_retries),
     ]
     if repository_backend is not None:
         # Annotated (not `cast`) so the type checker validates each literal
@@ -1684,6 +1720,8 @@ def _create_goal_criteria_agent(
 def create_goal_criteria_fallback_agent(
     *,
     model: str | BaseChatModel,
+    model_retries: int = DEFAULT_MODEL_RETRIES,
+    cli_max_retries: int | None = None,
 ) -> Any:  # noqa: ANN401
     """Create the goal-only fallback agent for criteria generation.
 
@@ -1696,6 +1734,8 @@ def create_goal_criteria_fallback_agent(
 
     Args:
         model: Chat model or model identifier used by the server graph.
+        model_retries: Model-node retry attempts after the first call.
+        cli_max_retries: Explicit `--max-retries` value for runtime model switches.
 
     Returns:
         Compiled goal-only criteria agent graph.
@@ -1705,9 +1745,14 @@ def create_goal_criteria_fallback_agent(
 
     from deepagents_code._cli_context import CLIContextSchema
     from deepagents_code.configurable_model import ConfigurableModelMiddleware
+    from deepagents_code.model_retry import CodeModelRetryMiddleware
 
     middleware: list[AgentMiddleware[Any, Any]] = [
-        ConfigurableModelMiddleware(persist_model_state=False)
+        ConfigurableModelMiddleware(
+            persist_model_state=False,
+            cli_max_retries=cli_max_retries,
+        ),
+        CodeModelRetryMiddleware(max_retries=model_retries),
     ]
     return create_agent(
         model=model,

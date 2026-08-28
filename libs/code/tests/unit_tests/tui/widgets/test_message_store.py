@@ -24,6 +24,7 @@ from deepagents_code.tui.widgets.messages import (
     DiffMessage,
     ErrorMessage,
     LazyToolGroupSummary,
+    ReasoningMessage,
     RubricResultMessage,
     SkillMessage,
     SummarizationMessage,
@@ -1381,6 +1382,67 @@ class TestVirtualizationFlow:
 class TestBulkLoad:
     """Tests for MessageStore.bulk_load."""
 
+    @staticmethod
+    def _rows(count: int) -> list[MessageData]:
+        """Build `count` distinctly-identified rows for bulk_load."""
+        return [
+            MessageData(type=MessageType.USER, content=f"msg{i}", id=f"id-{i}")
+            for i in range(count)
+        ]
+
+    def test_bulk_load_uses_bounded_initial_tail(self):
+        """Resume mounts `INITIAL_WINDOW_SIZE` rows unless the window is smaller."""
+        initial = MessageStore.INITIAL_WINDOW_SIZE
+        data = self._rows(initial + 20)
+
+        store = MessageStore()
+        archived, visible = store.bulk_load(data)
+        assert len(visible) == initial
+        assert len(archived) == 20
+        assert visible[0].id == "id-20"
+
+        store = MessageStore()
+        store.WINDOW_SIZE = initial - 18
+        archived, visible = store.bulk_load(data)
+        assert len(visible) == store.WINDOW_SIZE
+        assert len(archived) == len(data) - store.WINDOW_SIZE
+        assert visible[0].id == f"id-{len(archived)}"
+
+    def test_bulk_load_at_initial_window_size(self):
+        """Exactly `INITIAL_WINDOW_SIZE` rows should all mount, none archived.
+
+        The boundary belongs to the `INITIAL_WINDOW_SIZE` arm of the `min()`,
+        which the other bulk_load tests never reach: they shrink `WINDOW_SIZE`
+        below it, so `WINDOW_SIZE` wins there.
+        """
+        store = MessageStore()
+        archived, visible = store.bulk_load(
+            self._rows(MessageStore.INITIAL_WINDOW_SIZE)
+        )
+        assert archived == []
+        assert len(visible) == MessageStore.INITIAL_WINDOW_SIZE
+        assert store._visible_start == 0
+
+    def test_bulk_load_just_under_initial_window_size(self):
+        """One row below the boundary stays fully mounted."""
+        store = MessageStore()
+        archived, visible = store.bulk_load(
+            self._rows(MessageStore.INITIAL_WINDOW_SIZE - 1)
+        )
+        assert archived == []
+        assert len(visible) == MessageStore.INITIAL_WINDOW_SIZE - 1
+        assert store._visible_start == 0
+
+    def test_bulk_load_just_over_initial_window_size(self):
+        """One row above the boundary archives exactly one row."""
+        store = MessageStore()
+        archived, visible = store.bulk_load(
+            self._rows(MessageStore.INITIAL_WINDOW_SIZE + 1)
+        )
+        assert len(archived) == 1
+        assert len(visible) == MessageStore.INITIAL_WINDOW_SIZE
+        assert visible[0].id == "id-1"
+
     def test_bulk_load_under_window_size(self):
         """All messages should be visible when count <= WINDOW_SIZE."""
         store = MessageStore()
@@ -1554,6 +1616,18 @@ class TestMessageStoreIndex:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_reasoning_roundtrip_preserves_content_and_expansion() -> None:
+    widget = ReasoningMessage("[bold]plain[/bold]")
+    widget._expanded = False
+
+    restored = MessageData.from_widget(widget).to_widget()
+
+    assert isinstance(restored, ReasoningMessage)
+    assert restored._content == "[bold]plain[/bold]"
+    assert restored._deferred_expanded is False
+    assert restored._streaming is False
 
 
 def test_display_caveat_survives_the_store_roundtrip() -> None:
